@@ -8,6 +8,32 @@ function Test-RunningAsSystem {
 	}
 }
 
+function OOBEComplete {
+$TypeDef = @"
+
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace Api
+{
+public class Kernel32
+{
+[DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+public static extern int OOBEComplete(ref int bIsOOBEComplete);
+}
+}
+"@
+    
+    Add-Type -TypeDefinition $TypeDef -Language CSharp
+    
+    $IsOOBEComplete = $false
+    $hr = [Api.Kernel32]::OOBEComplete([ref] $IsOOBEComplete)
+    
+    return $IsOOBEComplete
+}
+
 <# Script variables #>
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
@@ -20,13 +46,12 @@ $useWhitelist = $true
 
 <# ----------------------------------------------- #>
 
-
-<# Abort script in ESP phase #>
-$processWWA = Get-Process "WWAHost" -ErrorAction SilentlyContinue
-if ($processWWA -ne $null) {
-    "ESP"
-    exit 0
+<# Abort script in OOBE phase #>
+if (-not (OOBEComplete)) {
+    "OOBE"
+    Exit 1
 }
+
 <# ---------------------------------------------- #>
 
 
