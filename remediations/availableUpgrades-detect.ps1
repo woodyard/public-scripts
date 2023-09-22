@@ -185,9 +185,9 @@ $ras = $true
 If (-Not (Test-RunningAsSystem)) {
     $ras = $false
 
-    if (-not ($userIsAdmin)) {
-        $whitelistConfig = $whitelistConfig | Where-Object { $_.UserContext -eq $true }
-    }
+    #if (-not ($userIsAdmin)) {
+    #    $whitelistConfig = $whitelistConfig | Where-Object { $_.UserContext -eq $true }
+    #}
 
     $OUTPUT = $(winget upgrade --accept-source-agreements)
     $OUTPUT = $(winget upgrade --accept-source-agreements)
@@ -241,13 +241,6 @@ if ( (-Not ($ras)) -or $wingetpath) {
                                 Write-Log -Message "Upgrade $($okapp.AppID) in system context"
                                 $doUpgrade = $true
                                 continue
-                            } elseif ($($okapp.UserContextPath)) {
-                                "$($okapp.UserContextPath)"
-                                If (Test-Path $ExecutionContext.InvokeCommand.ExpandString($($okapp.UserContextPath))) {
-                                    Write-Log -Message "Upgrade $($okapp.AppID) in user context"
-                                    $doUpgrade = $true
-                                    continue
-                                }
                             }
                         }
                     }
