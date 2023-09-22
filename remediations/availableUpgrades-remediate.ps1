@@ -8,6 +8,12 @@ function Test-RunningAsSystem {
 		return [bool]($(whoami -user) -match 'S-1-5-18')
 	}
 }
+function Write-Log($message) #Log script messages to temp directory
+{
+    $LogMessage = ((Get-Date -Format "MM-dd-yy HH:mm:ss ") + $message)
+    $LogMessage
+	Out-File -InputObject $LogMessage -FilePath "$LogPath\$LogFullName" -Append -Encoding utf8
+}
 
 function OOBEComplete {
 $TypeDef = @"
@@ -54,23 +60,6 @@ if (-not (OOBEComplete)) {
 }
 
 <# ---------------------------------------------- #>
-
-
-
-function Write-Log($message) #Log script messages to temp directory
-{
-    $LogMessage = ((Get-Date -Format "MM-dd-yy HH:mm:ss ") + $message)
-    $LogMessage
-	Out-File -InputObject $LogMessage -FilePath "$LogPath\$LogFullName" -Append -Encoding utf8
-}
-
-<#
-#Only run this on AAD joined machine!
-If ((Get-WmiObject -Class win32_computersystem).partofdomain) {
-	Write-Log -Message "Skipping due to AAD join requirement"
-	exit 0 #Exiting with a 'Good' status, to avoid re-run on this PC
-}
-#>
 
 $whitelistJSON = @'
 [
