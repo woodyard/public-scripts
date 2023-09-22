@@ -233,56 +233,55 @@ if ( (-Not ($ras)) -or $wingetpath) {
         $message = ""
 
         foreach ($app in $LIST) {
-            if ([string]::IsNullOrEmpty($app)) {
-                continue  # Skip empty entries in $LIST
-            }
-            if ($useWhitelist) {
-                $doUpgrade = $false
-                foreach ($okapp in $whitelistConfig) {
-                    if ($app -like "*$($okapp.AppID)*") {
-                        $blockingProcessName = $okapp.BlockingProcess
-                        if (-not [string]::IsNullOrEmpty($blockingProcessName)) {
-                            if (Get-Process -Name $blockingProcessName -ErrorAction SilentlyContinue) {
-                                Write-Host "$blockingProcessName is running."
-                                Write-Log -Message "Skipping $($okapp.AppID)"
-                                continue
+            if ($app -ne "") {
+                if ($useWhitelist) {
+                    $doUpgrade = $false
+                    foreach ($okapp in $whitelistConfig) {
+                        if ($app -like "*$($okapp.AppID)*") {
+                            $blockingProcessName = $okapp.BlockingProcess
+                            if (-not [string]::IsNullOrEmpty($blockingProcessName)) {
+                                if (Get-Process -Name $blockingProcessName -ErrorAction SilentlyContinue) {
+                                    Write-Host "$blockingProcessName is running."
+                                    Write-Log -Message "Skipping $($okapp.AppID)"
+                                    continue
+                                }
                             }
-                        }
-                        
-                        if ($ras -or $userIsAdmin) {
-                            Write-Log -Message "Upgrade $($okapp.AppID) in system context"
-                            $doUpgrade = $true
-                            continue
-                        } elseif ($($okapp.UserContextPath)) {
-                            If (Test-Path $ExecutionContext.InvokeCommand.ExpandString($($okapp.UserContextPath))) {
-                                Write-Log -Message "Upgrade $($okapp.AppID) in user context"
+                            
+                            if ($ras -or $userIsAdmin) {
+                                Write-Log -Message "Upgrade $($okapp.AppID) in system context"
                                 $doUpgrade = $true
                                 continue
+                            } elseif ($($okapp.UserContextPath)) {
+                                If (Test-Path $ExecutionContext.InvokeCommand.ExpandString($($okapp.UserContextPath))) {
+                                    Write-Log -Message "Upgrade $($okapp.AppID) in user context"
+                                    $doUpgrade = $true
+                                    continue
+                                }
                             }
                         }
                     }
                 }
-            }
-            else {
-                $doUpgrade = $true
-                foreach ($exclude in $excludeapps) {
-                    if ($app -like "*$exclude*") {
-                        $doUpgrade = $false
-                        continue
-                    }
-                }  
-            }
-
-            if ($doUpgrade) {
-                $count++
-                if ($ras) {
-                    $(.\winget.exe upgrade --silent --accept-source-agreements --id $app)
-                }
                 else {
-                    $(winget upgrade --silent --accept-source-agreements --id $app)
+                    $doUpgrade = $true
+                    foreach ($exclude in $excludeapps) {
+                        if ($app -like "*$exclude*") {
+                            $doUpgrade = $false
+                            continue
+                        }
+                    }  
                 }
-                
-                $message += $app + "|"
+
+                if ($doUpgrade) {
+                    $count++
+                    if ($ras) {
+                        $(.\winget.exe upgrade --silent --accept-source-agreements --id $app)
+                    }
+                    else {
+                        $(winget upgrade --silent --accept-source-agreements --id $app)
+                    }
+                    
+                    $message += $app + "|"
+                }
             }
         }
 
