@@ -238,14 +238,13 @@ if ( (-Not ($ras)) -or $wingetpath) {
                 continue  # Skip empty entries in $LIST
             }
         
-            $doUpgrade = $true
+            $doUpgrade = $false
         
             if ($useWhitelist) {
                 foreach ($okapp in $whitelistConfig) {
                     if ($app -like "*$($okapp.AppID)*" -and ![string]::IsNullOrEmpty($okapp.BlockingProcess) -and (Get-Process -Name $okapp.BlockingProcess -ErrorAction SilentlyContinue)) {
                         Write-Host "$($okapp.BlockingProcess) is running."
                         Write-Log -Message "Skipping $($okapp.AppID)"
-                        $doUpgrade = $false
                         continue
                     }
         
@@ -268,9 +267,9 @@ if ( (-Not ($ras)) -or $wingetpath) {
             if ($doUpgrade) {
                 $count++
                 $wingetCommand = if ($ras) { ".\winget.exe" } else { "winget" }
-                $arguments = "upgrade --silent --accept-source-agreements --id $okapp"
+                $arguments = "upgrade --silent --accept-source-agreements --id $app"
                 $result = Invoke-Expression "$wingetCommand $arguments"
-                $message += "$okapp|"
+                $message += "$app|"
             }
         }
         
