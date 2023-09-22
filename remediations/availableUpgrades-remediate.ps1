@@ -232,102 +232,60 @@ if ( (-Not ($ras)) -or $wingetpath) {
         $count = 0
         $message = ""
 
-
         foreach ($app in $LIST) {
             if ([string]::IsNullOrEmpty($app)) {
                 continue  # Skip empty entries in $LIST
             }
-        
-            $doUpgrade = $false
-        
             if ($useWhitelist) {
+                $doUpgrade = $false
                 foreach ($okapp in $whitelistConfig) {
-                    if ($app -like "*$($okapp.AppID)*" -and ![string]::IsNullOrEmpty($okapp.BlockingProcess) -and (Get-Process -Name $okapp.BlockingProcess -ErrorAction SilentlyContinue)) {
-                        Write-Host "$($okapp.BlockingProcess) is running."
-                        Write-Log -Message "Skipping $($okapp.AppID)"
-                        continue
-                    }
-        
-                    if ($ras -or $userIsAdmin) {
-                        Write-Log -Message "Upgrade $($okapp.AppID)"
-                        $doUpgrade = $true
-                        continue
+                    if ($app -like "*$($okapp.AppID)*") {
+                        $blockingProcessName = $okapp.BlockingProcess
+                        if (-not [string]::IsNullOrEmpty($blockingProcessName)) {
+                            if (Get-Process -Name $blockingProcessName -ErrorAction SilentlyContinue) {
+                                Write-Host "$blockingProcessName is running."
+                                Write-Log -Message "Skipping $($okapp.AppID)"
+                                continue
+                            }
+                        }
+                        
+                        if ($ras -or $userIsAdmin) {
+                            Write-Log -Message "Upgrade $($okapp.AppID) in system context"
+                            $doUpgrade = $true
+                            continue
+                        } elseif ($($okapp.UserContextPath)) {
+                            If (Test-Path $ExecutionContext.InvokeCommand.ExpandString($($okapp.UserContextPath))) {
+                                Write-Log -Message "Upgrade $($okapp.AppID) in user context"
+                                $doUpgrade = $true
+                                continue
+                            }
+                        }
                     }
                 }
             }
             else {
+                $doUpgrade = $true
                 foreach ($exclude in $excludeapps) {
                     if ($app -like "*$exclude*") {
                         $doUpgrade = $false
-                        break  # No need to check other $excludeapps entries
+                        continue
                     }
-                }
+                }  
             }
-        
+
             if ($doUpgrade) {
                 $count++
-                $wingetCommand = if ($ras) { ".\winget.exe" } else { "winget" }
-                $arguments = "upgrade --silent --accept-source-agreements --id $app"
-                $result = Invoke-Expression "$wingetCommand $arguments"
-                $message += "$app|"
-            }
-        }
-        
-
-<#
-        foreach ($app in $LIST) {
-            if ($app -ne "") {
-                if ($useWhitelist) {
-                    $doUpgrade = $false
-                    foreach ($okapp in $whitelistConfig) {
-                        if ($app -like "*$($okapp.AppID)*") {
-                            $blockingProcessName = $okapp.BlockingProcess
-                            if (-not [string]::IsNullOrEmpty($blockingProcessName)) {
-                                if (Get-Process -Name $blockingProcessName -ErrorAction SilentlyContinue) {
-                                    Write-Host "$blockingProcessName is running."
-                                    Write-Log -Message "Skipping $($okapp.AppID)"
-                                    continue
-                                }
-                            }
-                            
-                            if ($ras -or $userIsAdmin) {
-                                Write-Log -Message "Upgrade $($okapp.AppID) in system context"
-                                $doUpgrade = $true
-                                continue
-                            } elseif ($($okapp.UserContextPath)) {
-                                If (Test-Path $ExecutionContext.InvokeCommand.ExpandString($($okapp.UserContextPath))) {
-                                    Write-Log -Message "Upgrade $($okapp.AppID) in user context"
-                                    $doUpgrade = $true
-                                    continue
-                                }
-                            }
-                        }
-                    }
+                if ($ras) {
+                    $(.\winget.exe upgrade --silent --accept-source-agreements --id $app)
                 }
                 else {
-                    $doUpgrade = $true
-                    foreach ($exclude in $excludeapps) {
-                        if ($app -like "*$exclude*") {
-                            $doUpgrade = $false
-                            continue
-                        }
-                    }  
+                    $(winget upgrade --silent --accept-source-agreements --id $app)
                 }
-
-                if ($doUpgrade) {
-                    $count++
-                    if ($ras) {
-                        $(.\winget.exe upgrade --silent --accept-source-agreements --id $app)
-                    }
-                    else {
-                        $(winget upgrade --silent --accept-source-agreements --id $app)
-                    }
-                    
-                    $message += $app + "|"
-                }
+                
+                $message += $app + "|"
             }
         }
-#>
+
         exit 0
     }
     Write-Log -Message "No upgrades (0x0000002)"
