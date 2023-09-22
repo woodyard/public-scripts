@@ -231,6 +231,42 @@ if ( (-Not ($ras)) -or $wingetpath) {
         $count = 0
         $message = ""
 
+
+        foreach ($app in $LIST) {
+            if ([string]::IsNullOrEmpty($app)) {
+                continue  # Skip empty entries in $LIST
+            }
+        
+            $doUpgrade = $false
+        
+            if ($useWhitelist) {
+                foreach ($okapp in $whitelistConfig) {
+                    if ($app -like "*$($okapp.AppID)*") {
+                        if ($ras -or $userIsAdmin) {
+                            $doUpgrade = $true
+                            Write-Log -Message "Upgrade $($okapp.AppID)"
+                            continue
+                        }
+                    }
+                }
+            }
+            else {
+                $doUpgrade = $true
+                foreach ($exclude in $excludeapps) {
+                    if ($app -like "*$exclude*") {
+                        $doUpgrade = $false
+                        continue
+                    }
+                }
+            }
+        
+            if ($doUpgrade) {
+                $count++
+                $message += "$app|"
+            }
+        }
+        
+<#
         foreach ($app in $LIST) {
             if ($app -ne "") {
                 if ($useWhitelist) {
@@ -268,6 +304,7 @@ if ( (-Not ($ras)) -or $wingetpath) {
                 }
             }
         }
+#>
 
         if ($count -eq 0) {
             Write-Log -Message "No upgrades available"
