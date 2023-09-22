@@ -231,7 +231,7 @@ if ( (-Not ($ras)) -or $wingetpath) {
 
         $count = 0
         $message = ""
-"hallo"
+
         foreach ($app in $LIST) {
             if ($app -ne "") {
                 if ($useWhitelist) {
