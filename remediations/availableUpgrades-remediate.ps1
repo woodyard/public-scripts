@@ -240,12 +240,6 @@ if ( (-Not ($ras)) -or $wingetpath) {
                                 Write-Log -Message "Upgrade $($okapp.AppID) in system context"
                                 $doUpgrade = $true
                                 continue
-                            } elseif ($($okapp.UserContextPath)) {
-                                If (Test-Path $ExecutionContext.InvokeCommand.ExpandString($($okapp.UserContextPath))) {
-                                    Write-Log -Message "Upgrade $($okapp.AppID) in user context"
-                                    $doUpgrade = $true
-                                    continue
-                                }
                             }
                         }
                     }
