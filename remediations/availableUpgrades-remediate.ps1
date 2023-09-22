@@ -268,9 +268,9 @@ if ( (-Not ($ras)) -or $wingetpath) {
             if ($doUpgrade) {
                 $count++
                 $wingetCommand = if ($ras) { ".\winget.exe" } else { "winget" }
-                $arguments = "upgrade --silent --accept-source-agreements --id $app"
+                $arguments = "upgrade --silent --accept-source-agreements --id $okapp"
                 $result = Invoke-Expression "$wingetCommand $arguments"
-                $message += "$app|"
+                $message += "$okapp|"
             }
         }
         
