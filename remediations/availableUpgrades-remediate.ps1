@@ -157,6 +157,7 @@ $whitelistJSON = @'
     ,{        AppID:              "WinSCP.WinSCP" }
     ,{        AppID:              "WinMerge.WinMerge" }
     ,{        AppID:              "Adobe.Acrobat.Reader.64-bit"}
+    ,{        AppID:              "RazerInc.RazerInstaller"}
 ]
 '@
 
