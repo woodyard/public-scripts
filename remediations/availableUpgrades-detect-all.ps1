@@ -190,7 +190,7 @@ if ( (-Not ($ras)) -or $WingetPath) {
                         }
                     }
                 }
-                else {
+                else { #use exclude list
                     $doUpgrade = $true
                     foreach ($exclude in $excludeapps) {
                         if ($app -like "*$exclude*") {

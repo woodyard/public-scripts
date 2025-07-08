@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.4
-    Tag: 2N
+    Version: 2.5
+    Tag: 2R
     
     Version History:
     1.0 - Initial version
@@ -19,6 +19,7 @@
     2.2 - Implemented variable-based tag system for easier maintenance
     2.3 - Improved console output: tag moved to front, removed date from console (kept in log), added startup date log
     2.4 - ScriptTag now appears before timestamp in console output
+    2.5 - Disabled Logitech.OptionsPlus due to upgrade issues
     
     Exit Codes:
     0 - Script completed successfully
@@ -77,7 +78,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "2N"
+$ScriptTag = "2R"
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -204,7 +205,7 @@ $whitelistJSON = @'
     ,{        AppID:              "Microsoft.Bicep"}
     ,{        AppID:              "JanDeDobbeleer.OhMyPosh"}
     ,{        AppID:              "Logitech.Options"}
-    ,{        AppID:              "Logitech.OptionsPlus"}
+    ,{        AppID:              "Logitech.OptionsPlus", Disabled: true}
     ,{        AppID:              "TrackerSoftware.PDF-XChangeEditor"}
 ]
 '@
@@ -335,7 +336,7 @@ if ( (-Not ($ras)) -or $WingetPath) {
                         }
                     }
                 }
-                else {
+                else { #use exclude list
                     $doUpgrade = $true
                     foreach ($exclude in $excludeapps) {
                         if ($app -like "*$exclude*") {
