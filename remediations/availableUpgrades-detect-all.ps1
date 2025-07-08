@@ -33,6 +33,7 @@ function Test-RunningAsSystem {
 	}
 }
 
+$ScriptTag = "2D"
 $LogName = 'DetectAvailableUpgradesAll'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -193,16 +194,16 @@ if ( (-Not ($ras)) -or $WingetPath) {
         }
 
         if ($count -eq 0) {
-            Write-Log -Message "No upgrades available [2D]"
+            Write-Log -Message "No upgrades available [$ScriptTag]"
             exit 0
         }
         
         $appList = $approvedApps -join ", "
-        Write-Log -Message "Found $count apps ready for upgrade: $appList [2D]"
+        Write-Log -Message "Found $count apps ready for upgrade: $appList [$ScriptTag]"
         exit 1
     }
-    Write-Log -Message "No upgrades (0x0000002) [2D]"
+    Write-Log -Message "No upgrades (0x0000002) [$ScriptTag]"
     exit 0
 }
-Write-Log -Message "Winget not detected [2D]"
+Write-Log -Message "Winget not detected [$ScriptTag]"
 exit 0 #change to 1 if the remediation script can install winget :)

@@ -66,6 +66,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
+$ScriptTag = "2C"
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -412,14 +413,14 @@ if ( (-Not ($ras)) -or $WingetPath) {
             }
         }
 
-        Write-Log -Message "Remediation completed: $count apps processed [2C]"
+        Write-Log -Message "Remediation completed: $count apps processed [$ScriptTag]"
         if ($message -ne "") {
-            Write-Log -Message "Apps upgraded: $message [2C]"
+            Write-Log -Message "Apps upgraded: $message [$ScriptTag]"
         }
         exit 0
     }
-    Write-Log -Message "No upgrades (0x0000002) [2C]"
+    Write-Log -Message "No upgrades (0x0000002) [$ScriptTag]"
     exit 0
 }
-Write-Log -Message "Winget not detected [2C]"
+Write-Log -Message "Winget not detected [$ScriptTag]"
 exit 0 #change to 1 if the remediation script can install winget :)

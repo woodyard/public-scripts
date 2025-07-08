@@ -65,6 +65,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
+$ScriptTag = "2B"
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -337,13 +338,13 @@ if ( (-Not ($ras)) -or $WingetPath) {
         }
 
         if ($count -eq 0) {
-            Write-Log -Message "No upgrades available [2B]"
+            Write-Log -Message "No upgrades available [$ScriptTag]"
             exit 0
         }
         if ($message -eq "") {
-            $message = "No upgrades available (0x0000001-$count) [2B]"
+            $message = "No upgrades available (0x0000001-$count) [$ScriptTag]"
         }
-        Write-Log -Message "$message [2B]"
+        Write-Log -Message "$message [$ScriptTag]"
         exit 1
     }
     Write-Log -Message "No upgrades (0x0000002)"
