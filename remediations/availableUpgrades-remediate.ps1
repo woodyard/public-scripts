@@ -1,3 +1,25 @@
+<#
+.SYNOPSIS
+    Winget Application Update Remediation Script
+
+.DESCRIPTION
+    This script performs application updates using winget based on a whitelist approach.
+    It supports both system and user context applications and includes blocking process detection.
+    The script is designed to work as a remediation script in Microsoft Intune remediation policies.
+
+.NOTES
+    Author: Henrik Skovgaard
+    Version: 2.0
+    
+    Version History:
+    1.0 - Initial version
+    2.0 - Fixed user context detection, improved error handling, enhanced blocking process logic
+    
+    Exit Codes:
+    0 - Script completed successfully
+    1 - OOBE not complete
+#>
+
 #Requires -RunAsAdministrator
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
@@ -68,19 +90,22 @@ $whitelistJSON = @'
         Disabled:           false,
         SystemContext:      true,
         UserContext:        true,
-        UserContextPath:    "$Env:LocalAppData\\Mozilla Firefox\\firefox.exe"
+        UserContextPath:    "$Env:LocalAppData\\Mozilla Firefox\\firefox.exe",
+        BlockingProcess:    "firefox"
     }
     ,{
         AppID:              "Google.Chrome",
         SystemContext:      true,
         UserContext:        true,
-        UserContextPath:    "$Env:LocalAppData\\Google\\Chrome\\Application\\chrome.exe"
+        UserContextPath:    "$Env:LocalAppData\\Google\\Chrome\\Application\\chrome.exe",
+        BlockingProcess:    "chrome"
     }
     ,{
         AppID:              "Microsoft.VisualStudioCode",
         SystemContext:      true,
         UserContext:        true,
-        UserContextPath:    "$Env:LocalAppData\\Programs\\Microsoft VS Code\\Code.exe"
+        UserContextPath:    "$Env:LocalAppData\\Programs\\Microsoft VS Code\\Code.exe",
+        BlockingProcess:    "Code"
     }
     ,{
         AppID:              "Salesforce.sfdx-cli",
@@ -117,47 +142,50 @@ $whitelistJSON = @'
         AppID:              "Citrix.Workspace",
         BlockingProcess:    "cdviewer"
     }
-    ,{        AppID:              "Notepad++.Notepad++"    }
-    ,{        AppID:              "7zip.7zip"    }
-    ,{        AppID:              "Zoom.Zoom"    }
-    ,{        AppID:              "Microsoft.PowerToys"    }
-    ,{        AppID:              "AgileBits.1Password"    }
-    ,{        AppID:              "Logitech.SetPoint"    }
-    ,{        AppID:              "TheDocumentFoundation.LibreOffice"    }
-    ,{        AppID:              "Lenovo.QuickClean"    }
-    ,{        AppID:              "Bitwarden.Bitwarden"    }
-    ,{        AppID:              "SumatraPDF.SumatraPDF"    }
-    ,{        AppID:              "Microsoft.WindowsTerminal"    }
-    ,{        AppID:              "Logitech.UnifyingSoftware"    }
-    ,{        AppID:              "Microsoft.Azure.StorageExplorer"    }
-    ,{        AppID:              "calibre.calibre"    }
-    ,{        AppID:              "wethat.onenotetaggingkit"    }
-    ,{        AppID:              "LogMeIn.LastPass"    }
-    ,{        AppID:              "Microsoft.PowerShell.Preview"    }
-    ,{        AppID:              "PuTTY.PuTTY"    }
-    ,{        AppID:              "Git.Git"    }
-    ,{        AppID:              "RARLab.WinRAR"    }
-    ,{        AppID:              "JGraph.Draw"    }
-    ,{        AppID:              "Meld.Meld"    }
-    ,{        AppID:              "Kitware.CMake"    }
-    ,{        AppID:              "VideoLAN.VLC"    }
-    ,{        AppID:              "Jabra.Direct"    }
-    ,{        AppID:              "ArtifexSoftware.GhostScript"    }
-    ,{        AppID:              "ImageMagick.ImageMagick"    }
-    ,{        AppID:              "IrfanSkiljan.IrfanView"    }
-    ,{        AppID:              "OpenJS.NodeJS.LTS"    }
-    ,{        AppID:              "Microsoft.webpicmd"    }
-    ,{        AppID:              "Apache.OpenOffice"    }
-    ,{        AppID:              "DominikReichl.KeePass"    }
-    ,{        AppID:              "Microsoft.UpdateAssistant"    }
-    ,{        AppID:              "Amazon.AWSCLI"    }
-    ,{        AppID:              "Keybase.Keybase" }
-    ,{        AppID:              "Anki.Anki" }
+    ,{        AppID:              "Notepad++.Notepad++",              BlockingProcess:    "notepad++" }
+    ,{        AppID:              "7zip.7zip",                        BlockingProcess:    "7zFM" }
+    ,{        AppID:              "Zoom.Zoom",                        BlockingProcess:    "Zoom" }
+    ,{        AppID:              "Microsoft.PowerToys",              BlockingProcess:    "PowerToys" }
+    ,{        AppID:              "AgileBits.1Password",              BlockingProcess:    "1Password" }
+    ,{        AppID:              "Logitech.SetPoint" }
+    ,{        AppID:              "TheDocumentFoundation.LibreOffice", BlockingProcess:    "soffice" }
+    ,{        AppID:              "Lenovo.QuickClean" }
+    ,{        AppID:              "Bitwarden.Bitwarden",              BlockingProcess:    "Bitwarden" }
+    ,{        AppID:              "SumatraPDF.SumatraPDF",            BlockingProcess:    "SumatraPDF" }
+    ,{        AppID:              "Microsoft.WindowsTerminal",        BlockingProcess:    "WindowsTerminal" }
+    ,{        AppID:              "Logitech.UnifyingSoftware" }
+    ,{        AppID:              "Microsoft.Azure.StorageExplorer",  BlockingProcess:    "StorageExplorer" }
+    ,{        AppID:              "calibre.calibre",                  BlockingProcess:    "calibre" }
+    ,{        AppID:              "wethat.onenotetaggingkit" }
+    ,{        AppID:              "LogMeIn.LastPass",                 BlockingProcess:    "LastPass" }
+    ,{        AppID:              "Microsoft.PowerShell.Preview",     BlockingProcess:    "pwsh" }
+    ,{        AppID:              "PuTTY.PuTTY",                      BlockingProcess:    "putty" }
+    ,{        AppID:              "Git.Git" }
+    ,{        AppID:              "RARLab.WinRAR",                    BlockingProcess:    "WinRAR" }
+    ,{        AppID:              "JGraph.Draw" }
+    ,{        AppID:              "Meld.Meld",                        BlockingProcess:    "Meld" }
+    ,{        AppID:              "Kitware.CMake" }
+    ,{        AppID:              "VideoLAN.VLC",                     BlockingProcess:    "vlc" }
+    ,{        AppID:              "Jabra.Direct",                     BlockingProcess:    "JabraDirectCoreService" }
+    ,{        AppID:              "ArtifexSoftware.GhostScript" }
+    ,{        AppID:              "ImageMagick.ImageMagick" }
+    ,{        AppID:              "IrfanSkiljan.IrfanView",           BlockingProcess:    "i_view64" }
+    ,{        AppID:              "OpenJS.NodeJS.LTS" }
+    ,{        AppID:              "Microsoft.webpicmd" }
+    ,{        AppID:              "Apache.OpenOffice",                BlockingProcess:    "soffice" }
+    ,{        AppID:              "DominikReichl.KeePass",            BlockingProcess:    "KeePass" }
+    ,{        AppID:              "Microsoft.UpdateAssistant" }
+    ,{        AppID:              "Amazon.AWSCLI" }
+    ,{        AppID:              "Keybase.Keybase",                  BlockingProcess:    "Keybase" }
+    ,{        AppID:              "Anki.Anki",                        BlockingProcess:    "anki" }
     ,{        AppID:              "PostgreSQL.PostgreSQL" }
-    ,{        AppID:              "WinSCP.WinSCP" }
-    ,{        AppID:              "WinMerge.WinMerge" }
-    ,{        AppID:              "Adobe.Acrobat.Reader.64-bit"}
+    ,{        AppID:              "WinSCP.WinSCP",                    BlockingProcess:    "WinSCP" }
+    ,{        AppID:              "WinMerge.WinMerge",                BlockingProcess:    "WinMergeU" }
+    ,{        AppID:              "Adobe.Acrobat.Reader.64-bit",      BlockingProcess:    "AcroRd32" }
     ,{        AppID:              "RazerInc.RazerInstaller"}
+    ,{        AppID:              "Cloudflare.cloudflared"}
+    ,{        AppID:              "Microsoft.Bicep"}
+    ,{        AppID:              "JanDeDobbeleer.OhMyPosh"}
 ]
 '@
 
@@ -169,8 +197,14 @@ if ($ResolveWingetPath) {
     $WingetPath = $ResolveWingetPath[-1].Path
 }
 
-$whitelistConfig = $whitelistJSON | ConvertFrom-Json -ErrorAction Stop
-$whitelistConfig = $whitelistConfig | Where-Object { ($_.Disabled -eq $null -or $_.Disabled -eq $false) }
+try {
+    $whitelistConfig = $whitelistJSON | ConvertFrom-Json -ErrorAction Stop
+    $whitelistConfig = $whitelistConfig | Where-Object { ($_.Disabled -eq $null -or $_.Disabled -eq $false) }
+    Write-Log -Message "Successfully loaded whitelist configuration with $($whitelistConfig.Count) enabled apps"
+} catch {
+    Write-Log -Message "Error parsing whitelist JSON: $($_.Exception.Message)"
+    exit 1
+}
 
 $ras = $true
 If (-Not (Test-RunningAsSystem)) {
@@ -184,11 +218,12 @@ If (-Not (Test-RunningAsSystem)) {
     $OUTPUT = $(winget upgrade --accept-source-agreements)
     Write-Log -Message "Local user mode"
 }
-elseif ($wingetpath) {
-    Write-Log -Message $wingetpath
-    Set-Location $wingetpath
+elseif ($WingetPath) {
+    Write-Log -Message $WingetPath
+    Set-Location $WingetPath
 
-    $whitelistConfig = $whitelistConfig | Where-Object { ($_.SystemContext -eq $null -or $_.SystemContext -eq $true) -or ($_.UserContext -eq $null -or $_.UserContext -eq $false) }
+    # In system context, we can upgrade both system and user context apps
+    $whitelistConfig = $whitelistConfig | Where-Object { ($_.SystemContext -eq $null -or $_.SystemContext -eq $true) -or ($_.UserContext -eq $null -or $_.UserContext -eq $true) }
 
     # call this command twice, to see if output is better
     $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
@@ -196,14 +231,13 @@ elseif ($wingetpath) {
 #    $OUTPUT = $OUTPUT.replace("Γ","").replace("Ç","").replace("ª","")
 }
 
-if ( (-Not ($ras)) -or $wingetpath) {
+if ( (-Not ($ras)) -or $WingetPath) {
     $headerLine = -1
     $lineCount = 0
 
     foreach ($line in $OUTPUT) {
-        if ($line -like "Name*") {
+        if ($line -like "Name*" -and $headerLine -eq -1) {
             $headerLine = $lineCount
-            continue
         }
         $lineCount++
     }
@@ -214,9 +248,16 @@ if ( (-Not ($ras)) -or $wingetpath) {
         $versionPos = $str.indexOf("Version")-1
 
         $LIST= [System.Collections.ArrayList]::new()
-        for ($i = $headerLine+2; $i -lt $OUTPUT.count-1; $i++ ) {
+        for ($i = $headerLine+2; $i -lt $OUTPUT.count; $i++ ) {
             $lineData = $OUTPUT[$i]
-            $LIST.Add(($lineData[$idPos..$versionPos] -Join "").trim())
+            # Stop parsing if we hit the second section or empty lines
+            if ($lineData -like "*upgrade available, but require*" -or $lineData.Trim() -eq "" -or $lineData -like "*following packages*") {
+                break
+            }
+            $appId = ($lineData[$idPos..$versionPos] -Join "").trim()
+            if ($appId -ne "") {
+                $null = $LIST.Add($appId)
+            }
         }
 
         $count = 0
@@ -257,18 +298,90 @@ if ( (-Not ($ras)) -or $wingetpath) {
 
                 if ($doUpgrade) {
                     $count++
-                    if ($ras) {
-                        $(.\winget.exe upgrade --silent --accept-source-agreements --id $app)
-                    }
-                    else {
-                        $(winget upgrade --silent --accept-source-agreements --id $app)
-                    }
+                    Write-Log -Message "Starting upgrade for: $app"
                     
-                    $message += $app + "|"
+                    try {
+                        Write-Log -Message "Executing winget upgrade for: $app"
+                        
+                        # First attempt: Standard upgrade
+                        if ($ras) {
+                            $upgradeResult = & .\winget.exe upgrade --silent --accept-source-agreements --id $app 2>&1
+                        }
+                        else {
+                            $upgradeResult = & winget upgrade --silent --accept-source-agreements --id $app 2>&1
+                        }
+                        
+                        $upgradeOutput = $upgradeResult -join "`n"
+                        # Clean up winget output for logging
+                        $cleanOutput = $upgradeOutput -replace '[\-\\\|\/]', '' -replace '\s+', ' ' -replace '^\s+', ''
+                        $lines = $cleanOutput -split "`n" | Where-Object { $_.Trim() -ne "" -and $_.Length -gt 10 }
+                        Write-Log -Message "Winget result for $app : $($lines[0..2] -join '; ')"
+                        
+                        # Handle specific failure cases
+                        if ($upgradeOutput -like "*install technology is different*") {
+                            Write-Log -Message "Install technology mismatch detected for $app. Attempting uninstall and reinstall."
+                            
+                            # First uninstall
+                            if ($ras) {
+                                $uninstallResult = & .\winget.exe uninstall --silent --id $app 2>&1
+                            } else {
+                                $uninstallResult = & winget uninstall --silent --id $app 2>&1
+                            }
+                            
+                            $uninstallOutput = $uninstallResult -join "`n"
+                            if ($uninstallOutput -like "*Successfully uninstalled*") {
+                                Write-Log -Message "Successfully uninstalled $app"
+                            } else {
+                                Write-Log -Message "Uninstall issue for $app"
+                            }
+                            
+                            # Wait a moment for cleanup
+                            Start-Sleep -Seconds 2
+                            
+                            # Then install fresh
+                            if ($ras) {
+                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements --id $app 2>&1
+                            } else {
+                                $upgradeResult = & winget install --silent --accept-source-agreements --id $app 2>&1
+                            }
+                            
+                            $upgradeOutput = $upgradeResult -join "`n"
+                            Write-Log -Message "Fresh install completed for $app"
+                            
+                        } elseif ($upgradeOutput -like "*Uninstall failed*") {
+                            Write-Log -Message "Uninstall failure detected for $app. Trying alternative approaches."
+                            
+                            # Try install with --force to override
+                            if ($ras) {
+                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements --force --id $app 2>&1
+                            } else {
+                                $upgradeResult = & winget install --silent --accept-source-agreements --force --id $app 2>&1
+                            }
+                            
+                            $upgradeOutput = $upgradeResult -join "`n"
+                            Write-Log -Message "Force install completed for $app"
+                        }
+                        
+                        # Evaluate success
+                        if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*") {
+                            Write-Log -Message "Upgrade completed successfully for: $app"
+                            $message += $app + "|"
+                        } else {
+                            Write-Log -Message "Upgrade failed for $app - Exit code: $LASTEXITCODE"
+                            $message += $app + " (FAILED)|"
+                        }
+                    } catch {
+                        Write-Log -Message "Error upgrading $app : $($_.Exception.Message)"
+                        $message += $app + " (ERROR)|"
+                    }
                 }
             }
         }
 
+        Write-Log -Message "Remediation completed: $count apps processed"
+        if ($message -ne "") {
+            Write-Log -Message "Apps upgraded: $message"
+        }
         exit 0
     }
     Write-Log -Message "No upgrades (0x0000002)"
