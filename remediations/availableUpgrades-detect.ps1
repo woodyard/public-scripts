@@ -186,6 +186,7 @@ $whitelistJSON = @'
     ,{        AppID:              "Microsoft.Bicep"}
     ,{        AppID:              "JanDeDobbeleer.OhMyPosh"}
     ,{        AppID:              "Logitech.Options"}
+    ,{        AppID:              "Logitech.OptionsPlus"}
     ,{        AppID:              "TrackerSoftware.PDF-XChangeEditor"}
 ]
 '@
