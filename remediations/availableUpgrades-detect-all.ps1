@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.5
-    Tag: 2P
+    Version: 2.6
+    Tag: 2U
     
     Version History:
     1.0 - Initial version
@@ -20,6 +20,7 @@
     2.3 - Fixed timestamp format in Write-Log function (HH:MM:ss → HH:mm:ss)
     2.4 - Improved console output: tag moved to front, removed date from console (kept in log), added startup date log
     2.5 - ScriptTag now appears before timestamp in console output
+    2.6 - Improved date format from MM-dd-yy to dd.MM.yyyy for better readability
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -36,7 +37,7 @@ function Test-RunningAsSystem {
 	}
 }
 
-$ScriptTag = "2P"
+$ScriptTag = "2U"
 $LogName = 'DetectAvailableUpgradesAll'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -65,7 +66,7 @@ if ($esp) {
 
 function Write-Log($message) #Log script messages to temp directory
 {
-    $LogMessage = ((Get-Date -Format "MM-dd-yy HH:mm:ss ") + $message)
+    $LogMessage = ((Get-Date -Format "dd.MM.yyyy HH:mm:ss ") + $message)
     # Extract ScriptTag from message if present, or use global variable
     if ($message -match '^\[([A-Z0-9]+)\]\s*(.*)') {
         $tag = $matches[1]
@@ -79,7 +80,7 @@ function Write-Log($message) #Log script messages to temp directory
 }
 
 # Log script start with full date
-Write-Log -Message "Script started on $(Get-Date -Format 'dd-MM-yy')"
+Write-Log -Message "Script started on $(Get-Date -Format 'dd.MM.yyyy')"
 
 <#
 #Only run this on AAD joined machine!
