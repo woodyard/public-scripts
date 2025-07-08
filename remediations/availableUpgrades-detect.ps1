@@ -10,7 +10,7 @@
 .NOTES
     Author: Henrik Skovgaard
     Version: 2.2
-    Tag: 2F
+    Tag: 2I
     
     Version History:
     1.0 - Initial version
@@ -66,7 +66,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "2F"
+$ScriptTag = "2I"
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -352,4 +352,4 @@ if ( (-Not ($ras)) -or $WingetPath) {
     exit 0
 }
 Write-Log -Message "Winget not detected"
-exit 0 #change to 1 if the remediation script can install winget :)
+exit 0

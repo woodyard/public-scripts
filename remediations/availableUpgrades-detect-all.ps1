@@ -10,7 +10,7 @@
 .NOTES
     Author: Henrik Skovgaard
     Version: 2.3
-    Tag: 2E
+    Tag: 2J
     
     Version History:
     1.0 - Initial version
@@ -34,7 +34,7 @@ function Test-RunningAsSystem {
 	}
 }
 
-$ScriptTag = "2E"
+$ScriptTag = "2J"
 $LogName = 'DetectAvailableUpgradesAll'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -207,4 +207,4 @@ if ( (-Not ($ras)) -or $WingetPath) {
     exit 0
 }
 Write-Log -Message "Winget not detected [$ScriptTag]"
-exit 0 #change to 1 if the remediation script can install winget :)
+exit 0
