@@ -9,14 +9,15 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.2
-    Tag: 2D
+    Version: 2.3
+    Tag: 2E
     
     Version History:
     1.0 - Initial version
     2.0 - Fixed parsing bugs, improved error handling, clean output
     2.1 - Fixed progress indicator parsing bug that captured winget spinner characters as app names
     2.2 - Added 2-character tag system for version tracking
+    2.3 - Fixed timestamp format in Write-Log function (HH:MM:ss → HH:mm:ss)
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -33,7 +34,7 @@ function Test-RunningAsSystem {
 	}
 }
 
-$ScriptTag = "2D"
+$ScriptTag = "2E"
 $LogName = 'DetectAvailableUpgradesAll'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -62,7 +63,7 @@ if ($esp) {
 
 function Write-Log($message) #Log script messages to temp directory
 {
-    $LogMessage = ((Get-Date -Format "MM-dd-yy HH:MM:ss ") + $message)
+    $LogMessage = ((Get-Date -Format "MM-dd-yy HH:mm:ss ") + $message)
     $LogMessage
 	Out-File -InputObject $LogMessage -FilePath "$LogPath\$LogFullName" -Append -Encoding utf8
 }

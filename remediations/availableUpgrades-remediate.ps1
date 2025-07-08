@@ -9,13 +9,14 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.1
-    Tag: 2C
+    Version: 2.2
+    Tag: 2G
     
     Version History:
     1.0 - Initial version
     2.0 - Fixed user context detection, improved error handling, enhanced blocking process logic
     2.1 - Added Logitech.Options, Logitech.OptionsPlus, TrackerSoftware.PDF-XChangeEditor to whitelist
+    2.2 - Implemented variable-based tag system for easier maintenance
     
     Exit Codes:
     0 - Script completed successfully
@@ -66,7 +67,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "2C"
+$ScriptTag = "2G"
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
