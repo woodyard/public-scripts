@@ -1,3 +1,25 @@
+<#
+.SYNOPSIS
+    Winget Application Update Detection Script (All Apps)
+
+.DESCRIPTION
+    This script detects available application updates using winget and reports them to Intune.
+    It uses an exclude list approach instead of a whitelist to detect all available updates.
+    The script is designed to work as a detection script in Microsoft Intune remediation policies.
+
+.NOTES
+    Author: Henrik Skovgaard
+    Version: 2.0
+    
+    Version History:
+    1.0 - Initial version
+    2.0 - Fixed parsing bugs, improved error handling, clean output
+    
+    Exit Codes:
+    0 - No upgrades available or script completed successfully
+    1 - Upgrades available (triggers remediation) or ESP not complete
+#>
+
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 function Test-RunningAsSystem {
@@ -66,11 +88,10 @@ If (-Not (Test-RunningAsSystem)) {
     $OUTPUT = $(winget upgrade --accept-source-agreements)
     $OUTPUT = $(winget upgrade --accept-source-agreements)
     Write-Log -Message "Local user mode"
-    Write-Log -Message $OUTPUT
 }
-elseif ($wingetpath) {
-    Write-Log -Message $wingetpath
-    Set-Location $wingetpath
+elseif ($WingetPath) {
+    Write-Log -Message $WingetPath
+    Set-Location $WingetPath
 
     # call this command twice, to see if output is better
     $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
@@ -78,36 +99,36 @@ elseif ($wingetpath) {
 #    $OUTPUT = $OUTPUT.replace("Γ","").replace("Ç","").replace("ª","")
 }
 
-if ( (-Not ($ras)) -or $wingetpath) {
+if ( (-Not ($ras)) -or $WingetPath) {
     $headerLine = -1
     $lineCount = 0
 
     foreach ($line in $OUTPUT) {
-        if ($line -like "Name*") {
+        if ($line -like "Name*" -and $headerLine -eq -1) {
             $headerLine = $lineCount
-            continue
         }
         $lineCount++
     }
-    Write-Log -Message "Found header"
-
     if ($OUTPUT -and $lineCount -gt $headerLine+2) {
         $str = $OUTPUT[$headerLine]
         $idPos = $str.indexOf("Id")
         $versionPos = $str.indexOf("Version")-1
 
-        Write-Log -Message "Detecting app ids"
-
         $LIST= [System.Collections.ArrayList]::new()
-        for ($i = $headerLine+2; $i -lt $OUTPUT.count-1; $i++ ) {
+        for ($i = $headerLine+2; $i -lt $OUTPUT.count; $i++ ) {
             $lineData = $OUTPUT[$i]
-            $LIST.Add(($lineData[$idPos..$versionPos] -Join "").trim())
+            # Stop parsing if we hit the second section or empty lines
+            if ($lineData -like "*upgrade available, but require*" -or $lineData.Trim() -eq "" -or $lineData -like "*following packages*") {
+                break
+            }
+            $appId = ($lineData[$idPos..$versionPos] -Join "").trim()
+            if ($appId -ne "") {
+                $null = $LIST.Add($appId)
+            }
         }
 
-        Write-Log -Message "Done detecting app ids"
-
         $count = 0
-        $message = ""
+        $approvedApps = @()
 
         foreach ($app in $LIST) {
             if ($app -ne "") {
@@ -133,7 +154,7 @@ if ( (-Not ($ras)) -or $wingetpath) {
 
                 if ($doUpgrade) {
                     $count++
-                    $message += $app + "|"
+                    $approvedApps += $app
                 }
             }
         }
@@ -142,10 +163,9 @@ if ( (-Not ($ras)) -or $wingetpath) {
             Write-Log -Message "No upgrades available"
             exit 0
         }
-        if ($message -eq "") {
-            $message = "No upgrades available (0x0000001-$count)"
-        }
-        Write-Log -Message $message
+        
+        $appList = $approvedApps -join ", "
+        Write-Log -Message "Found $count apps ready for upgrade: $appList"
         exit 1
     }
     Write-Log -Message "No upgrades (0x0000002)"
