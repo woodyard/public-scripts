@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.3
-    Tag: 2J
+    Version: 2.5
+    Tag: 2P
     
     Version History:
     1.0 - Initial version
@@ -18,6 +18,8 @@
     2.1 - Fixed progress indicator parsing bug that captured winget spinner characters as app names
     2.2 - Added 2-character tag system for version tracking
     2.3 - Fixed timestamp format in Write-Log function (HH:MM:ss → HH:mm:ss)
+    2.4 - Improved console output: tag moved to front, removed date from console (kept in log), added startup date log
+    2.5 - ScriptTag now appears before timestamp in console output
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -34,7 +36,7 @@ function Test-RunningAsSystem {
 	}
 }
 
-$ScriptTag = "2J"
+$ScriptTag = "2P"
 $LogName = 'DetectAvailableUpgradesAll'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -64,9 +66,20 @@ if ($esp) {
 function Write-Log($message) #Log script messages to temp directory
 {
     $LogMessage = ((Get-Date -Format "MM-dd-yy HH:mm:ss ") + $message)
-    $LogMessage
+    # Extract ScriptTag from message if present, or use global variable
+    if ($message -match '^\[([A-Z0-9]+)\]\s*(.*)') {
+        $tag = $matches[1]
+        $cleanMessage = $matches[2]
+        $ConsoleMessage = "[$tag] " + (Get-Date -Format "HH:mm:ss ") + $cleanMessage
+    } else {
+        $ConsoleMessage = "[$ScriptTag] " + (Get-Date -Format "HH:mm:ss ") + $message
+    }
+    $ConsoleMessage
 	Out-File -InputObject $LogMessage -FilePath "$LogPath\$LogFullName" -Append -Encoding utf8
 }
+
+# Log script start with full date
+Write-Log -Message "Script started on $(Get-Date -Format 'dd-MM-yy')"
 
 <#
 #Only run this on AAD joined machine!
@@ -195,16 +208,16 @@ if ( (-Not ($ras)) -or $WingetPath) {
         }
 
         if ($count -eq 0) {
-            Write-Log -Message "No upgrades available [$ScriptTag]"
+            Write-Log -Message "[$ScriptTag] No upgrades available"
             exit 0
         }
         
         $appList = $approvedApps -join ", "
-        Write-Log -Message "Found $count apps ready for upgrade: $appList [$ScriptTag]"
+        Write-Log -Message "[$ScriptTag] Found $count apps ready for upgrade: $appList"
         exit 1
     }
-    Write-Log -Message "No upgrades (0x0000002) [$ScriptTag]"
+    Write-Log -Message "[$ScriptTag] No upgrades (0x0000002)"
     exit 0
 }
-Write-Log -Message "Winget not detected [$ScriptTag]"
+Write-Log -Message "[$ScriptTag] Winget not detected"
 exit 0

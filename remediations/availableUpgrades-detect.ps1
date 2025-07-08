@@ -9,14 +9,16 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.2
-    Tag: 2I
+    Version: 2.4
+    Tag: 2M
     
     Version History:
     1.0 - Initial version
     2.0 - Fixed user context detection, improved error handling, added blocking process logic
     2.1 - Added Logitech.Options, Logitech.OptionsPlus, TrackerSoftware.PDF-XChangeEditor to whitelist
     2.2 - Implemented variable-based tag system for easier maintenance
+    2.3 - Improved console output: tag moved to front, removed date from console (kept in log), added startup date log
+    2.4 - ScriptTag now appears before timestamp in console output
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -35,7 +37,15 @@ function Test-RunningAsSystem {
 function Write-Log($message) #Log script messages to temp directory
 {
     $LogMessage = ((Get-Date -Format "MM-dd-yy HH:mm:ss ") + $message)
-    $LogMessage
+    # Extract ScriptTag from message if present, or use global variable
+    if ($message -match '^\[([A-Z0-9]+)\]\s*(.*)') {
+        $tag = $matches[1]
+        $cleanMessage = $matches[2]
+        $ConsoleMessage = "[$tag] " + (Get-Date -Format "HH:mm:ss ") + $cleanMessage
+    } else {
+        $ConsoleMessage = "[$ScriptTag] " + (Get-Date -Format "HH:mm:ss ") + $message
+    }
+    $ConsoleMessage
 	Out-File -InputObject $LogMessage -FilePath "$LogPath\$LogFullName" -Append -Encoding utf8
 }
 
@@ -66,7 +76,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "2I"
+$ScriptTag = "2M"
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -77,6 +87,9 @@ $userIsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole
 $useWhitelist = $true
 
 <# ----------------------------------------------- #>
+
+# Log script start with full date
+Write-Log -Message "Script started on $(Get-Date -Format 'dd-MM-yy')"
 
 <# Abort script in OOBE phase #>
 if (-not (OOBEComplete)) {
@@ -339,13 +352,13 @@ if ( (-Not ($ras)) -or $WingetPath) {
         }
 
         if ($count -eq 0) {
-            Write-Log -Message "No upgrades available [$ScriptTag]"
+            Write-Log -Message "[$ScriptTag] No upgrades available"
             exit 0
         }
         if ($message -eq "") {
-            $message = "No upgrades available (0x0000001-$count) [$ScriptTag]"
+            $message = "[$ScriptTag] No upgrades available (0x0000001-$count)"
         }
-        Write-Log -Message "$message [$ScriptTag]"
+        Write-Log -Message "[$ScriptTag] $message"
         exit 1
     }
     Write-Log -Message "No upgrades (0x0000002)"
