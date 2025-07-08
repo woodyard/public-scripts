@@ -9,11 +9,13 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.0
+    Version: 2.1
+    Tag: 2B
     
     Version History:
     1.0 - Initial version
     2.0 - Fixed user context detection, improved error handling, added blocking process logic
+    2.1 - Added Logitech.Options, Logitech.OptionsPlus, TrackerSoftware.PDF-XChangeEditor to whitelist
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -335,13 +337,13 @@ if ( (-Not ($ras)) -or $WingetPath) {
         }
 
         if ($count -eq 0) {
-            Write-Log -Message "No upgrades available"
+            Write-Log -Message "No upgrades available [2B]"
             exit 0
         }
         if ($message -eq "") {
-            $message = "No upgrades available (0x0000001-$count)"
+            $message = "No upgrades available (0x0000001-$count) [2B]"
         }
-        Write-Log -Message $message
+        Write-Log -Message "$message [2B]"
         exit 1
     }
     Write-Log -Message "No upgrades (0x0000002)"

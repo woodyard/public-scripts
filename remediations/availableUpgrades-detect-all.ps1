@@ -9,12 +9,14 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.1
+    Version: 2.2
+    Tag: 2D
     
     Version History:
     1.0 - Initial version
     2.0 - Fixed parsing bugs, improved error handling, clean output
     2.1 - Fixed progress indicator parsing bug that captured winget spinner characters as app names
+    2.2 - Added 2-character tag system for version tracking
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -191,16 +193,16 @@ if ( (-Not ($ras)) -or $WingetPath) {
         }
 
         if ($count -eq 0) {
-            Write-Log -Message "No upgrades available"
+            Write-Log -Message "No upgrades available [2D]"
             exit 0
         }
         
         $appList = $approvedApps -join ", "
-        Write-Log -Message "Found $count apps ready for upgrade: $appList"
+        Write-Log -Message "Found $count apps ready for upgrade: $appList [2D]"
         exit 1
     }
-    Write-Log -Message "No upgrades (0x0000002)"
+    Write-Log -Message "No upgrades (0x0000002) [2D]"
     exit 0
 }
-Write-Log -Message "Winget not detected"
+Write-Log -Message "Winget not detected [2D]"
 exit 0 #change to 1 if the remediation script can install winget :)

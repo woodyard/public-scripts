@@ -9,11 +9,13 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.0
+    Version: 2.1
+    Tag: 2C
     
     Version History:
     1.0 - Initial version
     2.0 - Fixed user context detection, improved error handling, enhanced blocking process logic
+    2.1 - Added Logitech.Options, Logitech.OptionsPlus, TrackerSoftware.PDF-XChangeEditor to whitelist
     
     Exit Codes:
     0 - Script completed successfully
@@ -410,14 +412,14 @@ if ( (-Not ($ras)) -or $WingetPath) {
             }
         }
 
-        Write-Log -Message "Remediation completed: $count apps processed"
+        Write-Log -Message "Remediation completed: $count apps processed [2C]"
         if ($message -ne "") {
-            Write-Log -Message "Apps upgraded: $message"
+            Write-Log -Message "Apps upgraded: $message [2C]"
         }
         exit 0
     }
-    Write-Log -Message "No upgrades (0x0000002)"
+    Write-Log -Message "No upgrades (0x0000002) [2C]"
     exit 0
 }
-Write-Log -Message "Winget not detected"
+Write-Log -Message "Winget not detected [2C]"
 exit 0 #change to 1 if the remediation script can install winget :)
