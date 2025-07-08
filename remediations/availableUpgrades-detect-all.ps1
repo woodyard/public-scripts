@@ -9,11 +9,12 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.0
+    Version: 2.1
     
     Version History:
     1.0 - Initial version
     2.0 - Fixed parsing bugs, improved error handling, clean output
+    2.1 - Fixed progress indicator parsing bug that captured winget spinner characters as app names
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -151,7 +152,8 @@ if ( (-Not ($ras)) -or $WingetPath) {
                 break
             }
             $appId = ($lineData[$idPos..$versionPos] -Join "").trim()
-            if ($appId -ne "") {
+            # Filter out progress indicators and single characters
+            if ($appId -ne "" -and $appId.Length -gt 2 -and $appId -notmatch '^[-\\|/]+$') {
                 $null = $LIST.Add($appId)
             }
         }
