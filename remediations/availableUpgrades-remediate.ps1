@@ -186,6 +186,8 @@ $whitelistJSON = @'
     ,{        AppID:              "Cloudflare.cloudflared"}
     ,{        AppID:              "Microsoft.Bicep"}
     ,{        AppID:              "JanDeDobbeleer.OhMyPosh"}
+    ,{        AppID:              "Logitech.Options"}
+    ,{        AppID:              "TrackerSoftware.PDF-XChangeEditor"}
 ]
 '@
 
