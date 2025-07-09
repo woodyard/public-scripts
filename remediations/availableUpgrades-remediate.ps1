@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.0
-    Tag: 3C
+    Version: 3.1
+    Tag: 3E
     
     Version History:
     1.0 - Initial version
@@ -25,6 +25,7 @@
     2.8 - Enhanced Adobe Reader blocking processes and improved multiple process support
     2.9 - Fixed Logitech.OptionsPlus AppID typo to match actual winget ID (OptonsPlus)
     3.0 - Added Microsoft.AzureDataStudio, Mythicsoft.AgentRansack, ParadoxInteractive.ParadoxLauncher, Foxit.FoxitReader.Inno, OBSProject.OBSStudio, Python.Launcher; Disabled Fortinet.FortiClientVPN
+    3.1 - Added ARM64 support for winget path resolution
     
     Exit Codes:
     0 - Script completed successfully
@@ -83,7 +84,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "3C"
+$ScriptTag = "3E"
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -226,7 +227,7 @@ $whitelistJSON = @'
 $excludeapps = 'Microsoft.Office','Microsoft.Teams','Microsoft.VisualStudio','VMware.HorizonClient','Microsoft.SQLServer','TeamViewer','Docker','DisplayLink.GraphicsDriver','Microsoft.VCRedist','Microsoft.Edge','Cisco.WebexTeams','Amazon.WorkspacesClient'
 
 
-$ResolveWingetPath = Resolve-Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe"
+$ResolveWingetPath = Resolve-Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_*64__8wekyb3d8bbwe"
 if ($ResolveWingetPath) {
     $WingetPath = $ResolveWingetPath[-1].Path
 }
