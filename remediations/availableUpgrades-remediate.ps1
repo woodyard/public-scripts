@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.1
-    Tag: 3E
+    Version: 3.4
+    Tag: 3H
     
     Version History:
     1.0 - Initial version
@@ -26,6 +26,9 @@
     2.9 - Fixed Logitech.OptionsPlus AppID typo to match actual winget ID (OptonsPlus)
     3.0 - Added Microsoft.AzureDataStudio, Mythicsoft.AgentRansack, ParadoxInteractive.ParadoxLauncher, Foxit.FoxitReader.Inno, OBSProject.OBSStudio, Python.Launcher; Disabled Fortinet.FortiClientVPN
     3.1 - Added ARM64 support for winget path resolution
+    3.2 - Added interactive popup to ask users about closing blocking processes
+    3.3 - Added GitHub.GitHubDesktop to whitelist; Fixed winget output parsing bug causing character-by-character display
+    3.4 - Moved whitelist configuration to external GitHub-hosted JSON file for centralized management
     
     Exit Codes:
     0 - Script completed successfully
@@ -83,8 +86,177 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
         return $IsOOBEComplete
 }
 
+function Show-ProcessCloseDialog {
+    param(
+        [string]$AppName,
+        [string]$ProcessName,
+        [int]$TimeoutSeconds = 60,
+        [bool]$DefaultTimeoutAction = $false,
+        [string]$FriendlyName = ""
+    )
+    
+    Write-Log -Message "Show-ProcessCloseDialog called for $AppName" | Out-Null
+    
+    # Use provided FriendlyName or fallback to AppName
+    $friendlyName = if (-not [string]::IsNullOrEmpty($FriendlyName)) { $FriendlyName } else { $AppName }
+    
+    Write-Log -Message "Friendly name resolved to: $friendlyName" | Out-Null
+    
+    $defaultAction = if ($DefaultTimeoutAction) { "Yes" } else { "No" }
+    $message = "An update is available for $friendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $friendlyName now to allow the update to proceed?`n`nThis dialog will automatically choose '$defaultAction' in $TimeoutSeconds seconds."
+    
+    try {
+        Write-Log -Message "Attempting to show Windows Forms dialog" | Out-Null
+        
+        # Try to use Windows Forms for interactive popup
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+        
+        # Create form
+        $form = New-Object System.Windows.Forms.Form
+        $form.Text = "Application Update Available"
+        $form.Size = New-Object System.Drawing.Size(500, 250)
+        $form.StartPosition = "CenterScreen"
+        $form.MaximizeBox = $false
+        $form.MinimizeBox = $false
+        $form.FormBorderStyle = "FixedDialog"
+        $form.TopMost = $true
+        
+        # Create label
+        $label = New-Object System.Windows.Forms.Label
+        $label.Location = New-Object System.Drawing.Point(20, 20)
+        $label.Size = New-Object System.Drawing.Size(450, 120)
+        $label.Text = $message
+        $label.TextAlign = "MiddleLeft"
+        $form.Controls.Add($label)
+        
+        # Create countdown label
+        $countdownLabel = New-Object System.Windows.Forms.Label
+        $countdownLabel.Location = New-Object System.Drawing.Point(20, 150)
+        $countdownLabel.Size = New-Object System.Drawing.Size(450, 20)
+        $countdownLabel.Text = "Time remaining: $TimeoutSeconds seconds"
+        $countdownLabel.ForeColor = [System.Drawing.Color]::Red
+        $form.Controls.Add($countdownLabel)
+        
+        # Create buttons
+        $buttonYes = New-Object System.Windows.Forms.Button
+        $buttonYes.Location = New-Object System.Drawing.Point(250, 180)
+        $buttonYes.Size = New-Object System.Drawing.Size(100, 30)
+        $buttonYes.Text = "Yes, Close App"
+        $buttonYes.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+        $form.Controls.Add($buttonYes)
+        
+        $buttonNo = New-Object System.Windows.Forms.Button
+        $buttonNo.Location = New-Object System.Drawing.Point(370, 180)
+        $buttonNo.Size = New-Object System.Drawing.Size(100, 30)
+        $buttonNo.Text = "No, Keep Open"
+        $buttonNo.DialogResult = [System.Windows.Forms.DialogResult]::No
+        $form.Controls.Add($buttonNo)
+        
+        # Create timer for countdown
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 1000
+        $timer.Tag = $TimeoutSeconds  # Use Tag property to store countdown value
+        
+        $timer.add_Tick({
+            $currentTimer = $this
+            $timeLeft = [int]$currentTimer.Tag
+            $timeLeft--
+            $currentTimer.Tag = $timeLeft
+            $countdownLabel.Text = "Time remaining: $timeLeft seconds"
+            if ($timeLeft -le 0) {
+                $currentTimer.Stop()
+                if ($DefaultTimeoutAction) {
+                    $form.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+                } else {
+                    $form.DialogResult = [System.Windows.Forms.DialogResult]::No
+                }
+                $form.Close()
+            }
+        })
+        
+        $timer.Start()
+        
+        Write-Log -Message "About to show dialog" | Out-Null
+        
+        # Show dialog
+        $result = $form.ShowDialog()
+        $timer.Stop()
+        $form.Dispose()
+        
+        Write-Log -Message "Dialog result for $friendlyName : $result" | Out-Null
+        
+        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+            Write-Log -Message "User chose to close $friendlyName for update" | Out-Null
+            return $true
+        } else {
+            Write-Log -Message "User chose to keep $friendlyName open (timeout or manual selection)" | Out-Null
+            return $false
+        }
+        
+    } catch {
+        Write-Log -Message "Error showing GUI dialog: $($_.Exception.Message)" | Out-Null
+        Write-Log -Message "Exception details: $($_.Exception.ToString())" | Out-Null
+        
+        # Fallback to command line approach for system context
+        try {
+            # Use msg.exe to show message to logged-in users
+            $sessionId = (quser | Where-Object { $_ -match "Active" } | ForEach-Object { ($_ -split '\s+')[2] })[0]
+            if ($sessionId) {
+                Write-Log -Message "Sending message to session $sessionId using msg.exe" | Out-Null
+                $msgResult = msg.exe $sessionId "/time:$TimeoutSeconds" "Update available for $friendlyName. Close the application? (This message will close automatically in $TimeoutSeconds seconds)"
+                
+                # Since msg.exe doesn't provide interactive response, default to No for safety
+                Write-Log -Message "msg.exe sent, defaulting to No for safety" | Out-Null
+                return $false
+            } else {
+                Write-Log -Message "No active user session found for popup" | Out-Null
+                return $false
+            }
+        } catch {
+            Write-Log -Message "Error with msg.exe fallback: $($_.Exception.Message)" | Out-Null
+            return $false
+        }
+    }
+}
+
+function Stop-BlockingProcesses {
+    param(
+        [string]$ProcessNames
+    )
+    
+    $processesToStop = $ProcessNames -split ','
+    $stoppedAny = $false
+    
+    foreach ($processName in $processesToStop) {
+        $processName = $processName.Trim()
+        $processes = Get-Process -Name $processName -ErrorAction SilentlyContinue
+        
+        if ($processes) {
+            try {
+                foreach ($process in $processes) {
+                    Write-Log -Message "Stopping process: $processName (PID: $($process.Id))"
+                    $process.CloseMainWindow()
+                    
+                    # Wait up to 10 seconds for graceful shutdown
+                    if (!$process.WaitForExit(10000)) {
+                        Write-Log -Message "Process $processName did not exit gracefully, forcing termination"
+                        $process.Kill()
+                    }
+                    $stoppedAny = $true
+                }
+                Write-Log -Message "Successfully stopped process: $processName"
+            } catch {
+                Write-Log -Message "Error stopping process $processName : $($_.Exception.Message)"
+            }
+        }
+    }
+    
+    return $stoppedAny
+}
+
 <# Script variables #>
-$ScriptTag = "3E"
+$ScriptTag = "3H"
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -107,122 +279,31 @@ if (-not (OOBEComplete)) {
 
 <# ---------------------------------------------- #>
 
-$whitelistJSON = @'
+# Fetch whitelist configuration from GitHub
+$whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"
+Write-Log -Message "Fetching whitelist configuration from GitHub"
+
+try {
+    $webClient = New-Object System.Net.WebClient
+    $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/3.4")
+    $whitelistJSON = $webClient.DownloadString($whitelistUrl)
+    Write-Log -Message "Successfully downloaded whitelist configuration from GitHub"
+} catch {
+    Write-Log -Message "Error downloading whitelist from GitHub: $($_.Exception.Message)"
+    Write-Log -Message "Falling back to local configuration"
+    
+    # Fallback to basic configuration if GitHub is unavailable
+    $whitelistJSON = @'
 [
-    {
-        AppID:              "Mozilla.Firefox",
-        Disabled:           false,
-        SystemContext:      true,
-        UserContext:        true,
-        UserContextPath:    "$Env:LocalAppData\\Mozilla Firefox\\firefox.exe",
-        BlockingProcess:    "firefox"
-    }
-    ,{
-        AppID:              "Google.Chrome",
-        SystemContext:      true,
-        UserContext:        true,
-        UserContextPath:    "$Env:LocalAppData\\Google\\Chrome\\Application\\chrome.exe",
-        BlockingProcess:    "chrome"
-    }
-    ,{
-        AppID:              "Microsoft.VisualStudioCode",
-        SystemContext:      true,
-        UserContext:        true,
-        UserContextPath:    "$Env:LocalAppData\\Programs\\Microsoft VS Code\\Code.exe",
-        BlockingProcess:    "Code"
-    }
-    ,{
-        AppID:              "Salesforce.sfdx-cli",
-        Disabled:           true
-    }
-    ,{        
-        AppID:              "Microsoft.WindowsPCHealthCheck",
-        Disabled:           true
-    }
-    ,{        
-        AppID:              "Azul.Zulu",
-        Disabled:           true
-    }
-    ,{        
-        AppID:              "Microsoft.Edge",
-        Disabled:           true
-    }
-    ,{
-        AppID:              "Oracle.JavaRuntimeEnvironment",
-        Disabled:           true
-    }
-    ,{        
-        AppID:              "RStudio.RStudio.OpenSource"
-    }
-    ,{        
-        AppID:              "Posit.RStudio",
-        BlockingProcess:    "rstudio"
-    }
-    ,{        
-        AppID:              "RProject.R",
-        BlockingProcess:    "rgui"
-    }
-    ,{        
-        AppID:              "Citrix.Workspace",
-        BlockingProcess:    "cdviewer"
-    }
-    ,{        AppID:              "Notepad++.Notepad++",              BlockingProcess:    "notepad++" }
-    ,{        AppID:              "7zip.7zip",                        BlockingProcess:    "7zFM" }
-    ,{        AppID:              "Zoom.Zoom",                        BlockingProcess:    "Zoom" }
-    ,{        AppID:              "Microsoft.PowerToys",              BlockingProcess:    "PowerToys" }
-    ,{        AppID:              "AgileBits.1Password",              BlockingProcess:    "1Password" }
-    ,{        AppID:              "Logitech.SetPoint" }
-    ,{        AppID:              "TheDocumentFoundation.LibreOffice", BlockingProcess:    "soffice" }
-    ,{        AppID:              "Lenovo.QuickClean" }
-    ,{        AppID:              "Bitwarden.Bitwarden",              BlockingProcess:    "Bitwarden" }
-    ,{        AppID:              "SumatraPDF.SumatraPDF",            BlockingProcess:    "SumatraPDF" }
-    ,{        AppID:              "Microsoft.WindowsTerminal",        BlockingProcess:    "WindowsTerminal" }
-    ,{        AppID:              "Logitech.UnifyingSoftware" }
-    ,{        AppID:              "Microsoft.Azure.StorageExplorer",  BlockingProcess:    "StorageExplorer" }
-    ,{        AppID:              "calibre.calibre",                  BlockingProcess:    "calibre" }
-    ,{        AppID:              "wethat.onenotetaggingkit" }
-    ,{        AppID:              "LogMeIn.LastPass",                 BlockingProcess:    "LastPass" }
-    ,{        AppID:              "Microsoft.PowerShell.Preview",     BlockingProcess:    "pwsh" }
-    ,{        AppID:              "PuTTY.PuTTY",                      BlockingProcess:    "putty" }
-    ,{        AppID:              "Git.Git" }
-    ,{        AppID:              "RARLab.WinRAR",                    BlockingProcess:    "WinRAR" }
-    ,{        AppID:              "JGraph.Draw" }
-    ,{        AppID:              "Meld.Meld",                        BlockingProcess:    "Meld" }
-    ,{        AppID:              "Kitware.CMake" }
-    ,{        AppID:              "VideoLAN.VLC",                     BlockingProcess:    "vlc" }
-    ,{        AppID:              "Jabra.Direct",                     BlockingProcess:    "JabraDirectCoreService" }
-    ,{        AppID:              "ArtifexSoftware.GhostScript" }
-    ,{        AppID:              "ImageMagick.ImageMagick" }
-    ,{        AppID:              "IrfanSkiljan.IrfanView",           BlockingProcess:    "i_view64" }
-    ,{        AppID:              "OpenJS.NodeJS.LTS" }
-    ,{        AppID:              "Microsoft.webpicmd" }
-    ,{        AppID:              "Apache.OpenOffice",                BlockingProcess:    "soffice" }
-    ,{        AppID:              "DominikReichl.KeePass",            BlockingProcess:    "KeePass" }
-    ,{        AppID:              "Microsoft.UpdateAssistant" }
-    ,{        AppID:              "Amazon.AWSCLI" }
-    ,{        AppID:              "Keybase.Keybase",                  BlockingProcess:    "Keybase" }
-    ,{        AppID:              "Anki.Anki",                        BlockingProcess:    "anki" }
-    ,{        AppID:              "PostgreSQL.PostgreSQL" }
-    ,{        AppID:              "WinSCP.WinSCP",                    BlockingProcess:    "WinSCP" }
-    ,{        AppID:              "WinMerge.WinMerge",                BlockingProcess:    "WinMergeU" }
-    ,{        AppID:              "Adobe.Acrobat.Reader.64-bit",      BlockingProcess:    "AcroRd32,Acrobat,AcroBroker,AdobeARM,AdobeCollabSync" }
-    ,{        AppID:              "RazerInc.RazerInstaller"}
-    ,{        AppID:              "Cloudflare.cloudflared"}
-    ,{        AppID:              "Microsoft.Bicep"}
-    ,{        AppID:              "JanDeDobbeleer.OhMyPosh"}
-    ,{        AppID:              "Logitech.Options"}
-    ,{        AppID:              "Logitech.OptonsPlus", Disabled: true}
-    ,{        AppID:              "TrackerSoftware.PDF-XChangeEditor"}
-    ,{        AppID:              "Microsoft.VCLibs.Desktop.14"}
-    ,{        AppID:              "Microsoft.AzureDataStudio", BlockingProcess: "azuredatastudio"}
-    ,{        AppID:              "Mythicsoft.AgentRansack", BlockingProcess: "AgentRansack"}
-    ,{        AppID:              "ParadoxInteractive.ParadoxLauncher"}
-    ,{        AppID:              "Fortinet.FortiClientVPN", Disabled: true}
-    ,{        AppID:              "Foxit.FoxitReader.Inno", BlockingProcess: "FoxitReader"}
-    ,{        AppID:              "OBSProject.OBSStudio", BlockingProcess: "obs64"}
-    ,{        AppID:              "Python.Launcher"}
+    {"AppID": "Mozilla.Firefox", "FriendlyName": "Firefox", "BlockingProcess": "firefox"},
+    {"AppID": "Google.Chrome", "FriendlyName": "Chrome", "BlockingProcess": "chrome"},
+    {"AppID": "Microsoft.VisualStudioCode", "FriendlyName": "Visual Studio Code", "BlockingProcess": "Code"},
+    {"AppID": "Notepad++.Notepad++", "FriendlyName": "Notepad++", "BlockingProcess": "notepad++", "DefaultTimeoutAction": true},
+    {"AppID": "7zip.7zip", "FriendlyName": "7-Zip", "BlockingProcess": "7zFM", "DefaultTimeoutAction": true},
+    {"AppID": "GitHub.GitHubDesktop", "FriendlyName": "GitHub Desktop", "BlockingProcess": "GitHubDesktop"}
 ]
 '@
+}
 
 $excludeapps = 'Microsoft.Office','Microsoft.Teams','Microsoft.VisualStudio','VMware.HorizonClient','Microsoft.SQLServer','TeamViewer','Docker','DisplayLink.GraphicsDriver','Microsoft.VCRedist','Microsoft.Edge','Cisco.WebexTeams','Amazon.WorkspacesClient'
 
@@ -337,16 +418,105 @@ if ( (-Not ($ras)) -or $WingetPath) {
                             if (-not [string]::IsNullOrEmpty($blockingProcessNames)) {
                                 $processesToCheck = $blockingProcessNames -split ','
                                 $isBlocked = $false
+                                $runningProcessName = ""
+                                
                                 foreach ($processName in $processesToCheck) {
                                     $processName = $processName.Trim()
                                     if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
-                                        Write-Host "$processName is running."
-                                        Write-Log -Message "Skipping $($okapp.AppID) - blocking process $processName is running"
+                                        $runningProcessName = $processName
                                         $isBlocked = $true
                                         break
                                     }
                                 }
-                                if ($isBlocked) { continue }
+                                
+                                if ($isBlocked) {
+                                    Write-Log -Message "Blocking process $runningProcessName is running for $($okapp.AppID)"
+                                    
+                                    # Check if we can auto-close only safe processes
+                                    $autoCloseProcesses = $okapp.AutoCloseProcesses
+                                    $canAutoClose = $false
+                                    $userChoice = $false
+                                    
+                                    if (-not [string]::IsNullOrEmpty($autoCloseProcesses)) {
+                                        $autoCloseList = $autoCloseProcesses -split ','
+                                        $runningProcesses = @()
+                                        
+                                        # Get all currently running blocking processes
+                                        foreach ($processName in $processesToCheck) {
+                                            $processName = $processName.Trim()
+                                            if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
+                                                $runningProcesses += $processName
+                                            }
+                                        }
+                                        
+                                        # Check if ALL running processes are in the auto-close list
+                                        $canAutoClose = $true
+                                        foreach ($runningProcess in $runningProcesses) {
+                                            $isAutoCloseable = $false
+                                            foreach ($autoCloseProcess in $autoCloseList) {
+                                                if ($runningProcess -eq $autoCloseProcess.Trim()) {
+                                                    $isAutoCloseable = $true
+                                                    break
+                                                }
+                                            }
+                                            if (-not $isAutoCloseable) {
+                                                $canAutoClose = $false
+                                                break
+                                            }
+                                        }
+                                        
+                                        if ($canAutoClose) {
+                                            Write-Log -Message "Only auto-closeable processes running for $($okapp.AppID): $($runningProcesses -join ', '). Auto-closing without user prompt."
+                                            $userChoice = $true
+                                        }
+                                    }
+                                    
+                                    # If we can't auto-close, show the interactive popup
+                                    if (-not $canAutoClose) {
+                                        $defaultTimeoutAction = if ($okapp.DefaultTimeoutAction -eq $true) { $true } else { $false }
+                                        $userChoice = Show-ProcessCloseDialog -AppName $okapp.AppID -ProcessName $runningProcessName -TimeoutSeconds 60 -DefaultTimeoutAction $defaultTimeoutAction -FriendlyName $okapp.FriendlyName
+                                        
+                                        Write-Log -Message "Show-ProcessCloseDialog returned: $userChoice (type: $($userChoice.GetType().Name))"
+                                    }
+                                    
+                                    if ($userChoice) {
+                                        if ($canAutoClose) {
+                                            Write-Log -Message "Auto-closing safe processes for $($okapp.AppID)"
+                                        } else {
+                                            Write-Log -Message "User agreed to close blocking processes for $($okapp.AppID)"
+                                        }
+                                        
+                                        # Try to stop the blocking processes
+                                        $processesStopped = Stop-BlockingProcesses -ProcessNames $blockingProcessNames
+                                        
+                                        if ($processesStopped) {
+                                            Write-Log -Message "Successfully stopped blocking processes for $($okapp.AppID)"
+                                            # Wait a moment for processes to fully close
+                                            Start-Sleep -Seconds 3
+                                            
+                                            # Verify processes are really stopped
+                                            $stillRunning = $false
+                                            foreach ($processName in $processesToCheck) {
+                                                $processName = $processName.Trim()
+                                                if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
+                                                    $stillRunning = $true
+                                                    break
+                                                }
+                                            }
+                                            
+                                            if ($stillRunning) {
+                                                Write-Log -Message "Some processes still running after close attempt for $($okapp.AppID), skipping"
+                                                continue
+                                            }
+                                        } else {
+                                            Write-Log -Message "Failed to stop blocking processes for $($okapp.AppID), skipping"
+                                            continue
+                                        }
+                                    } else {
+                                        Write-Log -Message "User chose not to close blocking processes for $($okapp.AppID), skipping"
+                                        continue
+                                    }
+                                }
                             }
                             
                             if ($ras -or $userIsAdmin) {
@@ -383,10 +553,24 @@ if ( (-Not ($ras)) -or $WingetPath) {
                         }
                         
                         $upgradeOutput = $upgradeResult -join "`n"
-                        # Clean up winget output for logging
-                        $cleanOutput = $upgradeOutput -replace '[\-\\\|\/]', '' -replace '\s+', ' ' -replace '^\s+', ''
-                        $lines = $cleanOutput -split "`n" | Where-Object { $_.Trim() -ne "" -and $_.Length -gt 10 }
-                        Write-Log -Message "Winget result for $app : $($lines[0..2] -join '; ')"
+                        # Extract meaningful lines from winget output for logging
+                        $meaningfulLines = @()
+                        foreach ($line in $upgradeResult) {
+                            $cleanLine = $line.Trim()
+                            if ($cleanLine -ne "" -and $cleanLine.Length -gt 10 -and 
+                                $cleanLine -notmatch '^[\-\\\|\/\s]*$' -and 
+                                $cleanLine -notlike "*Progress:*" -and
+                                $cleanLine -notlike "*.*%*") {
+                                $meaningfulLines += $cleanLine
+                            }
+                        }
+                        
+                        if ($meaningfulLines.Count -gt 0) {
+                            $logMessage = ($meaningfulLines | Select-Object -First 2) -join ' | '
+                            Write-Log -Message "Winget result for $app : $logMessage"
+                        } else {
+                            Write-Log -Message "Winget result for $app : Processing completed"
+                        }
                         
                         # Handle specific failure cases
                         if ($upgradeOutput -like "*install technology is different*") {

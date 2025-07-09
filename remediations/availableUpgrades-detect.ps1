@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.1
-    Tag: 3D
+    Version: 3.3
+    Tag: 3F
     
     Version History:
     1.0 - Initial version
@@ -26,6 +26,8 @@
     2.9 - Fixed Logitech.OptionsPlus AppID typo to match actual winget ID (OptonsPlus)
     3.0 - Added Microsoft.AzureDataStudio, Mythicsoft.AgentRansack, ParadoxInteractive.ParadoxLauncher, Foxit.FoxitReader.Inno, OBSProject.OBSStudio, Python.Launcher; Disabled Fortinet.FortiClientVPN
     3.1 - Added ARM64 support for winget path resolution
+    3.2 - Added GitHub.GitHubDesktop to whitelist
+    3.3 - Moved whitelist configuration to external GitHub-hosted JSON file for centralized management
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -83,7 +85,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "3D"
+$ScriptTag = "3F"
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -106,122 +108,31 @@ if (-not (OOBEComplete)) {
 
 <# ---------------------------------------------- #>
 
-$whitelistJSON = @'
+# Fetch whitelist configuration from GitHub
+$whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"
+Write-Log -Message "Fetching whitelist configuration from GitHub"
+
+try {
+    $webClient = New-Object System.Net.WebClient
+    $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/3.3")
+    $whitelistJSON = $webClient.DownloadString($whitelistUrl)
+    Write-Log -Message "Successfully downloaded whitelist configuration from GitHub"
+} catch {
+    Write-Log -Message "Error downloading whitelist from GitHub: $($_.Exception.Message)"
+    Write-Log -Message "Falling back to local configuration"
+    
+    # Fallback to basic configuration if GitHub is unavailable
+    $whitelistJSON = @'
 [
-    {
-        AppID:              "Mozilla.Firefox",
-        Disabled:           false,
-        SystemContext:      true,
-        UserContext:        true,
-        UserContextPath:    "$Env:LocalAppData\\Mozilla Firefox\\firefox.exe",
-        BlockingProcess:    "firefox"
-    }
-    ,{
-        AppID:              "Google.Chrome",
-        SystemContext:      true,
-        UserContext:        true,
-        UserContextPath:    "$Env:LocalAppData\\Google\\Chrome\\Application\\chrome.exe",
-        BlockingProcess:    "chrome"
-    }
-    ,{
-        AppID:              "Microsoft.VisualStudioCode",
-        SystemContext:      true,
-        UserContext:        true,
-        UserContextPath:    "$Env:LocalAppData\\Programs\\Microsoft VS Code\\Code.exe",
-        BlockingProcess:    "Code"
-    }
-    ,{
-        AppID:              "Salesforce.sfdx-cli",
-        Disabled:           true
-    }
-    ,{        
-        AppID:              "Microsoft.WindowsPCHealthCheck",
-        Disabled:           true
-    }
-    ,{        
-        AppID:              "Azul.Zulu",
-        Disabled:           true
-    }
-    ,{        
-        AppID:              "Microsoft.Edge",
-        Disabled:           true
-    }
-    ,{
-        AppID:              "Oracle.JavaRuntimeEnvironment",
-        Disabled:           true
-    }
-    ,{        
-        AppID:              "RStudio.RStudio.OpenSource"
-    }
-    ,{        
-        AppID:              "Posit.RStudio",
-        BlockingProcess:    "rstudio"
-    }
-    ,{        
-        AppID:              "RProject.R",
-        BlockingProcess:    "rgui"
-    }
-    ,{        
-        AppID:              "Citrix.Workspace",
-        BlockingProcess:    "cdviewer"
-    }
-    ,{        AppID:              "Notepad++.Notepad++",              BlockingProcess:    "notepad++" }
-    ,{        AppID:              "7zip.7zip",                        BlockingProcess:    "7zFM" }
-    ,{        AppID:              "Zoom.Zoom",                        BlockingProcess:    "Zoom" }
-    ,{        AppID:              "Microsoft.PowerToys",              BlockingProcess:    "PowerToys" }
-    ,{        AppID:              "AgileBits.1Password",              BlockingProcess:    "1Password" }
-    ,{        AppID:              "Logitech.SetPoint" }
-    ,{        AppID:              "TheDocumentFoundation.LibreOffice", BlockingProcess:    "soffice" }
-    ,{        AppID:              "Lenovo.QuickClean" }
-    ,{        AppID:              "Bitwarden.Bitwarden",              BlockingProcess:    "Bitwarden" }
-    ,{        AppID:              "SumatraPDF.SumatraPDF",            BlockingProcess:    "SumatraPDF" }
-    ,{        AppID:              "Microsoft.WindowsTerminal",        BlockingProcess:    "WindowsTerminal" }
-    ,{        AppID:              "Logitech.UnifyingSoftware" }
-    ,{        AppID:              "Microsoft.Azure.StorageExplorer",  BlockingProcess:    "StorageExplorer" }
-    ,{        AppID:              "calibre.calibre",                  BlockingProcess:    "calibre" }
-    ,{        AppID:              "wethat.onenotetaggingkit" }
-    ,{        AppID:              "LogMeIn.LastPass",                 BlockingProcess:    "LastPass" }
-    ,{        AppID:              "Microsoft.PowerShell.Preview",     BlockingProcess:    "pwsh" }
-    ,{        AppID:              "PuTTY.PuTTY",                      BlockingProcess:    "putty" }
-    ,{        AppID:              "Git.Git" }
-    ,{        AppID:              "RARLab.WinRAR",                    BlockingProcess:    "WinRAR" }
-    ,{        AppID:              "JGraph.Draw" }
-    ,{        AppID:              "Meld.Meld",                        BlockingProcess:    "Meld" }
-    ,{        AppID:              "Kitware.CMake" }
-    ,{        AppID:              "VideoLAN.VLC",                     BlockingProcess:    "vlc" }
-    ,{        AppID:              "Jabra.Direct",                     BlockingProcess:    "JabraDirectCoreService" }
-    ,{        AppID:              "ArtifexSoftware.GhostScript" }
-    ,{        AppID:              "ImageMagick.ImageMagick" }
-    ,{        AppID:              "IrfanSkiljan.IrfanView",           BlockingProcess:    "i_view64" }
-    ,{        AppID:              "OpenJS.NodeJS.LTS" }
-    ,{        AppID:              "Microsoft.webpicmd" }
-    ,{        AppID:              "Apache.OpenOffice",                BlockingProcess:    "soffice" }
-    ,{        AppID:              "DominikReichl.KeePass",            BlockingProcess:    "KeePass" }
-    ,{        AppID:              "Microsoft.UpdateAssistant" }
-    ,{        AppID:              "Amazon.AWSCLI" }
-    ,{        AppID:              "Keybase.Keybase",                  BlockingProcess:    "Keybase" }
-    ,{        AppID:              "Anki.Anki",                        BlockingProcess:    "anki" }
-    ,{        AppID:              "PostgreSQL.PostgreSQL" }
-    ,{        AppID:              "WinSCP.WinSCP",                    BlockingProcess:    "WinSCP" }
-    ,{        AppID:              "WinMerge.WinMerge",                BlockingProcess:    "WinMergeU" }
-    ,{        AppID:              "Adobe.Acrobat.Reader.64-bit",      BlockingProcess:    "AcroRd32,Acrobat,AcroBroker,AdobeARM,AdobeCollabSync" }
-    ,{        AppID:              "RazerInc.RazerInstaller"}
-    ,{        AppID:              "Cloudflare.cloudflared"}
-    ,{        AppID:              "Microsoft.Bicep"}
-    ,{        AppID:              "JanDeDobbeleer.OhMyPosh"}
-    ,{        AppID:              "Logitech.Options"}
-    ,{        AppID:              "Logitech.OptonsPlus", Disabled: true}
-    ,{        AppID:              "TrackerSoftware.PDF-XChangeEditor"}
-    ,{        AppID:              "Microsoft.VCLibs.Desktop.14"}
-    ,{        AppID:              "Microsoft.AzureDataStudio", BlockingProcess: "azuredatastudio"}
-    ,{        AppID:              "Mythicsoft.AgentRansack", BlockingProcess: "AgentRansack"}
-    ,{        AppID:              "ParadoxInteractive.ParadoxLauncher"}
-    ,{        AppID:              "Fortinet.FortiClientVPN", Disabled: true}
-    ,{        AppID:              "Foxit.FoxitReader.Inno", BlockingProcess: "FoxitReader"}
-    ,{        AppID:              "OBSProject.OBSStudio", BlockingProcess: "obs64"}
-    ,{        AppID:              "Python.Launcher"}
+    {"AppID": "Mozilla.Firefox", "BlockingProcess": "firefox"},
+    {"AppID": "Google.Chrome", "BlockingProcess": "chrome"},
+    {"AppID": "Microsoft.VisualStudioCode", "BlockingProcess": "Code"},
+    {"AppID": "Notepad++.Notepad++", "BlockingProcess": "notepad++"},
+    {"AppID": "7zip.7zip", "BlockingProcess": "7zFM"},
+    {"AppID": "GitHub.GitHubDesktop", "BlockingProcess": "GitHubDesktop"}
 ]
 '@
+}
 
 $excludeapps = 'Microsoft.Office','Microsoft.Teams','Microsoft.VisualStudio','VMware.HorizonClient','Microsoft.SQLServer','TeamViewer','Docker','DisplayLink.GraphicsDriver','Microsoft.VCRedist','Microsoft.Edge','Cisco.WebexTeams','Amazon.WorkspacesClient'
 

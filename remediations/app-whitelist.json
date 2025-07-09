@@ -1,0 +1,287 @@
+[
+    {
+        "AppID": "Mozilla.Firefox",
+        "FriendlyName": "Firefox",
+        "Disabled": false,
+        "SystemContext": true,
+        "UserContext": true,
+        "UserContextPath": "$Env:LocalAppData\\Mozilla Firefox\\firefox.exe",
+        "BlockingProcess": "firefox"
+    },
+    {
+        "AppID": "Google.Chrome",
+        "FriendlyName": "Chrome",
+        "SystemContext": true,
+        "UserContext": true,
+        "UserContextPath": "$Env:LocalAppData\\Google\\Chrome\\Application\\chrome.exe",
+        "BlockingProcess": "chrome"
+    },
+    {
+        "AppID": "Microsoft.VisualStudioCode",
+        "FriendlyName": "Visual Studio Code",
+        "SystemContext": true,
+        "UserContext": true,
+        "UserContextPath": "$Env:LocalAppData\\Programs\\Microsoft VS Code\\Code.exe",
+        "BlockingProcess": "Code"
+    },
+    {
+        "AppID": "Salesforce.sfdx-cli",
+        "Disabled": true
+    },
+    {
+        "AppID": "Microsoft.WindowsPCHealthCheck",
+        "Disabled": true
+    },
+    {
+        "AppID": "Azul.Zulu",
+        "Disabled": true
+    },
+    {
+        "AppID": "Microsoft.Edge",
+        "Disabled": true
+    },
+    {
+        "AppID": "Oracle.JavaRuntimeEnvironment",
+        "Disabled": true
+    },
+    {
+        "AppID": "RStudio.RStudio.OpenSource"
+    },
+    {
+        "AppID": "Posit.RStudio",
+        "BlockingProcess": "rstudio"
+    },
+    {
+        "AppID": "RProject.R",
+        "BlockingProcess": "rgui"
+    },
+    {
+        "AppID": "Citrix.Workspace",
+        "BlockingProcess": "cdviewer"
+    },
+    {
+        "AppID": "Notepad++.Notepad++",
+        "FriendlyName": "Notepad++",
+        "BlockingProcess": "notepad++",
+        "DefaultTimeoutAction": true
+    },
+    {
+        "AppID": "7zip.7zip",
+        "FriendlyName": "7-Zip",
+        "BlockingProcess": "7zFM",
+        "DefaultTimeoutAction": true
+    },
+    {
+        "AppID": "Zoom.Zoom",
+        "FriendlyName": "Zoom",
+        "BlockingProcess": "Zoom"
+    },
+    {
+        "AppID": "Microsoft.PowerToys",
+        "FriendlyName": "PowerToys",
+        "BlockingProcess": "PowerToys",
+        "DefaultTimeoutAction": true
+    },
+    {
+        "AppID": "AgileBits.1Password",
+        "FriendlyName": "1Password",
+        "BlockingProcess": "1Password"
+    },
+    {
+        "AppID": "Logitech.SetPoint"
+    },
+    {
+        "AppID": "TheDocumentFoundation.LibreOffice",
+        "BlockingProcess": "soffice"
+    },
+    {
+        "AppID": "Lenovo.QuickClean"
+    },
+    {
+        "AppID": "Bitwarden.Bitwarden",
+        "FriendlyName": "Bitwarden",
+        "BlockingProcess": "Bitwarden"
+    },
+    {
+        "AppID": "SumatraPDF.SumatraPDF",
+        "FriendlyName": "SumatraPDF",
+        "BlockingProcess": "SumatraPDF",
+        "DefaultTimeoutAction": true
+    },
+    {
+        "AppID": "Microsoft.WindowsTerminal",
+        "FriendlyName": "Windows Terminal",
+        "BlockingProcess": "WindowsTerminal",
+        "DefaultTimeoutAction": true
+    },
+    {
+        "AppID": "Logitech.UnifyingSoftware"
+    },
+    {
+        "AppID": "Microsoft.Azure.StorageExplorer",
+        "FriendlyName": "Azure Storage Explorer",
+        "BlockingProcess": "StorageExplorer"
+    },
+    {
+        "AppID": "calibre.calibre",
+        "FriendlyName": "Calibre",
+        "BlockingProcess": "calibre"
+    },
+    {
+        "AppID": "wethat.onenotetaggingkit"
+    },
+    {
+        "AppID": "LogMeIn.LastPass",
+        "FriendlyName": "LastPass",
+        "BlockingProcess": "LastPass"
+    },
+    {
+        "AppID": "Microsoft.PowerShell.Preview",
+        "BlockingProcess": "pwsh",
+        "DefaultTimeoutAction": true
+    },
+    {
+        "AppID": "PuTTY.PuTTY",
+        "BlockingProcess": "putty",
+        "DefaultTimeoutAction": true
+    },
+    {
+        "AppID": "Git.Git"
+    },
+    {
+        "AppID": "GitHub.GitHubDesktop",
+        "FriendlyName": "GitHub Desktop",
+        "BlockingProcess": "GitHubDesktop"
+    },
+    {
+        "AppID": "RARLab.WinRAR",
+        "BlockingProcess": "WinRAR",
+        "DefaultTimeoutAction": true
+    },
+    {
+        "AppID": "JGraph.Draw"
+    },
+    {
+        "AppID": "Meld.Meld",
+        "BlockingProcess": "Meld",
+        "DefaultTimeoutAction": true
+    },
+    {
+        "AppID": "Kitware.CMake"
+    },
+    {
+        "AppID": "VideoLAN.VLC",
+        "FriendlyName": "VLC Media Player",
+        "BlockingProcess": "vlc",
+        "DefaultTimeoutAction": true
+    },
+    {
+        "AppID": "Jabra.Direct",
+        "BlockingProcess": "JabraDirectCoreService"
+    },
+    {
+        "AppID": "ArtifexSoftware.GhostScript"
+    },
+    {
+        "AppID": "ImageMagick.ImageMagick"
+    },
+    {
+        "AppID": "IrfanSkiljan.IrfanView",
+        "BlockingProcess": "i_view64"
+    },
+    {
+        "AppID": "OpenJS.NodeJS.LTS"
+    },
+    {
+        "AppID": "Microsoft.webpicmd"
+    },
+    {
+        "AppID": "Apache.OpenOffice",
+        "BlockingProcess": "soffice"
+    },
+    {
+        "AppID": "DominikReichl.KeePass",
+        "BlockingProcess": "KeePass"
+    },
+    {
+        "AppID": "Microsoft.UpdateAssistant"
+    },
+    {
+        "AppID": "Amazon.AWSCLI"
+    },
+    {
+        "AppID": "Keybase.Keybase",
+        "BlockingProcess": "Keybase"
+    },
+    {
+        "AppID": "Anki.Anki",
+        "BlockingProcess": "anki"
+    },
+    {
+        "AppID": "PostgreSQL.PostgreSQL"
+    },
+    {
+        "AppID": "WinSCP.WinSCP",
+        "BlockingProcess": "WinSCP"
+    },
+    {
+        "AppID": "WinMerge.WinMerge",
+        "BlockingProcess": "WinMergeU"
+    },
+    {
+        "AppID": "Adobe.Acrobat.Reader.64-bit",
+        "BlockingProcess": "AcroRd32,Acrobat,AcroBroker,AdobeARM,AdobeCollabSync",
+        "AutoCloseProcesses": "AdobeCollabSync"
+    },
+    {
+        "AppID": "RazerInc.RazerInstaller"
+    },
+    {
+        "AppID": "Cloudflare.cloudflared"
+    },
+    {
+        "AppID": "Microsoft.Bicep"
+    },
+    {
+        "AppID": "JanDeDobbeleer.OhMyPosh"
+    },
+    {
+        "AppID": "Logitech.Options"
+    },
+    {
+        "AppID": "Logitech.OptonsPlus",
+        "Disabled": true
+    },
+    {
+        "AppID": "TrackerSoftware.PDF-XChangeEditor"
+    },
+    {
+        "AppID": "Microsoft.VCLibs.Desktop.14"
+    },
+    {
+        "AppID": "Microsoft.AzureDataStudio",
+        "BlockingProcess": "azuredatastudio"
+    },
+    {
+        "AppID": "Mythicsoft.AgentRansack",
+        "BlockingProcess": "AgentRansack"
+    },
+    {
+        "AppID": "ParadoxInteractive.ParadoxLauncher"
+    },
+    {
+        "AppID": "Fortinet.FortiClientVPN",
+        "Disabled": true
+    },
+    {
+        "AppID": "Foxit.FoxitReader.Inno",
+        "BlockingProcess": "FoxitReader"
+    },
+    {
+        "AppID": "OBSProject.OBSStudio",
+        "BlockingProcess": "obs64"
+    },
+    {
+        "AppID": "Python.Launcher"
+    }
+]
