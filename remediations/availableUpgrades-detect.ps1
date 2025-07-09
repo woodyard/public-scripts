@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.3
-    Tag: 3F
+    Version: 3.4
+    Tag: 3G
     
     Version History:
     1.0 - Initial version
@@ -28,6 +28,7 @@
     3.1 - Added ARM64 support for winget path resolution
     3.2 - Added GitHub.GitHubDesktop to whitelist
     3.3 - Moved whitelist configuration to external GitHub-hosted JSON file for centralized management
+    3.4 - Removed redundant exclude list logic to streamline whitelist-only approach
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -85,7 +86,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "3F"
+$ScriptTag = "3G"
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -133,9 +134,6 @@ try {
 ]
 '@
 }
-
-$excludeapps = 'Microsoft.Office','Microsoft.Teams','Microsoft.VisualStudio','VMware.HorizonClient','Microsoft.SQLServer','TeamViewer','Docker','DisplayLink.GraphicsDriver','Microsoft.VCRedist','Microsoft.Edge','Cisco.WebexTeams','Amazon.WorkspacesClient'
-
 
 $ResolveWingetPath = Resolve-Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_*64__8wekyb3d8bbwe"
 if ($ResolveWingetPath) {
@@ -239,42 +237,31 @@ if ( (-Not ($ras)) -or $WingetPath) {
 
         foreach ($app in $LIST) {
             if ($app -ne "") {
-                if ($useWhitelist) {
-                    $doUpgrade = $false
-                    foreach ($okapp in $whitelistConfig) {
-                        if ($app -like "*$($okapp.AppID)*") {
-                            # Check for blocking processes
-                            $blockingProcessNames = $okapp.BlockingProcess
-                            if (-not [string]::IsNullOrEmpty($blockingProcessNames)) {
-                                $processesToCheck = $blockingProcessNames -split ','
-                                $isBlocked = $false
-                                foreach ($processName in $processesToCheck) {
-                                    $processName = $processName.Trim()
-                                    if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
-                                        Write-Log -Message "Skipping $($okapp.AppID) - blocking process $processName is running"
-                                        $isBlocked = $true
-                                        break
-                                    }
+                $doUpgrade = $false
+                foreach ($okapp in $whitelistConfig) {
+                    if ($app -like "*$($okapp.AppID)*") {
+                        # Check for blocking processes
+                        $blockingProcessNames = $okapp.BlockingProcess
+                        if (-not [string]::IsNullOrEmpty($blockingProcessNames)) {
+                            $processesToCheck = $blockingProcessNames -split ','
+                            $isBlocked = $false
+                            foreach ($processName in $processesToCheck) {
+                                $processName = $processName.Trim()
+                                if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
+                                    Write-Log -Message "Skipping $($okapp.AppID) - blocking process $processName is running"
+                                    $isBlocked = $true
+                                    break
                                 }
-                                if ($isBlocked) { continue }
                             }
-                            
-                            if ($ras -or $userIsAdmin) {
-                                Write-Log -Message "Upgrade $($okapp.AppID) in system context"
-                                $doUpgrade = $true
-                                continue
-                            }
+                            if ($isBlocked) { continue }
                         }
-                    }
-                }
-                else { #use exclude list
-                    $doUpgrade = $true
-                    foreach ($exclude in $excludeapps) {
-                        if ($app -like "*$exclude*") {
-                            $doUpgrade = $false
+                        
+                        if ($ras -or $userIsAdmin) {
+                            Write-Log -Message "Upgrade $($okapp.AppID) in system context"
+                            $doUpgrade = $true
                             continue
                         }
-                    }  
+                    }
                 }
 
                 if ($doUpgrade) {

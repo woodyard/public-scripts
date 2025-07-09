@@ -10,7 +10,7 @@
 .NOTES
     Author: Henrik Skovgaard
     Version: 2.8
-    Tag: 2X
+    Tag: 2W
     
     Version History:
     1.0 - Initial version
@@ -22,7 +22,7 @@
     2.5 - ScriptTag now appears before timestamp in console output
     2.6 - Improved date format from MM-dd-yy to dd.MM.yyyy for better readability
     2.7 - Added ARM64 support for winget path resolution
-    2.8 - Removed TeamViewer from exclusion
+    2.8 - Added Fortinet.FortiClientVPN to exclude list
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -39,7 +39,7 @@ function Test-RunningAsSystem {
 	}
 }
 
-$ScriptTag = "2V"
+$ScriptTag = "2W"
 $LogName = 'DetectAvailableUpgradesAll'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -92,7 +92,7 @@ If ((Get-WmiObject -Class win32_computersystem).partofdomain) {
 }
 #>
 
-$excludeapps = 'Microsoft.Office','Microsoft.Teams','Microsoft.VisualStudio','VMware.HorizonClient','Microsoft.SQLServer','Docker','DisplayLink.GraphicsDriver','Microsoft.VCRedist','Microsoft.Edge','Cisco.WebexTeams','Amazon.WorkspacesClient','Salesforce.sfdx-cli','Microsoft.WindowsPCHealthCheck','Azul.Zulu'
+$excludeapps = 'Microsoft.Office','Microsoft.Teams','Microsoft.VisualStudio','VMware.HorizonClient','Microsoft.SQLServer','Docker','DisplayLink.GraphicsDriver','Microsoft.VCRedist','Microsoft.Edge','Cisco.WebexTeams','Amazon.WorkspacesClient','Salesforce.sfdx-cli','Microsoft.WindowsPCHealthCheck','Azul.Zulu','Fortinet.FortiClientVPN'
 
 $whitelist = ''
 

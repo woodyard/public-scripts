@@ -300,5 +300,28 @@
         "AppID": "TeamViewer.TeamViewer",
         "FriendlyName": "TeamViewer",
         "BlockingProcess": "TeamViewer"
+    },
+    {
+        "AppID": "Dropbox.Dropbox",
+        "FriendlyName": "Dropbox",
+        "BlockingProcess": "Dropbox"
+    },
+    {
+        "AppID": "Microsoft.AzureCLI",
+        "FriendlyName": "Azure CLI"
+    },
+    {
+        "AppID": "Microsoft.PowerAutomateDesktop",
+        "FriendlyName": "Power Automate Desktop",
+        "BlockingProcess": "PAD.Console.Host,PAD.Robot.Service"
+    },
+    {
+        "AppID": "Microsoft.DotNet.Runtime.8"
+    },
+    {
+        "AppID": "Microsoft.PowerShell",
+        "FriendlyName": "PowerShell",
+        "BlockingProcess": "pwsh",
+        "DefaultTimeoutAction": true
     }
 ]

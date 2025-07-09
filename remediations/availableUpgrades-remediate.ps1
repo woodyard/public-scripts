@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.4
-    Tag: 3H
+    Version: 3.5
+    Tag: 3I
     
     Version History:
     1.0 - Initial version
@@ -29,6 +29,7 @@
     3.2 - Added interactive popup to ask users about closing blocking processes
     3.3 - Added GitHub.GitHubDesktop to whitelist; Fixed winget output parsing bug causing character-by-character display
     3.4 - Moved whitelist configuration to external GitHub-hosted JSON file for centralized management
+    3.5 - Removed redundant exclude list logic to streamline whitelist-only approach
     
     Exit Codes:
     0 - Script completed successfully
@@ -256,7 +257,7 @@ function Stop-BlockingProcesses {
 }
 
 <# Script variables #>
-$ScriptTag = "3H"
+$ScriptTag = "3I"
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -304,9 +305,6 @@ try {
 ]
 '@
 }
-
-$excludeapps = 'Microsoft.Office','Microsoft.Teams','Microsoft.VisualStudio','VMware.HorizonClient','Microsoft.SQLServer','TeamViewer','Docker','DisplayLink.GraphicsDriver','Microsoft.VCRedist','Microsoft.Edge','Cisco.WebexTeams','Amazon.WorkspacesClient'
-
 
 $ResolveWingetPath = Resolve-Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_*64__8wekyb3d8bbwe"
 if ($ResolveWingetPath) {
@@ -410,131 +408,120 @@ if ( (-Not ($ras)) -or $WingetPath) {
 
         foreach ($app in $LIST) {
             if ($app -ne "") {
-                if ($useWhitelist) {
-                    $doUpgrade = $false
-                    foreach ($okapp in $whitelistConfig) {
-                        if ($app -like "*$($okapp.AppID)*") {
-                            $blockingProcessNames = $okapp.BlockingProcess
-                            if (-not [string]::IsNullOrEmpty($blockingProcessNames)) {
-                                $processesToCheck = $blockingProcessNames -split ','
-                                $isBlocked = $false
-                                $runningProcessName = ""
+                $doUpgrade = $false
+                foreach ($okapp in $whitelistConfig) {
+                    if ($app -like "*$($okapp.AppID)*") {
+                        $blockingProcessNames = $okapp.BlockingProcess
+                        if (-not [string]::IsNullOrEmpty($blockingProcessNames)) {
+                            $processesToCheck = $blockingProcessNames -split ','
+                            $isBlocked = $false
+                            $runningProcessName = ""
+                            
+                            foreach ($processName in $processesToCheck) {
+                                $processName = $processName.Trim()
+                                if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
+                                    $runningProcessName = $processName
+                                    $isBlocked = $true
+                                    break
+                                }
+                            }
+                            
+                            if ($isBlocked) {
+                                Write-Log -Message "Blocking process $runningProcessName is running for $($okapp.AppID)"
                                 
-                                foreach ($processName in $processesToCheck) {
-                                    $processName = $processName.Trim()
-                                    if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
-                                        $runningProcessName = $processName
-                                        $isBlocked = $true
-                                        break
+                                # Check if we can auto-close only safe processes
+                                $autoCloseProcesses = $okapp.AutoCloseProcesses
+                                $canAutoClose = $false
+                                $userChoice = $false
+                                
+                                if (-not [string]::IsNullOrEmpty($autoCloseProcesses)) {
+                                    $autoCloseList = $autoCloseProcesses -split ','
+                                    $runningProcesses = @()
+                                    
+                                    # Get all currently running blocking processes
+                                    foreach ($processName in $processesToCheck) {
+                                        $processName = $processName.Trim()
+                                        if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
+                                            $runningProcesses += $processName
+                                        }
+                                    }
+                                    
+                                    # Check if ALL running processes are in the auto-close list
+                                    $canAutoClose = $true
+                                    foreach ($runningProcess in $runningProcesses) {
+                                        $isAutoCloseable = $false
+                                        foreach ($autoCloseProcess in $autoCloseList) {
+                                            if ($runningProcess -eq $autoCloseProcess.Trim()) {
+                                                $isAutoCloseable = $true
+                                                break
+                                            }
+                                        }
+                                        if (-not $isAutoCloseable) {
+                                            $canAutoClose = $false
+                                            break
+                                        }
+                                    }
+                                    
+                                    if ($canAutoClose) {
+                                        Write-Log -Message "Only auto-closeable processes running for $($okapp.AppID): $($runningProcesses -join ', '). Auto-closing without user prompt."
+                                        $userChoice = $true
                                     }
                                 }
                                 
-                                if ($isBlocked) {
-                                    Write-Log -Message "Blocking process $runningProcessName is running for $($okapp.AppID)"
+                                # If we can't auto-close, show the interactive popup
+                                if (-not $canAutoClose) {
+                                    $defaultTimeoutAction = if ($okapp.DefaultTimeoutAction -eq $true) { $true } else { $false }
+                                    $userChoice = Show-ProcessCloseDialog -AppName $okapp.AppID -ProcessName $runningProcessName -TimeoutSeconds 60 -DefaultTimeoutAction $defaultTimeoutAction -FriendlyName $okapp.FriendlyName
                                     
-                                    # Check if we can auto-close only safe processes
-                                    $autoCloseProcesses = $okapp.AutoCloseProcesses
-                                    $canAutoClose = $false
-                                    $userChoice = $false
+                                    Write-Log -Message "Show-ProcessCloseDialog returned: $userChoice (type: $($userChoice.GetType().Name))"
+                                }
+                                
+                                if ($userChoice) {
+                                    if ($canAutoClose) {
+                                        Write-Log -Message "Auto-closing safe processes for $($okapp.AppID)"
+                                    } else {
+                                        Write-Log -Message "User agreed to close blocking processes for $($okapp.AppID)"
+                                    }
                                     
-                                    if (-not [string]::IsNullOrEmpty($autoCloseProcesses)) {
-                                        $autoCloseList = $autoCloseProcesses -split ','
-                                        $runningProcesses = @()
+                                    # Try to stop the blocking processes
+                                    $processesStopped = Stop-BlockingProcesses -ProcessNames $blockingProcessNames
+                                    
+                                    if ($processesStopped) {
+                                        Write-Log -Message "Successfully stopped blocking processes for $($okapp.AppID)"
+                                        # Wait a moment for processes to fully close
+                                        Start-Sleep -Seconds 3
                                         
-                                        # Get all currently running blocking processes
+                                        # Verify processes are really stopped
+                                        $stillRunning = $false
                                         foreach ($processName in $processesToCheck) {
                                             $processName = $processName.Trim()
                                             if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
-                                                $runningProcesses += $processName
-                                            }
-                                        }
-                                        
-                                        # Check if ALL running processes are in the auto-close list
-                                        $canAutoClose = $true
-                                        foreach ($runningProcess in $runningProcesses) {
-                                            $isAutoCloseable = $false
-                                            foreach ($autoCloseProcess in $autoCloseList) {
-                                                if ($runningProcess -eq $autoCloseProcess.Trim()) {
-                                                    $isAutoCloseable = $true
-                                                    break
-                                                }
-                                            }
-                                            if (-not $isAutoCloseable) {
-                                                $canAutoClose = $false
+                                                $stillRunning = $true
                                                 break
                                             }
                                         }
                                         
-                                        if ($canAutoClose) {
-                                            Write-Log -Message "Only auto-closeable processes running for $($okapp.AppID): $($runningProcesses -join ', '). Auto-closing without user prompt."
-                                            $userChoice = $true
-                                        }
-                                    }
-                                    
-                                    # If we can't auto-close, show the interactive popup
-                                    if (-not $canAutoClose) {
-                                        $defaultTimeoutAction = if ($okapp.DefaultTimeoutAction -eq $true) { $true } else { $false }
-                                        $userChoice = Show-ProcessCloseDialog -AppName $okapp.AppID -ProcessName $runningProcessName -TimeoutSeconds 60 -DefaultTimeoutAction $defaultTimeoutAction -FriendlyName $okapp.FriendlyName
-                                        
-                                        Write-Log -Message "Show-ProcessCloseDialog returned: $userChoice (type: $($userChoice.GetType().Name))"
-                                    }
-                                    
-                                    if ($userChoice) {
-                                        if ($canAutoClose) {
-                                            Write-Log -Message "Auto-closing safe processes for $($okapp.AppID)"
-                                        } else {
-                                            Write-Log -Message "User agreed to close blocking processes for $($okapp.AppID)"
-                                        }
-                                        
-                                        # Try to stop the blocking processes
-                                        $processesStopped = Stop-BlockingProcesses -ProcessNames $blockingProcessNames
-                                        
-                                        if ($processesStopped) {
-                                            Write-Log -Message "Successfully stopped blocking processes for $($okapp.AppID)"
-                                            # Wait a moment for processes to fully close
-                                            Start-Sleep -Seconds 3
-                                            
-                                            # Verify processes are really stopped
-                                            $stillRunning = $false
-                                            foreach ($processName in $processesToCheck) {
-                                                $processName = $processName.Trim()
-                                                if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
-                                                    $stillRunning = $true
-                                                    break
-                                                }
-                                            }
-                                            
-                                            if ($stillRunning) {
-                                                Write-Log -Message "Some processes still running after close attempt for $($okapp.AppID), skipping"
-                                                continue
-                                            }
-                                        } else {
-                                            Write-Log -Message "Failed to stop blocking processes for $($okapp.AppID), skipping"
+                                        if ($stillRunning) {
+                                            Write-Log -Message "Some processes still running after close attempt for $($okapp.AppID), skipping"
                                             continue
                                         }
                                     } else {
-                                        Write-Log -Message "User chose not to close blocking processes for $($okapp.AppID), skipping"
+                                        Write-Log -Message "Failed to stop blocking processes for $($okapp.AppID), skipping"
                                         continue
                                     }
+                                } else {
+                                    Write-Log -Message "User chose not to close blocking processes for $($okapp.AppID), skipping"
+                                    continue
                                 }
                             }
-                            
-                            if ($ras -or $userIsAdmin) {
-                                Write-Log -Message "Upgrade $($okapp.AppID) in system context"
-                                $doUpgrade = $true
-                                continue
-                            }
                         }
-                    }
-                }
-                else { #use exclude list
-                    $doUpgrade = $true
-                    foreach ($exclude in $excludeapps) {
-                        if ($app -like "*$exclude*") {
-                            $doUpgrade = $false
+                        
+                        if ($ras -or $userIsAdmin) {
+                            Write-Log -Message "Upgrade $($okapp.AppID) in system context"
+                            $doUpgrade = $true
                             continue
                         }
-                    }  
+                    }
                 }
 
                 if ($doUpgrade) {
