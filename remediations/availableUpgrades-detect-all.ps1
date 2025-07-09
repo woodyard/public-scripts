@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.7
-    Tag: 2V
+    Version: 2.8
+    Tag: 2X
     
     Version History:
     1.0 - Initial version
@@ -22,6 +22,7 @@
     2.5 - ScriptTag now appears before timestamp in console output
     2.6 - Improved date format from MM-dd-yy to dd.MM.yyyy for better readability
     2.7 - Added ARM64 support for winget path resolution
+    2.8 - Removed TeamViewer from exclusion
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
