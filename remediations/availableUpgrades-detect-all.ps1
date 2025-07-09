@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.8
-    Tag: 2W
+    Version: 3.0
+    Tag: 2Y
     
     Version History:
     1.0 - Initial version
@@ -23,6 +23,8 @@
     2.6 - Improved date format from MM-dd-yy to dd.MM.yyyy for better readability
     2.7 - Added ARM64 support for winget path resolution
     2.8 - Added Fortinet.FortiClientVPN to exclude list
+    2.9 - Enhanced parsing filter to eliminate "able." and other parsing artifacts
+    3.0 - Added dual-layer filtering to ensure count accuracy and eliminate all parsing artifacts
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -39,7 +41,7 @@ function Test-RunningAsSystem {
 	}
 }
 
-$ScriptTag = "2W"
+$ScriptTag = "2Y"
 $LogName = 'DetectAvailableUpgradesAll'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -172,8 +174,14 @@ if ( (-Not ($ras)) -or $WingetPath) {
                 break
             }
             $appId = ($lineData[$idPos..$versionPos] -Join "").trim()
-            # Filter out progress indicators and single characters
-            if ($appId -ne "" -and $appId.Length -gt 2 -and $appId -notmatch '^[-\\|/]+$') {
+            # Filter out progress indicators, single characters, and parsing artifacts
+            if ($appId -ne "" -and $appId.Length -gt 3 -and 
+                $appId -notmatch '^[-\\|/\s\.]+$' -and 
+                $appId -notlike "*able*" -and
+                $appId -notlike "*..." -and
+                $appId -notlike "*.*" -and
+                $appId -match '^[A-Za-z0-9]' -and
+                $appId -notmatch '^\.$') {
                 $null = $LIST.Add($appId)
             }
         }
@@ -183,6 +191,15 @@ if ( (-Not ($ras)) -or $WingetPath) {
 
         foreach ($app in $LIST) {
             if ($app -ne "") {
+                # Apply additional filtering here to catch any artifacts that slipped through
+                if ($app.Length -le 3 -or 
+                    $app -like "*able*" -or 
+                    $app -like "*...*" -or 
+                    $app -like "*.*" -or 
+                    $app -notmatch '^[A-Za-z0-9]' -or
+                    $app -match '^\.$') {
+                    continue  # Skip this app
+                }
 
                 if ($useWhitelist) {
                     $doUpgrade = $false
