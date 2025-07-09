@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.6
-    Tag: 2U
+    Version: 2.7
+    Tag: 2V
     
     Version History:
     1.0 - Initial version
@@ -21,6 +21,7 @@
     2.4 - Improved console output: tag moved to front, removed date from console (kept in log), added startup date log
     2.5 - ScriptTag now appears before timestamp in console output
     2.6 - Improved date format from MM-dd-yy to dd.MM.yyyy for better readability
+    2.7 - Added ARM64 support for winget path resolution
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -37,7 +38,7 @@ function Test-RunningAsSystem {
 	}
 }
 
-$ScriptTag = "2U"
+$ScriptTag = "2V"
 $LogName = 'DetectAvailableUpgradesAll'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -96,7 +97,7 @@ $whitelist = ''
 
 $useWhitelist = $false
 
-$ResolveWingetPath = Resolve-Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe"
+$ResolveWingetPath = Resolve-Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_*64__8wekyb3d8bbwe"
 if ($ResolveWingetPath) {
     $WingetPath = $ResolveWingetPath[-1].Path
 }
