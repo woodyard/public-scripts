@@ -283,5 +283,11 @@
     },
     {
         "AppID": "Python.Launcher"
+    },
+    {
+        "AppID": "Microsoft.VCRedist.2015+.x64"
+    },
+    {
+        "AppID": "Microsoft.VCRedist.2015+.arm64"
     }
 ]
