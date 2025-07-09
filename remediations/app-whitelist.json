@@ -295,5 +295,10 @@
         "FriendlyName": "TeamViewer Host",
         "BlockingProcess": "TeamViewer_Service,TeamViewer_Desktop,TeamViewer",
         "AutoCloseProcesses": "TeamViewer_Service,TeamViewer_Desktop,TeamViewer"
+    },
+    {
+        "AppID": "TeamViewer.TeamViewer",
+        "FriendlyName": "TeamViewer",
+        "BlockingProcess": "TeamViewer"
     }
 ]
