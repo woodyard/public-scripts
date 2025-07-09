@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.4
-    Tag: 3G
+    Version: 3.6
+    Tag: 3I
     
     Version History:
     1.0 - Initial version
@@ -29,6 +29,8 @@
     3.2 - Added GitHub.GitHubDesktop to whitelist
     3.3 - Moved whitelist configuration to external GitHub-hosted JSON file for centralized management
     3.4 - Removed redundant exclude list logic to streamline whitelist-only approach
+    3.5 - Added debugging for disabled apps filtering to troubleshoot Logitech.OptionsPlus issue
+    3.6 - Confirmed disabled apps filtering working correctly, removed debug logging
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -86,7 +88,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "3G"
+$ScriptTag = "3I"
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -115,7 +117,7 @@ Write-Log -Message "Fetching whitelist configuration from GitHub"
 
 try {
     $webClient = New-Object System.Net.WebClient
-    $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/3.3")
+    $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/3.4")
     $whitelistJSON = $webClient.DownloadString($whitelistUrl)
     Write-Log -Message "Successfully downloaded whitelist configuration from GitHub"
 } catch {
