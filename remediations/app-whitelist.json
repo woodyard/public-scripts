@@ -289,5 +289,11 @@
     },
     {
         "AppID": "Microsoft.VCRedist.2015+.arm64"
+    },
+    {
+        "AppID": "TeamViewer.TeamViewer.Host",
+        "FriendlyName": "TeamViewer Host",
+        "BlockingProcess": "TeamViewer_Service,TeamViewer_Desktop,TeamViewer",
+        "AutoCloseProcesses": "TeamViewer_Service,TeamViewer_Desktop,TeamViewer"
     }
 ]
