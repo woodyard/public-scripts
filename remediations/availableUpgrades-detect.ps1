@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.6
-    Tag: 2S
+    Version: 2.7
+    Tag: 2V
     
     Version History:
     1.0 - Initial version
@@ -21,6 +21,7 @@
     2.4 - ScriptTag now appears before timestamp in console output
     2.5 - Disabled Logitech.OptionsPlus due to upgrade issues
     2.6 - Improved date format from MM-dd-yy to dd.MM.yyyy for better readability
+    2.7 - Added Microsoft.VCLibs.Desktop.14 to whitelist
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -78,7 +79,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "2S"
+$ScriptTag = "2V"
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -207,6 +208,7 @@ $whitelistJSON = @'
     ,{        AppID:              "Logitech.Options"}
     ,{        AppID:              "Logitech.OptionsPlus", Disabled: true}
     ,{        AppID:              "TrackerSoftware.PDF-XChangeEditor"}
+    ,{        AppID:              "Microsoft.VCLibs.Desktop.14"}
 ]
 '@
 
