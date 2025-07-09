@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.7
-    Tag: 2V
+    Version: 2.8
+    Tag: 2X
     
     Version History:
     1.0 - Initial version
@@ -22,6 +22,7 @@
     2.5 - Disabled Logitech.OptionsPlus due to upgrade issues
     2.6 - Improved date format from MM-dd-yy to dd.MM.yyyy for better readability
     2.7 - Added Microsoft.VCLibs.Desktop.14 to whitelist
+    2.8 - Enhanced Adobe Reader blocking processes and improved multiple process support
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -79,7 +80,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "2V"
+$ScriptTag = "2X"
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -200,7 +201,7 @@ $whitelistJSON = @'
     ,{        AppID:              "PostgreSQL.PostgreSQL" }
     ,{        AppID:              "WinSCP.WinSCP",                    BlockingProcess:    "WinSCP" }
     ,{        AppID:              "WinMerge.WinMerge",                BlockingProcess:    "WinMergeU" }
-    ,{        AppID:              "Adobe.Acrobat.Reader.64-bit",      BlockingProcess:    "AcroRd32" }
+    ,{        AppID:              "Adobe.Acrobat.Reader.64-bit",      BlockingProcess:    "AcroRd32,Acrobat,AcroBroker,AdobeARM,AdobeCollabSync" }
     ,{        AppID:              "RazerInc.RazerInstaller"}
     ,{        AppID:              "Cloudflare.cloudflared"}
     ,{        AppID:              "Microsoft.Bicep"}
@@ -322,12 +323,19 @@ if ( (-Not ($ras)) -or $WingetPath) {
                     foreach ($okapp in $whitelistConfig) {
                         if ($app -like "*$($okapp.AppID)*") {
                             # Check for blocking processes
-                            $blockingProcessName = $okapp.BlockingProcess
-                            if (-not [string]::IsNullOrEmpty($blockingProcessName)) {
-                                if (Get-Process -Name $blockingProcessName -ErrorAction SilentlyContinue) {
-                                    Write-Log -Message "Skipping $($okapp.AppID) - blocking process $blockingProcessName is running"
-                                    continue
+                            $blockingProcessNames = $okapp.BlockingProcess
+                            if (-not [string]::IsNullOrEmpty($blockingProcessNames)) {
+                                $processesToCheck = $blockingProcessNames -split ','
+                                $isBlocked = $false
+                                foreach ($processName in $processesToCheck) {
+                                    $processName = $processName.Trim()
+                                    if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
+                                        Write-Log -Message "Skipping $($okapp.AppID) - blocking process $processName is running"
+                                        $isBlocked = $true
+                                        break
+                                    }
                                 }
+                                if ($isBlocked) { continue }
                             }
                             
                             if ($ras -or $userIsAdmin) {
