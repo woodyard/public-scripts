@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.9
-    Tag: 2Z
+    Version: 3.0
+    Tag: 3B
     
     Version History:
     1.0 - Initial version
@@ -24,6 +24,7 @@
     2.7 - Added Microsoft.VCLibs.Desktop.14 to whitelist
     2.8 - Enhanced Adobe Reader blocking processes and improved multiple process support
     2.9 - Fixed Logitech.OptionsPlus AppID typo to match actual winget ID (OptonsPlus)
+    3.0 - Added Microsoft.AzureDataStudio, Mythicsoft.AgentRansack, ParadoxInteractive.ParadoxLauncher, Foxit.FoxitReader.Inno, OBSProject.OBSStudio, Python.Launcher; Disabled Fortinet.FortiClientVPN
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -81,7 +82,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "2Z"
+$ScriptTag = "3B"
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -211,6 +212,13 @@ $whitelistJSON = @'
     ,{        AppID:              "Logitech.OptonsPlus", Disabled: true}
     ,{        AppID:              "TrackerSoftware.PDF-XChangeEditor"}
     ,{        AppID:              "Microsoft.VCLibs.Desktop.14"}
+    ,{        AppID:              "Microsoft.AzureDataStudio", BlockingProcess: "azuredatastudio"}
+    ,{        AppID:              "Mythicsoft.AgentRansack", BlockingProcess: "AgentRansack"}
+    ,{        AppID:              "ParadoxInteractive.ParadoxLauncher"}
+    ,{        AppID:              "Fortinet.FortiClientVPN", Disabled: true}
+    ,{        AppID:              "Foxit.FoxitReader.Inno", BlockingProcess: "FoxitReader"}
+    ,{        AppID:              "OBSProject.OBSStudio", BlockingProcess: "obs64"}
+    ,{        AppID:              "Python.Launcher"}
 ]
 '@
 
