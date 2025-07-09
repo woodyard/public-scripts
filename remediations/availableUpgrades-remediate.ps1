@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 2.8
-    Tag: 2Y
+    Version: 2.9
+    Tag: 3A
     
     Version History:
     1.0 - Initial version
@@ -23,6 +23,7 @@
     2.6 - Improved date format from MM-dd-yy to dd.MM.yyyy for better readability
     2.7 - Added Microsoft.VCLibs.Desktop.14 to whitelist
     2.8 - Enhanced Adobe Reader blocking processes and improved multiple process support
+    2.9 - Fixed Logitech.OptionsPlus AppID typo to match actual winget ID (OptonsPlus)
     
     Exit Codes:
     0 - Script completed successfully
@@ -81,7 +82,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "2Y"
+$ScriptTag = "3A"
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -208,7 +209,7 @@ $whitelistJSON = @'
     ,{        AppID:              "Microsoft.Bicep"}
     ,{        AppID:              "JanDeDobbeleer.OhMyPosh"}
     ,{        AppID:              "Logitech.Options"}
-    ,{        AppID:              "Logitech.OptionsPlus", Disabled: true}
+    ,{        AppID:              "Logitech.OptonsPlus", Disabled: true}
     ,{        AppID:              "TrackerSoftware.PDF-XChangeEditor"}
     ,{        AppID:              "Microsoft.VCLibs.Desktop.14"}
 ]
