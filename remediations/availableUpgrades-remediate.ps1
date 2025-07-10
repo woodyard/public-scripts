@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.5
-    Tag: 3I
+    Version: 3.7
+    Tag: 3K
     
     Version History:
     1.0 - Initial version
@@ -30,6 +30,8 @@
     3.3 - Added GitHub.GitHubDesktop to whitelist; Fixed winget output parsing bug causing character-by-character display
     3.4 - Moved whitelist configuration to external GitHub-hosted JSON file for centralized management
     3.5 - Removed redundant exclude list logic to streamline whitelist-only approach
+    3.6 - Fixed wildcard matching bug that caused disabled apps to be processed when they contained enabled app names as substrings
+    3.7 - Updated version to match detection script
     
     Exit Codes:
     0 - Script completed successfully
@@ -257,7 +259,7 @@ function Stop-BlockingProcesses {
 }
 
 <# Script variables #>
-$ScriptTag = "3I"
+$ScriptTag = "3K"
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -410,7 +412,7 @@ if ( (-Not ($ras)) -or $WingetPath) {
             if ($app -ne "") {
                 $doUpgrade = $false
                 foreach ($okapp in $whitelistConfig) {
-                    if ($app -like "*$($okapp.AppID)*") {
+                    if ($app -eq $okapp.AppID) {
                         $blockingProcessNames = $okapp.BlockingProcess
                         if (-not [string]::IsNullOrEmpty($blockingProcessNames)) {
                             $processesToCheck = $blockingProcessNames -split ','

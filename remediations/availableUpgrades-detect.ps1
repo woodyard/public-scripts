@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.6
-    Tag: 3I
+    Version: 3.7
+    Tag: 3J
     
     Version History:
     1.0 - Initial version
@@ -31,6 +31,7 @@
     3.4 - Removed redundant exclude list logic to streamline whitelist-only approach
     3.5 - Added debugging for disabled apps filtering to troubleshoot Logitech.OptionsPlus issue
     3.6 - Confirmed disabled apps filtering working correctly, removed debug logging
+    3.7 - Fixed wildcard matching bug that caused disabled apps to be processed when they contained enabled app names as substrings
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -88,7 +89,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "3I"
+$ScriptTag = "3J"
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -241,7 +242,7 @@ if ( (-Not ($ras)) -or $WingetPath) {
             if ($app -ne "") {
                 $doUpgrade = $false
                 foreach ($okapp in $whitelistConfig) {
-                    if ($app -like "*$($okapp.AppID)*") {
+                    if ($app -eq $okapp.AppID) {
                         # Check for blocking processes
                         $blockingProcessNames = $okapp.BlockingProcess
                         if (-not [string]::IsNullOrEmpty($blockingProcessNames)) {
