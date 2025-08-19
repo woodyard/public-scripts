@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.7
-    Tag: 3K
+    Version: 3.8
+    Tag: 3M
     
     Version History:
     1.0 - Initial version
@@ -32,6 +32,7 @@
     3.5 - Removed redundant exclude list logic to streamline whitelist-only approach
     3.6 - Fixed wildcard matching bug that caused disabled apps to be processed when they contained enabled app names as substrings
     3.7 - Updated version to match detection script
+    3.8 - Made context filtering logic more robust to handle apps without explicit SystemContext/UserContext properties; Added WiresharkFoundation.Wireshark to whitelist
     
     Exit Codes:
     0 - Script completed successfully
@@ -259,7 +260,7 @@ function Stop-BlockingProcesses {
 }
 
 <# Script variables #>
-$ScriptTag = "3K"
+$ScriptTag = "3M"
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"

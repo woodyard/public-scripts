@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.7
-    Tag: 3J
+    Version: 3.8
+    Tag: 3L
     
     Version History:
     1.0 - Initial version
@@ -32,6 +32,7 @@
     3.5 - Added debugging for disabled apps filtering to troubleshoot Logitech.OptionsPlus issue
     3.6 - Confirmed disabled apps filtering working correctly, removed debug logging
     3.7 - Fixed wildcard matching bug that caused disabled apps to be processed when they contained enabled app names as substrings
+    3.8 - Made context filtering logic more robust to handle apps without explicit SystemContext/UserContext properties
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -89,7 +90,7 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 }
 
 <# Script variables #>
-$ScriptTag = "3J"
+$ScriptTag = "3L"
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
