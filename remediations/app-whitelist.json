@@ -331,8 +331,6 @@
     {
         "AppID": "WiresharkFoundation.Wireshark",
         "FriendlyName": "Wireshark",
-        "SystemContext": true,
-        "UserContext": true,
         "BlockingProcess": "Wireshark",
         "DefaultTimeoutAction": true
     }

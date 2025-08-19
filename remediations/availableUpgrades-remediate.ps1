@@ -354,7 +354,15 @@ elseif ($WingetPath) {
     Set-Location $WingetPath
 
     # In system context, we can upgrade both system and user context apps
-    $whitelistConfig = $whitelistConfig | Where-Object { ($_.SystemContext -eq $null -or $_.SystemContext -eq $true) -or ($_.UserContext -eq $null -or $_.UserContext -eq $true) }
+    # Include apps if: no context properties defined, OR SystemContext is true, OR UserContext is true
+    $whitelistConfig = $whitelistConfig | Where-Object {
+        # If neither property exists, include the app
+        ((-not $_.PSObject.Properties['SystemContext']) -and (-not $_.PSObject.Properties['UserContext'])) -or
+        # Or if SystemContext is explicitly true
+        ($_.SystemContext -eq $true) -or
+        # Or if UserContext is explicitly true
+        ($_.UserContext -eq $true)
+    }
 
     # call winget and check if we need to retry
     $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
