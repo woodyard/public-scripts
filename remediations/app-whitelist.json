@@ -190,6 +190,9 @@
         "BlockingProcess": "i_view64"
     },
     {
+        "AppID": "OpenJS.NodeJS"
+    },
+    {
         "AppID": "OpenJS.NodeJS.LTS"
     },
     {
