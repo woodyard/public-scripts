@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.8
-    Tag: 3M
+    Version: 3.9
+    Tag: 3N
     
     Version History:
     1.0 - Initial version
@@ -33,6 +33,7 @@
     3.6 - Fixed wildcard matching bug that caused disabled apps to be processed when they contained enabled app names as substrings
     3.7 - Updated version to match detection script
     3.8 - Made context filtering logic more robust to handle apps without explicit SystemContext/UserContext properties; Added WiresharkFoundation.Wireshark to whitelist
+    3.9 - Improved log management: dynamic path selection (Intune logs for system context), automatic cleanup of logs older than 1 month
     
     Exit Codes:
     0 - Script completed successfully
@@ -259,18 +260,47 @@ function Stop-BlockingProcesses {
     return $stoppedAny
 }
 
+function Remove-OldLogs {
+    param([string]$LogPath)
+    
+    try {
+        $cutoffDate = (Get-Date).AddMonths(-1)
+        $logFiles = Get-ChildItem -Path $LogPath -Filter "*AvailableUpgrades*.log" -ErrorAction SilentlyContinue
+        foreach ($logFile in $logFiles) {
+            if ($logFile.LastWriteTime -lt $cutoffDate) {
+                Remove-Item -Path $logFile.FullName -Force -ErrorAction SilentlyContinue
+                Write-Log -Message "Removed old log file: $($logFile.Name)"
+            }
+        }
+    } catch {
+        # Don't use Write-Log here as it may not be ready yet - just silently continue
+    }
+}
+
 <# Script variables #>
-$ScriptTag = "3M" # Update this tag for each script version
+$ScriptTag = "3N" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
-#$LogPath = "$env:ProgramData\Microsoft\IntuneManagementExtension\Logs"
-$LogPath = "$env:Temp"
+
+# Dynamic log path selection based on execution context
+if (Test-RunningAsSystem) {
+    $LogPath = "$env:ProgramData\Microsoft\IntuneManagementExtension\Logs"
+    # Ensure the directory exists
+    if (-not (Test-Path -Path $LogPath)) {
+        New-Item -Path $LogPath -ItemType Directory -Force | Out-Null
+    }
+} else {
+    $LogPath = "$env:Temp"
+}
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 $userIsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $useWhitelist = $true
 
 <# ----------------------------------------------- #>
+
+# Clean up old log files (older than 1 month)
+Remove-OldLogs -LogPath $LogPath
 
 # Log script start with full date
 Write-Log -Message "Script started on $(Get-Date -Format 'dd.MM.yyyy')"
