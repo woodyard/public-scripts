@@ -278,7 +278,7 @@ Write-Log -Message "Script started on $(Get-Date -Format 'dd.MM.yyyy')"
 <# Abort script in OOBE phase #>
 if (-not (OOBEComplete)) {
     "OOBE"
-    Exit 1
+    Exit 0
 }
 
 <# ---------------------------------------------- #>
