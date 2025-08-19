@@ -327,5 +327,11 @@
         "FriendlyName": "PowerShell",
         "BlockingProcess": "pwsh",
         "DefaultTimeoutAction": true
+    },
+    {
+        "AppID": "WiresharkFoundation.Wireshark",
+        "FriendlyName": "Wireshark",
+        "BlockingProcess": "Wireshark",
+        "DefaultTimeoutAction": true
     }
 ]
