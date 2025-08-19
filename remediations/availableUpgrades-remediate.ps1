@@ -260,7 +260,7 @@ function Stop-BlockingProcesses {
 }
 
 <# Script variables #>
-$ScriptTag = "3M"
+$ScriptTag = "3M" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
