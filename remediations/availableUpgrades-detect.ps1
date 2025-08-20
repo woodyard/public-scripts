@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.9
-    Tag: 3M
+    Version: 4.0
+    Tag: 3O
     
     Version History:
     1.0 - Initial version
@@ -34,6 +34,7 @@
     3.7 - Fixed wildcard matching bug that caused disabled apps to be processed when they contained enabled app names as substrings
     3.8 - Made context filtering logic more robust to handle apps without explicit SystemContext/UserContext properties
     3.9 - Improved log management: dynamic path selection (Intune logs for system context), automatic cleanup of logs older than 1 month
+    4.0 - Added PromptWhenBlocked property for granular control over interactive dialogs vs silent waiting when blocking processes are running
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -108,7 +109,7 @@ function Remove-OldLogs {
 }
 
 <# Script variables #>
-$ScriptTag = "3M" # Update this tag for each script version
+$ScriptTag = "3O" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -287,15 +288,24 @@ if ( (-Not ($ras)) -or $WingetPath) {
                         if (-not [string]::IsNullOrEmpty($blockingProcessNames)) {
                             $processesToCheck = $blockingProcessNames -split ','
                             $isBlocked = $false
+                            $runningProcessName = ""
                             foreach ($processName in $processesToCheck) {
                                 $processName = $processName.Trim()
                                 if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
-                                    Write-Log -Message "Skipping $($okapp.AppID) - blocking process $processName is running"
+                                    $runningProcessName = $processName
                                     $isBlocked = $true
                                     break
                                 }
                             }
-                            if ($isBlocked) { continue }
+                            if ($isBlocked) {
+                                if ($okapp.PromptWhenBlocked -eq $true) {
+                                    Write-Log -Message "$($okapp.AppID) has blocking process $runningProcessName running, but PromptWhenBlocked=true, allowing remediation"
+                                    # Continue processing - app will reach remediation script for interactive handling
+                                } else {
+                                    Write-Log -Message "Skipping $($okapp.AppID) - blocking process $runningProcessName is running (PromptWhenBlocked not set)"
+                                    continue
+                                }
+                            }
                         }
                         
                         if ($ras -or $userIsAdmin) {

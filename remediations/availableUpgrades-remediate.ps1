@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.9
-    Tag: 3N
+    Version: 4.0
+    Tag: 3P
     
     Version History:
     1.0 - Initial version
@@ -34,6 +34,7 @@
     3.7 - Updated version to match detection script
     3.8 - Made context filtering logic more robust to handle apps without explicit SystemContext/UserContext properties; Added WiresharkFoundation.Wireshark to whitelist
     3.9 - Improved log management: dynamic path selection (Intune logs for system context), automatic cleanup of logs older than 1 month
+    4.0 - Added PromptWhenBlocked property support for granular control over interactive dialogs vs silent waiting when blocking processes are running
     
     Exit Codes:
     0 - Script completed successfully
@@ -278,7 +279,7 @@ function Remove-OldLogs {
 }
 
 <# Script variables #>
-$ScriptTag = "3N" # Update this tag for each script version
+$ScriptTag = "3P" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -470,6 +471,12 @@ if ( (-Not ($ras)) -or $WingetPath) {
                             if ($isBlocked) {
                                 Write-Log -Message "Blocking process $runningProcessName is running for $($okapp.AppID)"
                                 
+                                # Check if this app should prompt when blocked
+                                if ($okapp.PromptWhenBlocked -ne $true) {
+                                    Write-Log -Message "Skipping $($okapp.AppID) - PromptWhenBlocked not set, waiting for next run"
+                                    continue
+                                }
+                                
                                 # Check if we can auto-close only safe processes
                                 $autoCloseProcesses = $okapp.AutoCloseProcesses
                                 $canAutoClose = $false
@@ -509,8 +516,9 @@ if ( (-Not ($ras)) -or $WingetPath) {
                                     }
                                 }
                                 
-                                # If we can't auto-close, show the interactive popup
+                                # If we can't auto-close and PromptWhenBlocked is true, show the interactive popup
                                 if (-not $canAutoClose) {
+                                    Write-Log -Message "$($okapp.AppID) has PromptWhenBlocked=true, showing interactive dialog"
                                     $defaultTimeoutAction = if ($okapp.DefaultTimeoutAction -eq $true) { $true } else { $false }
                                     $userChoice = Show-ProcessCloseDialog -AppName $okapp.AppID -ProcessName $runningProcessName -TimeoutSeconds 60 -DefaultTimeoutAction $defaultTimeoutAction -FriendlyName $okapp.FriendlyName
                                     
