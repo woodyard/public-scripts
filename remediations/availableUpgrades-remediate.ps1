@@ -8,9 +8,9 @@
     The script is designed to work as a remediation script in Microsoft Intune remediation policies.
 
 .NOTES
-    Author: Henrik Skovgaard
-    Version: 4.0
-    Tag: 3P
+ Author: Henrik Skovgaard
+ Version: 4.1
+ Tag: 3Q
     
     Version History:
     1.0 - Initial version
@@ -35,6 +35,7 @@
     3.8 - Made context filtering logic more robust to handle apps without explicit SystemContext/UserContext properties; Added WiresharkFoundation.Wireshark to whitelist
     3.9 - Improved log management: dynamic path selection (Intune logs for system context), automatic cleanup of logs older than 1 month
     4.0 - Added PromptWhenBlocked property support for granular control over interactive dialogs vs silent waiting when blocking processes are running
+    4.1 - Fixed Windows Forms dialog for non-interactive/system context execution, resolved quser command path issues, improved system context error handling
     
     Exit Codes:
     0 - Script completed successfully
@@ -100,24 +101,40 @@ function Show-ProcessCloseDialog {
         [bool]$DefaultTimeoutAction = $false,
         [string]$FriendlyName = ""
     )
-    
+
     Write-Log -Message "Show-ProcessCloseDialog called for $AppName" | Out-Null
-    
+
+    # Check execution context
+    $isSystemContext = Test-RunningAsSystem
+    $isInteractive = [Environment]::UserInteractive
+
+    Write-Log -Message "Execution context - System: $isSystemContext, Interactive: $isInteractive" | Out-Null
+
     # Use provided FriendlyName or fallback to AppName
     $friendlyName = if (-not [string]::IsNullOrEmpty($FriendlyName)) { $FriendlyName } else { $AppName }
-    
+
     Write-Log -Message "Friendly name resolved to: $friendlyName" | Out-Null
+
+    # If running in system context and non-interactive, skip dialog entirely
+    if ($isSystemContext -and -not $isInteractive) {
+        Write-Log -Message "Running in system non-interactive context. Using default timeout action: $DefaultTimeoutAction" | Out-Null
+        return $DefaultTimeoutAction
+    }
     
     $defaultAction = if ($DefaultTimeoutAction) { "Yes" } else { "No" }
     $message = "An update is available for $friendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $friendlyName now to allow the update to proceed?`n`nThis dialog will automatically choose '$defaultAction' in $TimeoutSeconds seconds."
     
     try {
         Write-Log -Message "Attempting to show Windows Forms dialog" | Out-Null
-        
+
+        # Check if running in interactive mode
+        $isInteractive = [Environment]::UserInteractive
+        Write-Log -Message "Running in interactive mode: $isInteractive" | Out-Null
+
         # Try to use Windows Forms for interactive popup
         Add-Type -AssemblyName System.Windows.Forms
         Add-Type -AssemblyName System.Drawing
-        
+
         # Create form
         $form = New-Object System.Windows.Forms.Form
         $form.Text = "Application Update Available"
@@ -127,6 +144,15 @@ function Show-ProcessCloseDialog {
         $form.MinimizeBox = $false
         $form.FormBorderStyle = "FixedDialog"
         $form.TopMost = $true
+
+        # Set form style for non-interactive mode
+        if (-not $isInteractive) {
+            Write-Log -Message "Setting ServiceNotification style for non-interactive mode" | Out-Null
+            # Set styles to allow showing in service/non-interactive context
+            $form.ShowInTaskbar = $false
+            # Note: ServiceNotification style is not directly available in Windows Forms
+            # We'll handle this by using a different approach
+        }
         
         # Create label
         $label = New-Object System.Windows.Forms.Label
@@ -184,11 +210,18 @@ function Show-ProcessCloseDialog {
         $timer.Start()
         
         Write-Log -Message "About to show dialog" | Out-Null
-        
-        # Show dialog
-        $result = $form.ShowDialog()
-        $timer.Stop()
-        $form.Dispose()
+
+        # Show dialog - handle non-interactive mode
+        if (-not $isInteractive) {
+            Write-Log -Message "Non-interactive mode detected, cannot show dialog. Using default timeout action: $DefaultTimeoutAction" | Out-Null
+            $result = if ($DefaultTimeoutAction) { [System.Windows.Forms.DialogResult]::Yes } else { [System.Windows.Forms.DialogResult]::No }
+            $timer.Stop()
+            $form.Dispose()
+        } else {
+            $result = $form.ShowDialog()
+            $timer.Stop()
+            $form.Dispose()
+        }
         
         Write-Log -Message "Dialog result for $friendlyName : $result" | Out-Null
         
@@ -206,17 +239,34 @@ function Show-ProcessCloseDialog {
         
         # Fallback to command line approach for system context
         try {
-            # Use msg.exe to show message to logged-in users
-            $sessionId = (quser | Where-Object { $_ -match "Active" } | ForEach-Object { ($_ -split '\s+')[2] })[0]
-            if ($sessionId) {
-                Write-Log -Message "Sending message to session $sessionId using msg.exe" | Out-Null
-                $msgResult = msg.exe $sessionId "/time:$TimeoutSeconds" "Update available for $friendlyName. Close the application? (This message will close automatically in $TimeoutSeconds seconds)"
-                
-                # Since msg.exe doesn't provide interactive response, default to No for safety
-                Write-Log -Message "msg.exe sent, defaulting to No for safety" | Out-Null
-                return $false
+            # Use full path to quser.exe and msg.exe
+            $quserPath = "$env:SystemRoot\System32\quser.exe"
+            $msgPath = "$env:SystemRoot\System32\msg.exe"
+
+            if (Test-Path $quserPath) {
+                # Use quser.exe to find active user sessions
+                $sessionInfo = & $quserPath | Where-Object { $_ -match "Active" }
+                if ($sessionInfo) {
+                    $sessionId = ($sessionInfo -split '\s+')[2]
+                    Write-Log -Message "Found active session $sessionId using quser.exe" | Out-Null
+
+                    if (Test-Path $msgPath) {
+                        Write-Log -Message "Sending message to session $sessionId using msg.exe" | Out-Null
+                        $msgResult = & $msgPath $sessionId "/time:$TimeoutSeconds" "Update available for $friendlyName. Close the application? (This message will close automatically in $TimeoutSeconds seconds)"
+
+                        # Since msg.exe doesn't provide interactive response, default to No for safety
+                        Write-Log -Message "msg.exe sent, defaulting to No for safety" | Out-Null
+                        return $false
+                    } else {
+                        Write-Log -Message "msg.exe not found at $msgPath" | Out-Null
+                        return $false
+                    }
+                } else {
+                    Write-Log -Message "No active user session found for popup" | Out-Null
+                    return $false
+                }
             } else {
-                Write-Log -Message "No active user session found for popup" | Out-Null
+                Write-Log -Message "quser.exe not found at $quserPath" | Out-Null
                 return $false
             }
         } catch {
@@ -279,20 +329,25 @@ function Remove-OldLogs {
 }
 
 <# Script variables #>
-$ScriptTag = "3P" # Update this tag for each script version
+$ScriptTag = "3Q" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
 
 # Dynamic log path selection based on execution context
-if (Test-RunningAsSystem) {
+$isSystemContext = Test-RunningAsSystem
+$isInteractive = [Environment]::UserInteractive
+
+if ($isSystemContext) {
     $LogPath = "$env:ProgramData\Microsoft\IntuneManagementExtension\Logs"
     # Ensure the directory exists
     if (-not (Test-Path -Path $LogPath)) {
         New-Item -Path $LogPath -ItemType Directory -Force | Out-Null
     }
+    Write-Host "Running in system context (non-interactive: $(-not $isInteractive))"
 } else {
     $LogPath = "$env:Temp"
+    Write-Host "Running in user context (interactive: $isInteractive)"
 }
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 $userIsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -357,12 +412,20 @@ try {
 $ras = $true
 If (-Not (Test-RunningAsSystem)) {
     $ras = $false
+    Write-Log -Message "User context mode detected"
 
     #if (-not ($userIsAdmin)) {
     #    $whitelistConfig = $whitelistConfig | Where-Object { $_.UserContext -eq $true }
     #}
 
-    $OUTPUT = $(winget upgrade --accept-source-agreements)
+    try {
+        $OUTPUT = $(winget upgrade --accept-source-agreements)
+        Write-Log -Message "Successfully executed winget upgrade in user context"
+    } catch {
+        Write-Log -Message "Error executing winget in user context: $($_.Exception.Message)"
+        Write-Log -Message "Winget may not be available or properly configured"
+        exit 1
+    }
     
     # Check if first output is valid (contains actual app data)
     $hasValidOutput = $false
@@ -382,7 +445,7 @@ If (-Not (Test-RunningAsSystem)) {
     Write-Log -Message "Local user mode"
 }
 elseif ($WingetPath) {
-    Write-Log -Message $WingetPath
+    Write-Log -Message "System context mode detected, using winget at: $WingetPath"
     Set-Location $WingetPath
 
     # In system context, we can upgrade both system and user context apps
@@ -396,8 +459,15 @@ elseif ($WingetPath) {
         ($_.UserContext -eq $true)
     }
 
-    # call winget and check if we need to retry
-    $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
+    try {
+        # call winget and check if we need to retry
+        $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
+        Write-Log -Message "Successfully executed winget upgrade in system context"
+    } catch {
+        Write-Log -Message "Error executing winget in system context: $($_.Exception.Message)"
+        Write-Log -Message "Winget execution failed, exiting"
+        exit 1
+    }
     
     # Check if first output is valid (contains actual app data)
     $hasValidOutput = $false
