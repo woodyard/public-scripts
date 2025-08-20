@@ -9,8 +9,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 4.1
- Tag: 3Q
+ Version: 4.2
+ Tag: 3R
     
     Version History:
     1.0 - Initial version
@@ -35,7 +35,8 @@
     3.8 - Made context filtering logic more robust to handle apps without explicit SystemContext/UserContext properties; Added WiresharkFoundation.Wireshark to whitelist
     3.9 - Improved log management: dynamic path selection (Intune logs for system context), automatic cleanup of logs older than 1 month
     4.0 - Added PromptWhenBlocked property support for granular control over interactive dialogs vs silent waiting when blocking processes are running
-    4.1 - Fixed Windows Forms dialog for non-interactive/system context execution, resolved quser command path issues, improved system context error handling
+    4.1 - Fixed Windows Forms dialog for non-interactive/system context execution, resolved quser command path issues, improved system context error handling, added user session dialog display for system context
+    4.2 - Enhanced user session dialog display with multiple fallback approaches and improved reliability
     
     Exit Codes:
     0 - Script completed successfully
@@ -93,6 +94,266 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
         return $IsOOBEComplete
 }
 
+function Show-DialogToUser {
+    param(
+        [string]$AppName,
+        [string]$ProcessName,
+        [int]$TimeoutSeconds = 60,
+        [bool]$DefaultTimeoutAction = $false,
+        [string]$FriendlyName = ""
+    )
+
+    Write-Log -Message "Show-DialogToUser called for $AppName" | Out-Null
+
+    # Use provided FriendlyName or fallback to AppName
+    $friendlyName = if (-not [string]::IsNullOrEmpty($FriendlyName)) { $FriendlyName } else { $AppName }
+
+    Write-Log -Message "Friendly name resolved to: $friendlyName" | Out-Null
+
+    $defaultAction = if ($DefaultTimeoutAction) { "Yes" } else { "No" }
+    $message = "An update is available for $friendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $friendlyName now to allow the update to proceed?`n`nThis dialog will automatically choose '$defaultAction' in $TimeoutSeconds seconds."
+
+    try {
+        # Check for active user sessions
+        $quserPath = "$env:SystemRoot\System32\quser.exe"
+        $msgPath = "$env:SystemRoot\System32\msg.exe"
+
+        if (Test-Path $quserPath) {
+            # Get active user sessions
+            $sessionInfo = & $quserPath 2>$null | Where-Object { $_ -match "Active" }
+            if ($sessionInfo) {
+                $sessionId = ($sessionInfo -split '\s+')[2] -replace '\D', ''
+                Write-Log -Message "Found active user session: $sessionId" | Out-Null
+
+                # Try to create a PowerShell script in user context
+                $scriptPath = "$env:TEMP\CloseDialog_$([guid]::NewGuid().ToString().Substring(0,8)).ps1"
+
+                # Create result file path
+                $resultFile = "$env:TEMP\DialogResult_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
+
+                # Create the dialog script
+                $dialogScript = @"
+param([string]`$friendlyName, [int]`$timeoutSeconds, [bool]`$defaultTimeoutAction, [string]`$resultFile)
+
+`$defaultAction = if (`$defaultTimeoutAction) { "Yes" } else { "No" }
+`$message = "An update is available for `$friendlyName, but it cannot be installed while the application is running.`n`nWould you like to close `$friendlyName now to allow the update to proceed?`n`nThis dialog will automatically choose '`$defaultAction' in `$timeoutSeconds seconds."
+
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    `$form = New-Object System.Windows.Forms.Form
+    `$form.Text = "Application Update Available"
+    `$form.Size = New-Object System.Drawing.Size(500, 250)
+    `$form.StartPosition = "CenterScreen"
+    `$form.MaximizeBox = `$false
+    `$form.MinimizeBox = `$false
+    `$form.FormBorderStyle = "FixedDialog"
+    `$form.TopMost = `$true
+
+    `$label = New-Object System.Windows.Forms.Label
+    `$label.Location = New-Object System.Drawing.Point(20, 20)
+    `$label.Size = New-Object System.Drawing.Size(450, 120)
+    `$label.Text = `$message
+    `$label.TextAlign = "MiddleLeft"
+    `$form.Controls.Add(`$label)
+
+    `$countdownLabel = New-Object System.Windows.Forms.Label
+    `$countdownLabel.Location = New-Object System.Drawing.Point(20, 150)
+    `$countdownLabel.Size = New-Object System.Drawing.Size(450, 20)
+    `$countdownLabel.Text = "Time remaining: `$timeoutSeconds seconds"
+    `$countdownLabel.ForeColor = [System.Drawing.Color]::Red
+    `$form.Controls.Add(`$countdownLabel)
+
+    `$buttonYes = New-Object System.Windows.Forms.Button
+    `$buttonYes.Location = New-Object System.Drawing.Point(250, 180)
+    `$buttonYes.Size = New-Object System.Drawing.Size(100, 30)
+    `$buttonYes.Text = "Yes, Close App"
+    `$buttonYes.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+    `$form.Controls.Add(`$buttonYes)
+
+    `$buttonNo = New-Object System.Windows.Forms.Button
+    `$buttonNo.Location = New-Object System.Drawing.Point(370, 180)
+    `$buttonNo.Size = New-Object System.Drawing.Size(100, 30)
+    `$buttonNo.Text = "No, Keep Open"
+    `$buttonNo.DialogResult = [System.Windows.Forms.DialogResult]::No
+    `$form.Controls.Add(`$buttonNo)
+
+    `$timer = New-Object System.Windows.Forms.Timer
+    `$timer.Interval = 1000
+    `$timer.Tag = `$timeoutSeconds
+
+    `$timer.add_Tick({
+        `$currentTimer = `$this
+        `$timeLeft = [int]`$currentTimer.Tag
+        `$timeLeft--
+        `$currentTimer.Tag = `$timeLeft
+        `$countdownLabel.Text = "Time remaining: `$timeLeft seconds"
+        if (`$timeLeft -le 0) {
+            `$currentTimer.Stop()
+            if (`$defaultTimeoutAction) {
+                `$form.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+            } else {
+                `$form.DialogResult = [System.Windows.Forms.DialogResult]::No
+            }
+            `$form.Close()
+        }
+    })
+
+    `$timer.Start()
+    `$result = `$form.ShowDialog()
+    `$timer.Stop()
+    `$form.Dispose()
+
+    if (`$result -eq [System.Windows.Forms.DialogResult]::Yes) {
+        "YES" | Out-File -FilePath `$resultFile -Encoding ASCII
+    } else {
+        "NO" | Out-File -FilePath `$resultFile -Encoding ASCII
+    }
+} catch {
+    "ERROR" | Out-File -FilePath `$resultFile -Encoding ASCII
+}
+"@
+
+                # Write the dialog script to temp file
+                $dialogScript | Out-File -FilePath $scriptPath -Encoding UTF8
+
+                # Try to run the dialog script in user context
+                try {
+                    # Get the current user session
+                    $explorerProcess = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($explorerProcess) {
+                        $userSessionId = $explorerProcess.SessionId
+                        Write-Log -Message "Found user session ID: $userSessionId" | Out-Null
+
+                        # Try multiple approaches to show dialog in user context
+                        $dialogShown = $false
+
+                        # Approach 1: Try using Windows API to show a system tray notification with buttons
+                        try {
+                            Write-Log -Message "Attempting to show Windows notification to user" | Out-Null
+
+                            # Create a simple VBScript for showing a message box in user context
+                            $vbsPath = "$env:TEMP\NotifyUser_$([guid]::NewGuid().ToString().Substring(0,8)).vbs"
+                            $vbsScript = @"
+Set objShell = CreateObject("WScript.Shell")
+result = objShell.Popup("An update is available for $friendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $friendlyName now to allow the update to proceed?", $TimeoutSeconds, "Application Update Available", 4 + 48)
+If result = 6 Then
+    ' Yes
+    Set objFSO = CreateObject("Scripting.FileSystemObject")
+    Set objFile = objFSO.CreateTextFile("$resultFile", True)
+    objFile.WriteLine "YES"
+    objFile.Close
+Else
+    ' No or timeout
+    Set objFSO = CreateObject("Scripting.FileSystemObject")
+    Set objFile = objFSO.CreateTextFile("$resultFile", True)
+    objFile.WriteLine "NO"
+    objFile.Close
+End If
+"@
+
+                            $vbsScript | Out-File -FilePath $vbsPath -Encoding ASCII
+
+                            # Try to execute the VBScript in user context
+                            $psexecPath = "$env:ProgramData\chocolatey\bin\PsExec.exe"
+                            if (Test-Path $psexecPath) {
+                                $psexecArgs = "-s -i $userSessionId wscript.exe `"$vbsPath`""
+                                $psexecResult = & $psexecPath $psexecArgs 2>&1
+                                Write-Log -Message "VBScript notification shown via PsExec" | Out-Null
+                                $dialogShown = $true
+                            } else {
+                                # Try using scheduled task as alternative
+                                Write-Log -Message "PsExec not available, trying scheduled task approach" | Out-Null
+                                $taskName = "NotifyUserTask_$([guid]::NewGuid().ToString().Substring(0,8))"
+                                $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbsPath`""
+                                $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType InteractiveToken
+                                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+
+                                Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+                                Start-ScheduledTask -TaskName $taskName
+
+                                # Wait a moment for the task to start
+                                Start-Sleep -Seconds 2
+                                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                                $dialogShown = $true
+                            }
+
+                            # Clean up VBS file
+                            if (Test-Path $vbsPath) {
+                                Remove-Item $vbsPath -Force -ErrorAction SilentlyContinue
+                            }
+                        } catch {
+                            Write-Log -Message "Windows notification failed: $($_.Exception.Message)" | Out-Null
+                        }
+
+                        # Approach 2: Try PowerShell approach if notification failed
+                        if (-not $dialogShown) {
+                            Write-Log -Message "Trying PowerShell dialog approach" | Out-Null
+                            $psexecPath = "$env:ProgramData\chocolatey\bin\PsExec.exe"
+                            if (Test-Path $psexecPath) {
+                                $psexecArgs = "-s -i $userSessionId powershell.exe -ExecutionPolicy Bypass -File `"$scriptPath`" -friendlyName `"$friendlyName`" -timeoutSeconds $TimeoutSeconds -defaultTimeoutAction `$$DefaultTimeoutAction -resultFile `"$resultFile`""
+                                $psexecResult = & $psexecPath $psexecArgs 2>&1
+                                Write-Log -Message "PowerShell dialog attempted via PsExec" | Out-Null
+                            }
+                        }
+
+                        # Wait for result file to be created
+                        $waitTime = 0
+                        while (-not (Test-Path $resultFile) -and $waitTime -lt ($TimeoutSeconds + 5)) {
+                            Start-Sleep -Seconds 1
+                            $waitTime++
+                        }
+
+                        # Read the result
+                        if (Test-Path $resultFile) {
+                            $result = Get-Content $resultFile -Raw -ErrorAction SilentlyContinue
+                            $result = $result.Trim()
+                            Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
+                            Write-Log -Message "Dialog result from user context: $result" | Out-Null
+                        } else {
+                            $result = "TIMEOUT"
+                            Write-Log -Message "Dialog result file not created, assuming timeout" | Out-Null
+                        }
+                    } else {
+                        Write-Log -Message "No explorer process found, no active user session" | Out-Null
+                        $result = "NO_SESSION"
+                    }
+                } catch {
+                    Write-Log -Message "Error running dialog in user context: $($_.Exception.Message)" | Out-Null
+                    $result = "ERROR"
+                }
+
+                # Clean up script file
+                if (Test-Path $scriptPath) {
+                    Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+                }
+
+                # Return based on result
+                if ($result -eq "YES") {
+                    Write-Log -Message "User chose to close $friendlyName via user context dialog" | Out-Null
+                    return $true
+                } elseif ($result -eq "NO") {
+                    Write-Log -Message "User chose not to close $friendlyName via user context dialog" | Out-Null
+                    return $false
+                } else {
+                    Write-Log -Message "Dialog in user context failed (result: $result), using default action: $DefaultTimeoutAction" | Out-Null
+                    return $DefaultTimeoutAction
+                }
+            } else {
+                Write-Log -Message "No active user session found" | Out-Null
+                return $DefaultTimeoutAction
+            }
+        } else {
+            Write-Log -Message "quser.exe not available, using default action: $DefaultTimeoutAction" | Out-Null
+            return $DefaultTimeoutAction
+        }
+    } catch {
+        Write-Log -Message "Error showing dialog to user: $($_.Exception.Message)" | Out-Null
+        return $DefaultTimeoutAction
+    }
+}
+
 function Show-ProcessCloseDialog {
     param(
         [string]$AppName,
@@ -115,10 +376,10 @@ function Show-ProcessCloseDialog {
 
     Write-Log -Message "Friendly name resolved to: $friendlyName" | Out-Null
 
-    # If running in system context and non-interactive, skip dialog entirely
+    # If running in system context and non-interactive, try to show dialog to active user
     if ($isSystemContext -and -not $isInteractive) {
-        Write-Log -Message "Running in system non-interactive context. Using default timeout action: $DefaultTimeoutAction" | Out-Null
-        return $DefaultTimeoutAction
+        Write-Log -Message "Running in system non-interactive context. Attempting to show dialog to active user." | Out-Null
+        return Show-DialogToUser -AppName $AppName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction -FriendlyName $FriendlyName
     }
     
     $defaultAction = if ($DefaultTimeoutAction) { "Yes" } else { "No" }
@@ -329,7 +590,7 @@ function Remove-OldLogs {
 }
 
 <# Script variables #>
-$ScriptTag = "3Q" # Update this tag for each script version
+$ScriptTag = "3R" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
