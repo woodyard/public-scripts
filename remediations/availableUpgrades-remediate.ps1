@@ -9,8 +9,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 4.2
- Tag: 3R
+ Version: 4.3
+ Tag: 4R
     
     Version History:
     1.0 - Initial version
@@ -37,6 +37,7 @@
     4.0 - Added PromptWhenBlocked property support for granular control over interactive dialogs vs silent waiting when blocking processes are running
     4.1 - Fixed Windows Forms dialog for non-interactive/system context execution, resolved quser command path issues, improved system context error handling, added user session dialog display for system context
     4.2 - Enhanced user session dialog display with multiple fallback approaches and improved reliability
+    4.3 - Fixed quser.exe availability issues with multiple path detection and comprehensive WMI-based fallback mechanisms for user session detection and dialog display
     
     Exit Codes:
     0 - Script completed successfully
@@ -114,11 +115,28 @@ function Show-DialogToUser {
     $message = "An update is available for $friendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $friendlyName now to allow the update to proceed?`n`nThis dialog will automatically choose '$defaultAction' in $TimeoutSeconds seconds."
 
     try {
-        # Check for active user sessions
+        # Check for active user sessions using multiple approaches
         $quserPath = "$env:SystemRoot\System32\quser.exe"
         $msgPath = "$env:SystemRoot\System32\msg.exe"
+        
+        # Alternative paths for quser.exe
+        $quserAlternatePaths = @(
+            "$env:SystemRoot\System32\quser.exe",
+            "$env:WINDIR\System32\quser.exe",
+            "C:\Windows\System32\quser.exe"
+        )
+        
+        $quserFound = $false
+        foreach ($path in $quserAlternatePaths) {
+            if (Test-Path $path) {
+                $quserPath = $path
+                $quserFound = $true
+                Write-Log -Message "Found quser.exe at: $path" | Out-Null
+                break
+            }
+        }
 
-        if (Test-Path $quserPath) {
+        if ($quserFound) {
             # Get active user sessions
             $sessionInfo = & $quserPath 2>$null | Where-Object { $_ -match "Active" }
             if ($sessionInfo) {
@@ -345,7 +363,131 @@ End If
                 return $DefaultTimeoutAction
             }
         } else {
-            Write-Log -Message "quser.exe not available, using default action: $DefaultTimeoutAction" | Out-Null
+            Write-Log -Message "quser.exe not found in any standard location, trying alternative approaches" | Out-Null
+            
+            # Try alternative approach using WMI/CIM to detect active user sessions
+            try {
+                Write-Log -Message "Attempting WMI-based user session detection" | Out-Null
+                $activeSessions = Get-CimInstance -ClassName Win32_LogonSession -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LogonType -eq 2 -or $_.LogonType -eq 10 } # Interactive or RemoteInteractive
+                
+                if ($activeSessions -and $activeSessions.Count -gt 0) {
+                    Write-Log -Message "Found $($activeSessions.Count) active user session(s) via WMI" | Out-Null
+                    
+                    # Try to get the current user's session ID from explorer process
+                    $explorerProcess = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($explorerProcess) {
+                        $userSessionId = $explorerProcess.SessionId
+                        Write-Log -Message "Found user session ID via explorer process: $userSessionId" | Out-Null
+                        
+                        # Try VBScript approach without quser
+                        try {
+                            Write-Log -Message "Attempting VBScript notification without quser dependency" | Out-Null
+                            
+                            # Create result file path
+                            $resultFile = "$env:TEMP\\DialogResult_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
+                            
+                            # Create a simple VBScript for showing a message box
+                            $vbsPath = "$env:TEMP\\NotifyUser_$([guid]::NewGuid().ToString().Substring(0,8)).vbs"
+                            $vbsScript = @"
+Set objShell = CreateObject("WScript.Shell")
+result = objShell.Popup("An update is available for $friendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $friendlyName now to allow the update to proceed?", $TimeoutSeconds, "Application Update Available", 4 + 48)
+If result = 6 Then
+    ' Yes
+    Set objFSO = CreateObject("Scripting.FileSystemObject")
+    Set objFile = objFSO.CreateTextFile("$resultFile", True)
+    objFile.WriteLine "YES"
+    objFile.Close
+ElseIf result = 7 Then
+    ' No
+    Set objFSO = CreateObject("Scripting.FileSystemObject")
+    Set objFile = objFSO.CreateTextFile("$resultFile", True)
+    objFile.WriteLine "NO"
+    objFile.Close
+Else
+    ' Timeout or other
+    Set objFSO = CreateObject("Scripting.FileSystemObject")
+    Set objFile = objFSO.CreateTextFile("$resultFile", True)
+    objFile.WriteLine "NO"
+    objFile.Close
+End If
+"@
+                            
+                            $vbsScript | Out-File -FilePath $vbsPath -Encoding ASCII
+                            
+                            # Try to execute the VBScript using scheduled task approach
+                            Write-Log -Message "Creating scheduled task to show dialog in user context" | Out-Null
+                            $taskName = "NotifyUserTask_$([guid]::NewGuid().ToString().Substring(0,8))"
+                            
+                            try {
+                                $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbsPath`""
+                                $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\\INTERACTIVE" -LogonType InteractiveToken
+                                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Seconds ($TimeoutSeconds + 10))
+                                
+                                Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+                                Start-ScheduledTask -TaskName $taskName
+                                
+                                Write-Log -Message "Scheduled task created and started: $taskName" | Out-Null
+                                
+                                # Wait for result file to be created
+                                $waitTime = 0
+                                while (-not (Test-Path $resultFile) -and $waitTime -lt ($TimeoutSeconds + 5)) {
+                                    Start-Sleep -Seconds 1
+                                    $waitTime++
+                                }
+                                
+                                # Clean up scheduled task
+                                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                                
+                                # Read the result
+                                if (Test-Path $resultFile) {
+                                    $result = Get-Content $resultFile -Raw -ErrorAction SilentlyContinue
+                                    $result = $result.Trim()
+                                    Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
+                                    Write-Log -Message "Dialog result from scheduled task approach: $result" | Out-Null
+                                    
+                                    # Clean up VBS file
+                                    if (Test-Path $vbsPath) {
+                                        Remove-Item $vbsPath -Force -ErrorAction SilentlyContinue
+                                    }
+                                    
+                                    # Return based on result
+                                    if ($result -eq "YES") {
+                                        Write-Log -Message "User chose to close $friendlyName via scheduled task dialog" | Out-Null
+                                        return $true
+                                    } else {
+                                        Write-Log -Message "User chose not to close $friendlyName via scheduled task dialog" | Out-Null
+                                        return $false
+                                    }
+                                } else {
+                                    Write-Log -Message "Dialog result file not created by scheduled task, using default action" | Out-Null
+                                }
+                            } catch {
+                                Write-Log -Message "Scheduled task approach failed: $($_.Exception.Message)" | Out-Null
+                            }
+                            
+                            # Clean up files
+                            if (Test-Path $vbsPath) {
+                                Remove-Item $vbsPath -Force -ErrorAction SilentlyContinue
+                            }
+                            if (Test-Path $resultFile) {
+                                Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
+                            }
+                            
+                        } catch {
+                            Write-Log -Message "VBScript fallback approach failed: $($_.Exception.Message)" | Out-Null
+                        }
+                    } else {
+                        Write-Log -Message "No explorer process found for session detection" | Out-Null
+                    }
+                } else {
+                    Write-Log -Message "No active user sessions found via WMI" | Out-Null
+                }
+            } catch {
+                Write-Log -Message "WMI-based session detection failed: $($_.Exception.Message)" | Out-Null
+            }
+            
+            Write-Log -Message "All dialog approaches failed, using default action: $DefaultTimeoutAction" | Out-Null
             return $DefaultTimeoutAction
         }
     } catch {
@@ -590,7 +732,7 @@ function Remove-OldLogs {
 }
 
 <# Script variables #>
-$ScriptTag = "3R" # Update this tag for each script version
+$ScriptTag = "4R" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
