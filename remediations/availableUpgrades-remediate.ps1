@@ -9,8 +9,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 4.3
- Tag: 4R
+ Version: 4.4
+ Tag: 5R
     
     Version History:
     1.0 - Initial version
@@ -38,6 +38,7 @@
     4.1 - Fixed Windows Forms dialog for non-interactive/system context execution, resolved quser command path issues, improved system context error handling, added user session dialog display for system context
     4.2 - Enhanced user session dialog display with multiple fallback approaches and improved reliability
     4.3 - Fixed quser.exe availability issues with multiple path detection and comprehensive WMI-based fallback mechanisms for user session detection and dialog display
+    4.4 - Fixed scheduled task LogonType enumeration error (InteractiveToken to Interactive) for proper VBScript dialog execution in user context
     
     Exit Codes:
     0 - Script completed successfully
@@ -421,7 +422,7 @@ End If
                             
                             try {
                                 $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbsPath`""
-                                $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\\INTERACTIVE" -LogonType InteractiveToken
+                                $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\\INTERACTIVE" -LogonType Interactive
                                 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Seconds ($TimeoutSeconds + 10))
                                 
                                 Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
@@ -732,7 +733,7 @@ function Remove-OldLogs {
 }
 
 <# Script variables #>
-$ScriptTag = "4R" # Update this tag for each script version
+$ScriptTag = "5R" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
