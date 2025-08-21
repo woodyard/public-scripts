@@ -286,7 +286,7 @@ End If
                                 Write-Log -Message "PsExec not available, trying scheduled task approach" | Out-Null
                                 $taskName = "NotifyUserTask_$([guid]::NewGuid().ToString().Substring(0,8))"
                                 $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbsPath`""
-                                $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType InteractiveToken
+                                $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
                                 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 
                                 Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
