@@ -9,8 +9,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 4.4
- Tag: 5R
+ Version: 4.5
+ Tag: 6R
     
     Version History:
     1.0 - Initial version
@@ -39,6 +39,7 @@
     4.2 - Enhanced user session dialog display with multiple fallback approaches and improved reliability
     4.3 - Fixed quser.exe availability issues with multiple path detection and comprehensive WMI-based fallback mechanisms for user session detection and dialog display
     4.4 - Fixed scheduled task LogonType enumeration error (InteractiveToken to Interactive) for proper VBScript dialog execution in user context
+    4.5 - Enhanced VBScript dialog execution with direct process approach and improved scheduled task debugging for better dialog reliability
     
     Exit Codes:
     0 - Script completed successfully
@@ -416,11 +417,60 @@ End If
                             
                             $vbsScript | Out-File -FilePath $vbsPath -Encoding ASCII
                             
-                            # Try to execute the VBScript using scheduled task approach
-                            Write-Log -Message "Creating scheduled task to show dialog in user context" | Out-Null
-                            $taskName = "NotifyUserTask_$([guid]::NewGuid().ToString().Substring(0,8))"
+                            # Try direct VBScript execution first - simpler approach
+                            Write-Log -Message "Attempting direct VBScript execution" | Out-Null
                             
                             try {
+                                # Try direct execution in current session
+                                $vbsProcess = Start-Process -FilePath "wscript.exe" -ArgumentList "`"$vbsPath`"" -PassThru -WindowStyle Normal
+                                Write-Log -Message "VBScript process started with PID: $($vbsProcess.Id)" | Out-Null
+                                
+                                # Wait for the VBScript to complete or timeout
+                                $waitTime = 0
+                                while (-not (Test-Path $resultFile) -and $waitTime -lt ($TimeoutSeconds + 5) -and -not $vbsProcess.HasExited) {
+                                    Start-Sleep -Seconds 1
+                                    $waitTime++
+                                }
+                                
+                                # If process is still running, kill it
+                                if (-not $vbsProcess.HasExited) {
+                                    Write-Log -Message "VBScript process timed out, terminating" | Out-Null
+                                    $vbsProcess.Kill()
+                                }
+                                
+                                # Check for result
+                                if (Test-Path $resultFile) {
+                                    $result = Get-Content $resultFile -Raw -ErrorAction SilentlyContinue
+                                    $result = $result.Trim()
+                                    Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
+                                    Write-Log -Message "Dialog result from direct VBScript: $result" | Out-Null
+                                    
+                                    # Clean up VBS file
+                                    if (Test-Path $vbsPath) {
+                                        Remove-Item $vbsPath -Force -ErrorAction SilentlyContinue
+                                    }
+                                    
+                                    # Return based on result
+                                    if ($result -eq "YES") {
+                                        Write-Log -Message "User chose to close $friendlyName via VBScript dialog" | Out-Null
+                                        return $true
+                                    } else {
+                                        Write-Log -Message "User chose not to close $friendlyName via VBScript dialog" | Out-Null
+                                        return $false
+                                    }
+                                } else {
+                                    Write-Log -Message "Direct VBScript approach failed, trying scheduled task" | Out-Null
+                                }
+                            } catch {
+                                Write-Log -Message "Direct VBScript execution failed: $($_.Exception.Message)" | Out-Null
+                                Write-Log -Message "Trying scheduled task approach as fallback" | Out-Null
+                            }
+                            
+                            # Fallback to scheduled task approach
+                            try {
+                                Write-Log -Message "Creating scheduled task to show dialog in user context" | Out-Null
+                                $taskName = "NotifyUserTask_$([guid]::NewGuid().ToString().Substring(0,8))"
+                                
                                 $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbsPath`""
                                 $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\\INTERACTIVE" -LogonType Interactive
                                 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Seconds ($TimeoutSeconds + 10))
@@ -435,10 +485,16 @@ End If
                                 while (-not (Test-Path $resultFile) -and $waitTime -lt ($TimeoutSeconds + 5)) {
                                     Start-Sleep -Seconds 1
                                     $waitTime++
+                                    if ($waitTime % 5 -eq 0) {
+                                        Write-Log -Message "Still waiting for dialog result... ($waitTime seconds elapsed)" | Out-Null
+                                    }
                                 }
+                                
+                                Write-Log -Message "Wait completed. Checking for result file..." | Out-Null
                                 
                                 # Clean up scheduled task
                                 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                                Write-Log -Message "Scheduled task cleaned up" | Out-Null
                                 
                                 # Read the result
                                 if (Test-Path $resultFile) {
@@ -461,7 +517,17 @@ End If
                                         return $false
                                     }
                                 } else {
-                                    Write-Log -Message "Dialog result file not created by scheduled task, using default action" | Out-Null
+                                    Write-Log -Message "Dialog result file not created by scheduled task, checking task status" | Out-Null
+                                    
+                                    # Try to get task information to debug
+                                    try {
+                                        $taskInfo = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                                        if ($taskInfo) {
+                                            Write-Log -Message "Task state was: $($taskInfo.State)" | Out-Null
+                                        }
+                                    } catch {
+                                        Write-Log -Message "Could not retrieve task information" | Out-Null
+                                    }
                                 }
                             } catch {
                                 Write-Log -Message "Scheduled task approach failed: $($_.Exception.Message)" | Out-Null
@@ -733,7 +799,7 @@ function Remove-OldLogs {
 }
 
 <# Script variables #>
-$ScriptTag = "5R" # Update this tag for each script version
+$ScriptTag = "6R" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
