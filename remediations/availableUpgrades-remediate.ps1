@@ -335,11 +335,12 @@ Add-Content -Path "`$ResponseFile.log" -Value "ServiceUI script completed at `$(
             Write-Log -Message "Executing dialog via ServiceUI.exe" | Out-Null
             
             # ServiceUI.exe correct syntax: ServiceUI.exe [SessionID] [ApplicationPath] "[Parameters]"
-            $powershellArgs = "-ExecutionPolicy Bypass -WindowStyle Normal -File `"$scriptPath`" -ResponseFile `"$responseFile`" -FriendlyName `"$FriendlyName`""
+            # Use single quotes inside to avoid nested quote issues
+            $powershellArgs = "-ExecutionPolicy Bypass -WindowStyle Normal -File '$scriptPath' -ResponseFile '$responseFile' -FriendlyName '$FriendlyName'"
             $serviceUIArgs = @(
                 $primarySession.SessionId,
                 "powershell.exe",
-                "`"$powershellArgs`""
+                $powershellArgs
             )
             
             Write-Log -Message "ServiceUI command: $serviceUIPath $($serviceUIArgs -join ' ')" | Out-Null
