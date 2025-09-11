@@ -193,41 +193,41 @@ function Show-ToastNotification {
         $responseFile = "$env:TEMP\ToastResponse_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
         
         # Create PowerShell script that shows actual Windows Toast notifications
-        $toastScript = @"
-param([string]`$ResponseFile, [string]`$FriendlyName, [int]`$TimeoutSeconds, [bool]`$DefaultTimeoutAction)
+        $toastScript = @'
+param([string]$ResponseFile, [string]$FriendlyName, [int]$TimeoutSeconds, [bool]$DefaultTimeoutAction)
 
 # Log script execution
-Add-Content -Path "`$ResponseFile.log" -Value "Toast script started at `$(Get-Date)"
-Add-Content -Path "`$ResponseFile.log" -Value "Current user: `$(whoami)"
-Add-Content -Path "`$ResponseFile.log" -Value "Session name: `$env:SESSIONNAME"
-Add-Content -Path "`$ResponseFile.log" -Value "FriendlyName: `$FriendlyName"
+Add-Content -Path "$ResponseFile.log" -Value "Toast script started at $(Get-Date)"
+Add-Content -Path "$ResponseFile.log" -Value "Current user: $(whoami)"
+Add-Content -Path "$ResponseFile.log" -Value "Session name: $env:SESSIONNAME"
+Add-Content -Path "$ResponseFile.log" -Value "FriendlyName: $FriendlyName"
 
 try {
     # Check Windows version for toast support
-    `$osVersion = [System.Environment]::OSVersion.Version
-    Add-Content -Path "`$ResponseFile.log" -Value "OS Version: `$(`$osVersion.Major).`$(`$osVersion.Minor).`$(`$osVersion.Build)"
+    $osVersion = [System.Environment]::OSVersion.Version
+    Add-Content -Path "$ResponseFile.log" -Value "OS Version: $($osVersion.Major).$($osVersion.Minor).$($osVersion.Build)"
     
-    if (`$osVersion.Major -lt 10) {
-        Add-Content -Path "`$ResponseFile.log" -Value "Toast notifications require Windows 10 or later"
+    if ($osVersion.Major -lt 10) {
+        Add-Content -Path "$ResponseFile.log" -Value "Toast notifications require Windows 10 or later"
         # Fallback to MessageBox for older Windows
         Add-Type -AssemblyName System.Windows.Forms
-        `$message = "An update is available for `$FriendlyName, but it cannot be installed while the application is running.``n``nWould you like to close `$FriendlyName now to allow the update to proceed?"
-        `$result = [System.Windows.Forms.MessageBox]::Show(`$message, "Application Update Available", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+        $message = "An update is available for $FriendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $FriendlyName now to allow the update to proceed?"
+        $result = [System.Windows.Forms.MessageBox]::Show($message, "Application Update Available", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
         
-        if (`$result -eq [System.Windows.Forms.DialogResult]::Yes) {
-            "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+            "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
         } else {
-            "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+            "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
         }
         return
     }
     
-    Add-Content -Path "`$ResponseFile.log" -Value "Loading Windows Runtime assemblies"
+    Add-Content -Path "$ResponseFile.log" -Value "Loading Windows Runtime assemblies"
     
     # Load Windows Runtime assemblies for Toast notifications
     Add-Type -AssemblyName System.Runtime.WindowsRuntime
-    `$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-    `$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+    $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+    $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
     
     # Alternative method if above fails
     if (-not ([System.Management.Automation.PSTypeName]'Windows.UI.Notifications.ToastNotificationManager').Type) {
@@ -235,15 +235,15 @@ try {
         [void][Windows.Data.Xml.Dom.XmlDocument]
     }
     
-    Add-Content -Path "`$ResponseFile.log" -Value "Windows Runtime assemblies loaded successfully"
+    Add-Content -Path "$ResponseFile.log" -Value "Windows Runtime assemblies loaded successfully"
     
     # Create toast XML template with protocol activation for button responses
-    `$toastXml = @"
+    $toastXml = @"
 <toast activationType="protocol" launch="action=timeout" duration="long">
     <visual>
         <binding template="ToastGeneric">
             <text>Application Update Available</text>
-            <text>An update is available for `$FriendlyName, but it cannot be installed while the application is running. Would you like to close `$FriendlyName now to allow the update to proceed?</text>
+            <text>An update is available for $FriendlyName, but it cannot be installed while the application is running. Would you like to close $FriendlyName now to allow the update to proceed?</text>
         </binding>
     </visual>
     <actions>
@@ -253,127 +253,127 @@ try {
 </toast>
 "@
 
-    Add-Content -Path "`$ResponseFile.log" -Value "Toast XML template created"
+    Add-Content -Path "$ResponseFile.log" -Value "Toast XML template created"
     
     # Create XmlDocument
-    `$xmlDoc = New-Object Windows.Data.Xml.Dom.XmlDocument
-    `$xmlDoc.LoadXml(`$toastXml)
+    $xmlDoc = New-Object Windows.Data.Xml.Dom.XmlDocument
+    $xmlDoc.LoadXml($toastXml)
     
-    Add-Content -Path "`$ResponseFile.log" -Value "XML document loaded"
+    Add-Content -Path "$ResponseFile.log" -Value "XML document loaded"
     
     # Create toast notification
-    `$toast = New-Object Windows.UI.Notifications.ToastNotification `$xmlDoc
+    $toast = New-Object Windows.UI.Notifications.ToastNotification $xmlDoc
     
     # Set expiration time
-    `$toast.ExpirationTime = [DateTimeOffset]::Now.AddSeconds(`$TimeoutSeconds)
+    $toast.ExpirationTime = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
     
-    Add-Content -Path "`$ResponseFile.log" -Value "Toast notification object created with expiration"
+    Add-Content -Path "$ResponseFile.log" -Value "Toast notification object created with expiration"
     
     # Get toast notifier for PowerShell
-    `$appId = "Microsoft.PowerShell_8wekyb3d8bbwe!powershell"
-    `$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(`$appId)
+    $appId = "Microsoft.PowerShell_8wekyb3d8bbwe!powershell"
+    $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId)
     
-    Add-Content -Path "`$ResponseFile.log" -Value "Toast notifier created for app ID: `$appId"
+    Add-Content -Path "$ResponseFile.log" -Value "Toast notifier created for app ID: $appId"
     
     # Add event handlers for user interaction
-    `$activated = `$false
-    `$activationArgs = ""
+    $activated = $false
+    $activationArgs = ""
     
     # Register activation handler
-    Register-ObjectEvent -InputObject `$toast -EventName Activated -Action {
-        `$activationArgs = `$Event.SourceEventArgs.Arguments
-        `$activated = `$true
-        Add-Content -Path "`$ResponseFile.log" -Value "Toast activated with arguments: `$activationArgs"
+    Register-ObjectEvent -InputObject $toast -EventName Activated -Action {
+        $activationArgs = $Event.SourceEventArgs.Arguments
+        $activated = $true
+        Add-Content -Path "$ResponseFile.log" -Value "Toast activated with arguments: $activationArgs"
         
-        if (`$activationArgs -like "*action=yes*") {
-            "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-            Add-Content -Path "`$ResponseFile.log" -Value "User clicked YES"
-        } elseif (`$activationArgs -like "*action=no*") {
-            "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-            Add-Content -Path "`$ResponseFile.log" -Value "User clicked NO"
+        if ($activationArgs -like "*action=yes*") {
+            "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
+            Add-Content -Path "$ResponseFile.log" -Value "User clicked YES"
+        } elseif ($activationArgs -like "*action=no*") {
+            "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
+            Add-Content -Path "$ResponseFile.log" -Value "User clicked NO"
         } else {
             # Default action on timeout or unexpected activation
-            if (`$DefaultTimeoutAction) {
-                "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-                Add-Content -Path "`$ResponseFile.log" -Value "Timeout - used default action YES"
+            if ($DefaultTimeoutAction) {
+                "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
+                Add-Content -Path "$ResponseFile.log" -Value "Timeout - used default action YES"
             } else {
-                "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-                Add-Content -Path "`$ResponseFile.log" -Value "Timeout - used default action NO"
+                "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
+                Add-Content -Path "$ResponseFile.log" -Value "Timeout - used default action NO"
             }
         }
     } | Out-Null
     
     # Register dismissed handler
-    Register-ObjectEvent -InputObject `$toast -EventName Dismissed -Action {
-        `$dismissedReason = `$Event.SourceEventArgs.Reason
-        Add-Content -Path "`$ResponseFile.log" -Value "Toast dismissed with reason: `$dismissedReason"
+    Register-ObjectEvent -InputObject $toast -EventName Dismissed -Action {
+        $dismissedReason = $Event.SourceEventArgs.Reason
+        Add-Content -Path "$ResponseFile.log" -Value "Toast dismissed with reason: $dismissedReason"
         
-        if (-not (Test-Path `$ResponseFile)) {
+        if (-not (Test-Path $ResponseFile)) {
             # Only write default if no response was already recorded
-            if (`$DefaultTimeoutAction) {
-                "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-                Add-Content -Path "`$ResponseFile.log" -Value "Dismissed - used default action YES"
+            if ($DefaultTimeoutAction) {
+                "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
+                Add-Content -Path "$ResponseFile.log" -Value "Dismissed - used default action YES"
             } else {
-                "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-                Add-Content -Path "`$ResponseFile.log" -Value "Dismissed - used default action NO"
+                "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
+                Add-Content -Path "$ResponseFile.log" -Value "Dismissed - used default action NO"
             }
         }
     } | Out-Null
     
     # Show the toast
-    Add-Content -Path "`$ResponseFile.log" -Value "About to show toast notification"
-    `$notifier.Show(`$toast)
-    Add-Content -Path "`$ResponseFile.log" -Value "Toast notification displayed successfully"
+    Add-Content -Path "$ResponseFile.log" -Value "About to show toast notification"
+    $notifier.Show($toast)
+    Add-Content -Path "$ResponseFile.log" -Value "Toast notification displayed successfully"
     
     # Wait for user response or timeout
-    `$waitTime = 0
-    while (`$waitTime -lt `$TimeoutSeconds -and -not (Test-Path `$ResponseFile)) {
+    $waitTime = 0
+    while ($waitTime -lt $TimeoutSeconds -and -not (Test-Path $ResponseFile)) {
         Start-Sleep -Seconds 1
-        `$waitTime++
+        $waitTime++
     }
     
     # If no response file exists after timeout, create default response
-    if (-not (Test-Path `$ResponseFile)) {
-        if (`$DefaultTimeoutAction) {
-            "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-            Add-Content -Path "`$ResponseFile.log" -Value "Final timeout - used default action YES"
+    if (-not (Test-Path $ResponseFile)) {
+        if ($DefaultTimeoutAction) {
+            "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
+            Add-Content -Path "$ResponseFile.log" -Value "Final timeout - used default action YES"
         } else {
-            "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-            Add-Content -Path "`$ResponseFile.log" -Value "Final timeout - used default action NO"
+            "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
+            Add-Content -Path "$ResponseFile.log" -Value "Final timeout - used default action NO"
         }
     }
     
 } catch {
-    Add-Content -Path "`$ResponseFile.log" -Value "Error in toast script: `$(`$_.Exception.Message)"
-    Add-Content -Path "`$ResponseFile.log" -Value "Exception details: `$(`$_.Exception.ToString())"
+    Add-Content -Path "$ResponseFile.log" -Value "Error in toast script: $($_.Exception.Message)"
+    Add-Content -Path "$ResponseFile.log" -Value "Exception details: $($_.Exception.ToString())"
     
     # Fallback to MessageBox on toast failure
     try {
         Add-Type -AssemblyName System.Windows.Forms
-        `$message = "An update is available for `$FriendlyName, but it cannot be installed while the application is running.``n``nWould you like to close `$FriendlyName now to allow the update to proceed?"
-        `$result = [System.Windows.Forms.MessageBox]::Show(`$message, "Application Update Available", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+        $message = "An update is available for $FriendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $FriendlyName now to allow the update to proceed?"
+        $result = [System.Windows.Forms.MessageBox]::Show($message, "Application Update Available", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
         
-        if (`$result -eq [System.Windows.Forms.DialogResult]::Yes) {
-            "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-            Add-Content -Path "`$ResponseFile.log" -Value "Fallback MessageBox - User clicked YES"
+        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+            "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
+            Add-Content -Path "$ResponseFile.log" -Value "Fallback MessageBox - User clicked YES"
         } else {
-            "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-            Add-Content -Path "`$ResponseFile.log" -Value "Fallback MessageBox - User clicked NO"
+            "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
+            Add-Content -Path "$ResponseFile.log" -Value "Fallback MessageBox - User clicked NO"
         }
     } catch {
         # Ultimate fallback
-        if (`$DefaultTimeoutAction) {
-            "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-            Add-Content -Path "`$ResponseFile.log" -Value "Ultimate fallback - used default action YES"
+        if ($DefaultTimeoutAction) {
+            "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
+            Add-Content -Path "$ResponseFile.log" -Value "Ultimate fallback - used default action YES"
         } else {
-            "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-            Add-Content -Path "`$ResponseFile.log" -Value "Ultimate fallback - used default action NO"
+            "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
+            Add-Content -Path "$ResponseFile.log" -Value "Ultimate fallback - used default action NO"
         }
     }
 }
 
-Add-Content -Path "`$ResponseFile.log" -Value "Toast script completed at `$(Get-Date)"
-"@
+Add-Content -Path "$ResponseFile.log" -Value "Toast script completed at $(Get-Date)"
+'@
         
         # Write the PowerShell script to temp file
         $scriptPath = "$env:TEMP\ToastScript_$([guid]::NewGuid().ToString().Substring(0,8)).ps1"
@@ -554,46 +554,46 @@ function Show-ServiceUIDialog {
         }
         
         # Create PowerShell script that shows MessageBox
-        $messageBoxScript = @"
-param([string]`$ResponseFile, [string]`$FriendlyName)
+        $messageBoxScript = @'
+param([string]$ResponseFile, [string]$FriendlyName)
 
 # Log script execution
-Add-Content -Path "`$ResponseFile.log" -Value "ServiceUI script started at `$(Get-Date)"
-Add-Content -Path "`$ResponseFile.log" -Value "Current user: `$(whoami)"
-Add-Content -Path "`$ResponseFile.log" -Value "Session name: `$env:SESSIONNAME"
-Add-Content -Path "`$ResponseFile.log" -Value "FriendlyName: `$FriendlyName"
+Add-Content -Path "$ResponseFile.log" -Value "ServiceUI script started at $(Get-Date)"
+Add-Content -Path "$ResponseFile.log" -Value "Current user: $(whoami)"
+Add-Content -Path "$ResponseFile.log" -Value "Session name: $env:SESSIONNAME"
+Add-Content -Path "$ResponseFile.log" -Value "FriendlyName: $FriendlyName"
 
 try {
     Add-Type -AssemblyName System.Windows.Forms
-    Add-Content -Path "`$ResponseFile.log" -Value "System.Windows.Forms loaded successfully"
+    Add-Content -Path "$ResponseFile.log" -Value "System.Windows.Forms loaded successfully"
     
-    `$message = "An update is available for `$FriendlyName, but it cannot be installed while the application is running.``n``nWould you like to close `$FriendlyName now to allow the update to proceed?"
-    `$title = "Application Update Available"
+    $message = "An update is available for $FriendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $FriendlyName now to allow the update to proceed?"
+    $title = "Application Update Available"
     
-    Add-Content -Path "`$ResponseFile.log" -Value "About to show MessageBox"
+    Add-Content -Path "$ResponseFile.log" -Value "About to show MessageBox"
     
     # Show MessageBox with TopMost to ensure visibility
-    `$result = [System.Windows.Forms.MessageBox]::Show(`$message, `$title, [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question, [System.Windows.Forms.MessageBoxDefaultButton]::Button2, [System.Windows.Forms.MessageBoxOptions]::DefaultDesktopOnly)
+    $result = [System.Windows.Forms.MessageBox]::Show($message, $title, [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question, [System.Windows.Forms.MessageBoxDefaultButton]::Button2, [System.Windows.Forms.MessageBoxOptions]::DefaultDesktopOnly)
     
-    Add-Content -Path "`$ResponseFile.log" -Value "MessageBox result: `$result"
+    Add-Content -Path "$ResponseFile.log" -Value "MessageBox result: $result"
     
-    if (`$result -eq [System.Windows.Forms.DialogResult]::Yes) {
-        "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-        Add-Content -Path "`$ResponseFile.log" -Value "User clicked YES - wrote to response file"
+    if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+        "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
+        Add-Content -Path "$ResponseFile.log" -Value "User clicked YES - wrote to response file"
     } else {
-        "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-        Add-Content -Path "`$ResponseFile.log" -Value "User clicked NO - wrote to response file"
+        "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
+        Add-Content -Path "$ResponseFile.log" -Value "User clicked NO - wrote to response file"
     }
     
 } catch {
-    Add-Content -Path "`$ResponseFile.log" -Value "Error: `$(`$_.Exception.Message)"
+    Add-Content -Path "$ResponseFile.log" -Value "Error: $($_.Exception.Message)"
     # Default to NO on error
-    "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
-    Add-Content -Path "`$ResponseFile.log" -Value "Used default NO due to error"
+    "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
+    Add-Content -Path "$ResponseFile.log" -Value "Used default NO due to error"
 }
 
-Add-Content -Path "`$ResponseFile.log" -Value "ServiceUI script completed at `$(Get-Date)"
-"@
+Add-Content -Path "$ResponseFile.log" -Value "ServiceUI script completed at $(Get-Date)"
+'@
         
         # Write the PowerShell script to temp file
         $scriptPath = "$env:TEMP\ServiceUIScript_$([guid]::NewGuid().ToString().Substring(0,8)).ps1"
