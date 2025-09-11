@@ -139,9 +139,7 @@
         "BlockingProcess": "LastPass"
     },
     {
-        "AppID": "Microsoft.PowerShell.Preview",
-        "BlockingProcess": "pwsh",
-        "DefaultTimeoutAction": true
+        "AppID": "Microsoft.PowerShell.Preview"
     },
     {
         "AppID": "PuTTY.PuTTY",
@@ -328,9 +326,7 @@
     },
     {
         "AppID": "Microsoft.PowerShell",
-        "FriendlyName": "PowerShell",
-        "BlockingProcess": "pwsh",
-        "DefaultTimeoutAction": true
+        "FriendlyName": "PowerShell"
     },
     {
         "AppID": "WiresharkFoundation.Wireshark",

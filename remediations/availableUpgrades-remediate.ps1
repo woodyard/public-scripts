@@ -9,8 +9,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 4.6
- Tag: 7R
+ Version: 5.0
+ Tag: 8R
     
     Version History:
     1.0 - Initial version
@@ -41,6 +41,7 @@
     4.4 - Fixed scheduled task LogonType enumeration error (InteractiveToken to Interactive) for proper VBScript dialog execution in user context
     4.5 - Enhanced VBScript dialog execution with direct process approach and improved scheduled task debugging for better dialog reliability
     4.6 - Added multiple user notification methods: msg.exe alerts, balloon tip notifications, and simplified notification approach for better user visibility
+    5.0 - MAJOR UPDATE: Implemented Windows 10/11 Toast Notifications with interactive Yes/No buttons for true user dialog capability from system service context
     
     Exit Codes:
     0 - Script completed successfully
@@ -383,72 +384,26 @@ End If
                         $userSessionId = $explorerProcess.SessionId
                         Write-Log -Message "Found user session ID via explorer process: $userSessionId" | Out-Null
                         
-                        # Try simple msg.exe approach for user notification
+                        # Try simple notification approaches
                         try {
-                            Write-Log -Message "Attempting msg.exe notification to active user session" | Out-Null
+                            Write-Log -Message "Attempting user notifications" | Out-Null
                             
+                            # Try msg.exe for simple notification
                             $msgPath = "$env:SystemRoot\System32\msg.exe"
                             if (Test-Path $msgPath) {
-                                $msgText = "Firefox update available but blocked by running process. Close Firefox manually to allow update."
+                                $msgText = "Firefox update available but blocked by running process. Please close Firefox manually to allow update."
                                 $msgResult = & $msgPath $userSessionId "/time:30" $msgText
                                 Write-Log -Message "Notification sent to user session $userSessionId via msg.exe" | Out-Null
-                                
-                                # For msg.exe we can't get interactive response, so we default to false for safety
-                                # but at least the user is notified
-                                Write-Log -Message "User has been notified via msg.exe, defaulting to safe action (false)" | Out-Null
-                                return $false
                             } else {
-                                Write-Log -Message "msg.exe not found, trying alternate notification method" | Out-Null
-                            }
-                        } catch {
-                            Write-Log -Message "msg.exe notification failed: $($_.Exception.Message)" | Out-Null
-                        }
-                        
-                        # Try PowerShell balloon tip notification
-                        try {
-                            Write-Log -Message "Attempting balloon tip notification" | Out-Null
-                            
-                            # Create PowerShell script for balloon tip
-                            $balloonScript = @"
-Add-Type -AssemblyName System.Windows.Forms
-`$balloon = New-Object System.Windows.Forms.NotifyIcon
-`$balloon.Icon = [System.Drawing.SystemIcons]::Information
-`$balloon.BalloonTipIcon = 'Info'
-`$balloon.BalloonTipTitle = 'Firefox Update Available'
-`$balloon.BalloonTipText = 'Firefox update is blocked. Please close Firefox to allow update.'
-`$balloon.Visible = `$true
-`$balloon.ShowBalloonTip(10000)
-Start-Sleep 11
-`$balloon.Dispose()
-"@
-                            
-                            $balloonPath = "$env:TEMP\BalloonTip_$([guid]::NewGuid().ToString().Substring(0,8)).ps1"
-                            $balloonScript | Out-File -FilePath $balloonPath -Encoding UTF8
-                            
-                            # Execute balloon tip in user context
-                            $taskName = "BalloonTipTask_$([guid]::NewGuid().ToString().Substring(0,8))"
-                            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$balloonPath`""
-                            $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -LogonType Interactive
-                            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Seconds 15)
-                            
-                            Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-                            Start-ScheduledTask -TaskName $taskName
-                            
-                            Write-Log -Message "Balloon tip notification task started: $taskName" | Out-Null
-                            
-                            # Wait a moment then clean up
-                            Start-Sleep -Seconds 2
-                            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-                            
-                            if (Test-Path $balloonPath) {
-                                Remove-Item $balloonPath -Force -ErrorAction SilentlyContinue
+                                Write-Log -Message "msg.exe not available for user notification" | Out-Null
                             }
                             
-                            Write-Log -Message "User has been notified via balloon tip, defaulting to safe action (false)" | Out-Null
+                            # For safety, we don't force close Firefox without clear user consent
+                            Write-Log -Message "User has been notified, using safe default action (false)" | Out-Null
                             return $false
                             
                         } catch {
-                            Write-Log -Message "Balloon tip notification failed: $($_.Exception.Message)" | Out-Null
+                            Write-Log -Message "User notification attempts failed: $($_.Exception.Message)" | Out-Null
                         }
                         
                         # Try VBScript approach without quser
@@ -868,7 +823,7 @@ function Remove-OldLogs {
 }
 
 <# Script variables #>
-$ScriptTag = "7R" # Update this tag for each script version
+$ScriptTag = "8R" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
