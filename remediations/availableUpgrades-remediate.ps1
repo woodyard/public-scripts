@@ -151,10 +151,10 @@ function Get-ActiveUserSessions {
 function Show-ToastNotification {
     <#
     .SYNOPSIS
-        Shows a Windows Toast Notification with interactive buttons
+        Shows a user notification using ServiceUI.exe for cross-session messaging
     .DESCRIPTION
-        Creates and displays a toast notification that can be shown from system context to user sessions
-        Uses Windows 10/11 Toast Notification APIs with response handling
+        Uses ServiceUI.exe from Microsoft Deployment Toolkit to display dialogs from SYSTEM context to user sessions
+        This is the most reliable method for system service to user UI communication
     .PARAMETER AppID
         Application ID for the update
     .PARAMETER FriendlyName
@@ -179,234 +179,162 @@ function Show-ToastNotification {
     Write-Log -Message "Show-ToastNotification called for $AppID ($FriendlyName)" | Out-Null
     
     try {
-        # Check if running on Windows 10/11 with Toast support
-        $osVersion = [System.Environment]::OSVersion.Version
-        if ($osVersion.Major -lt 10 -or ($osVersion.Major -eq 10 -and $osVersion.Build -lt 10240)) {
-            Write-Log -Message "Toast notifications not supported on this OS version, using fallback" | Out-Null
-            return Show-PowerShellDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
-        }
-        
         # Get active user sessions
         $activeSessions = Get-ActiveUserSessions
         if ($activeSessions.Count -eq 0) {
-            Write-Log -Message "No active user sessions found for toast notification" | Out-Null
+            Write-Log -Message "No active user sessions found for notification" | Out-Null
             return $DefaultTimeoutAction
         }
         
         $primarySession = $activeSessions[0]
-        Write-Log -Message "Using session $($primarySession.SessionId) for toast notification" | Out-Null
+        Write-Log -Message "Using session $($primarySession.SessionId) for user notification" | Out-Null
         
         # Create unique response file
-        $responseFile = "$env:TEMP\ToastResponse_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
-        $lockFile = "$responseFile.lock"
+        $responseFile = "$env:TEMP\ServiceUIResponse_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
         
-        # Create VBScript for more reliable MessageBox display in scheduled tasks
-        $vbScript = @"
-Dim AppID, FriendlyName, ResponseFile, LogFile, LockFile
-AppID = "$AppID"
-FriendlyName = "$FriendlyName"
-ResponseFile = "$responseFile"
-LogFile = ResponseFile + ".log"
-LockFile = ResponseFile + ".lock"
-
-' Create lock file
-Set fso = CreateObject("Scripting.FileSystemObject")
-Set lockFileObj = fso.CreateTextFile(LockFile, True)
-lockFileObj.WriteLine "RUNNING"
-lockFileObj.Close
-
-' Log script start
-Set logFileObj = fso.CreateTextFile(LogFile, True)
-logFileObj.WriteLine "VBScript started at " & Now()
-logFileObj.WriteLine "AppID: " & AppID
-logFileObj.WriteLine "FriendlyName: " & FriendlyName
-logFileObj.WriteLine "User: " & CreateObject("WScript.Network").UserName
-logFileObj.WriteLine "Computer: " & CreateObject("WScript.Network").ComputerName
-logFileObj.Close
-
-On Error Resume Next
-Dim Message, Title, Result
-Message = "An update is available for " & FriendlyName & ", but it cannot be installed while the application is running." & vbCrLf & vbCrLf & "Would you like to close " & FriendlyName & " now to allow the update to proceed?"
-Title = "Application Update Available"
-
-' Show MessageBox with Yes/No buttons and Question icon
-Result = MsgBox(Message, vbYesNo + vbQuestion + vbSystemModal, Title)
-
-' Log the result
-Set logFileObj = fso.OpenTextFile(LogFile, 8, True)
-logFileObj.WriteLine "MessageBox result: " & Result
-logFileObj.Close
-
-' Write response based on user choice
-If Result = vbYes Then
-    Set responseFileObj = fso.CreateTextFile(ResponseFile, True)
-    responseFileObj.WriteLine "YES"
-    responseFileObj.Close
-    
-    Set logFileObj = fso.OpenTextFile(LogFile, 8, True)
-    logFileObj.WriteLine "User clicked YES - wrote YES to response file"
-    logFileObj.Close
-Else
-    Set responseFileObj = fso.CreateTextFile(ResponseFile, True)
-    responseFileObj.WriteLine "NO"
-    responseFileObj.Close
-    
-    Set logFileObj = fso.OpenTextFile(LogFile, 8, True)
-    logFileObj.WriteLine "User clicked NO - wrote NO to response file"
-    logFileObj.Close
-End If
-
-' Clean up lock file
-If fso.FileExists(LockFile) Then
-    fso.DeleteFile LockFile
-End If
-
-' Log completion
-Set logFileObj = fso.OpenTextFile(LogFile, 8, True)
-logFileObj.WriteLine "VBScript completed at " & Now()
-logFileObj.Close
-"@
+        # Look for ServiceUI.exe in common locations
+        $serviceUILocations = @(
+            "$env:ProgramData\ServiceUI\ServiceUI.exe",  # Our download location (check first)
+            "$env:SystemRoot\System32\ServiceUI.exe",
+            "$env:SystemRoot\SysWOW64\ServiceUI.exe",
+            "$env:ProgramFiles\Microsoft Deployment Toolkit\Templates\Distribution\Tools\x64\ServiceUI.exe",
+            "$env:ProgramFiles(x86)\Microsoft Deployment Toolkit\Templates\Distribution\Tools\x86\ServiceUI.exe",
+            "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Deployment Toolkit\ServiceUI.exe"
+        )
         
-        # Write VBScript to temp file
-        $scriptPath = "$env:TEMP\ToastScript_$([guid]::NewGuid().ToString().Substring(0,8)).vbs"
-        $vbScript | Out-File -FilePath $scriptPath -Encoding ASCII
-        
-        # Execute toast script in user context using multiple approaches
-        $scriptExecuted = $false
-        
-        # Try PsExec first if available
-        $psexecPath = "$env:ProgramData\chocolatey\bin\PsExec.exe"
-        if (Test-Path $psexecPath) {
-            try {
-                Write-Log -Message "Executing toast script via PsExec in session $($primarySession.SessionId)" | Out-Null
-                $psexecArgs = "-accepteula -s -i $($primarySession.SessionId) powershell.exe -ExecutionPolicy Bypass -File `"$scriptPath`" -AppID `"$AppID`" -FriendlyName `"$FriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction -ResponseFile `"$responseFile`""
-                Start-Process -FilePath $psexecPath -ArgumentList $psexecArgs -WindowStyle Hidden -Wait:$false
-                $scriptExecuted = $true
-            } catch {
-                Write-Log -Message "PsExec execution failed: $($_.Exception.Message)" | Out-Null
-            }
-        }
-        
-        # Fallback to scheduled task approach
-        if (-not $scriptExecuted) {
-            try {
-                Write-Log -Message "Executing toast script via scheduled task for session $($primarySession.SessionId)" | Out-Null
-                $taskName = "ToastNotificationTask_$([guid]::NewGuid().ToString().Substring(0,8))"
-                
-                # Get the actual logged-on user using more reliable methods
-                $currentUser = $null
-                
-                # Method 1: Try to get the user from the explorer process
-                try {
-                    $explorerProcess = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
-                    if ($explorerProcess) {
-                        $processOwner = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($explorerProcess.Id)" |
-                            Invoke-CimMethod -MethodName GetOwner
-                        if ($processOwner.Domain -and $processOwner.User) {
-                            $currentUser = "$($processOwner.Domain)\$($processOwner.User)"
-                        }
-                    }
-                } catch {
-                    Write-Log -Message "Could not get user from explorer process: $($_.Exception.Message)" | Out-Null
-                }
-                
-                # Method 2: Fallback to computer system info
-                if (-not $currentUser) {
-                    try {
-                        $currentUser = (Get-CimInstance -ClassName Win32_ComputerSystem).UserName
-                    } catch {
-                        Write-Log -Message "Could not get user from Win32_ComputerSystem: $($_.Exception.Message)" | Out-Null
-                    }
-                }
-                
-                # Method 3: Ultimate fallback
-                if (-not $currentUser) {
-                    $currentUser = "NT AUTHORITY\INTERACTIVE"
-                }
-                
-                Write-Log -Message "Creating scheduled task for user: $currentUser" | Out-Null
-                
-                # Create action to execute VBScript with cscript
-                $action = New-ScheduledTaskAction -Execute "cscript.exe" -Argument "`"$scriptPath`" //NoLogo"
-                
-                # Create principal with the correct user and highest privileges
-                $principal = if ($currentUser -and $currentUser -ne "NT AUTHORITY\INTERACTIVE") {
-                    New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
-                } else {
-                    New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -LogonType Interactive -RunLevel Highest
-                }
-                
-                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew
-                
-                Write-Log -Message "Registering scheduled task: $taskName" | Out-Null
-                Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-                
-                Write-Log -Message "Starting scheduled task: $taskName" | Out-Null
-                Start-ScheduledTask -TaskName $taskName
-                
-                # Wait longer for the task to start and create the lock file
-                Start-Sleep -Seconds 8
-                
-                # Check if task is running or completed
-                $taskInfo = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-                if ($taskInfo) {
-                    Write-Log -Message "Task state: $($taskInfo.State)" | Out-Null
-                    $lastTaskResult = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
-                    if ($lastTaskResult) {
-                        Write-Log -Message "Last task result: $($lastTaskResult.LastTaskResult)" | Out-Null
-                    }
-                }
-                
-                # Don't clean up task immediately - let it finish completely
-                # We'll clean it up later after checking for responses
-                
-                $scriptExecuted = $true
-                
-            } catch {
-                Write-Log -Message "Scheduled task execution failed: $($_.Exception.Message)" | Out-Null
-                Write-Log -Message "Task creation error details: $($_.Exception.ToString())" | Out-Null
-            }
-        }
-        
-        if (-not $scriptExecuted) {
-            Write-Log -Message "Could not execute toast script, using fallback dialog" | Out-Null
-            Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-            return Show-PowerShellDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
-        }
-        
-        # Wait for response file or lock file to disappear (indicating completion)
-        $waitTime = 0
-        $maxWaitTime = $TimeoutSeconds + 15
-        
-        while ($waitTime -lt $maxWaitTime) {
-            if (Test-Path $responseFile) {
-                # Response received
+        $serviceUIPath = $null
+        foreach ($location in $serviceUILocations) {
+            if (Test-Path $location) {
+                $serviceUIPath = $location
+                Write-Log -Message "Found ServiceUI.exe at: $serviceUIPath" | Out-Null
                 break
             }
-            if (-not (Test-Path $lockFile)) {
-                # Script completed but no response file yet, wait a bit more
-                if ($waitTime -gt ($TimeoutSeconds + 5)) {
-                    break
-                }
+        }
+        
+        if (-not $serviceUIPath) {
+            Write-Log -Message "ServiceUI.exe not found locally, attempting to download" | Out-Null
+            
+            # Try to download ServiceUI.exe to a permanent location
+            $downloadPath = "$env:ProgramData\ServiceUI\ServiceUI.exe"
+            
+            # Ensure directory exists
+            $downloadDir = Split-Path $downloadPath -Parent
+            if (-not (Test-Path $downloadDir)) {
+                New-Item -Path $downloadDir -ItemType Directory -Force | Out-Null
+                Write-Log -Message "Created directory: $downloadDir" | Out-Null
             }
             
-            Start-Sleep -Seconds 1
-            $waitTime++
+            # ServiceUI.exe download URLs (Microsoft official sources)
+            $downloadUrls = @(
+                "https://github.com/microsoft/Microsoft-Deployment-Toolkit/raw/main/Source/Tools/ServiceUI.exe",
+                "https://download.microsoft.com/download/3/3/9/339BE62D-B4B8-4956-B58D-73C4685FC492/MicrosoftDeploymentToolkit_x64.msi"
+            )
             
-            if ($waitTime % 10 -eq 0) {
-                Write-Log -Message "Still waiting for toast response... ($waitTime seconds elapsed)" | Out-Null
+            $downloadSuccess = $false
+            
+            # Try direct ServiceUI.exe download first
+            try {
+                Write-Log -Message "Attempting to download ServiceUI.exe from GitHub" | Out-Null
+                $webClient = New-Object System.Net.WebClient
+                $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/6.0")
+                $webClient.DownloadFile($downloadUrls[0], $downloadPath)
+                
+                if (Test-Path $downloadPath -and (Get-Item $downloadPath).Length -gt 10KB) {
+                    $serviceUIPath = $downloadPath
+                    $downloadSuccess = $true
+                    Write-Log -Message "Successfully downloaded ServiceUI.exe to: $downloadPath" | Out-Null
+                } else {
+                    Write-Log -Message "Download completed but file appears invalid" | Out-Null
+                }
+            } catch {
+                Write-Log -Message "Failed to download ServiceUI.exe: $($_.Exception.Message)" | Out-Null
+            }
+            
+            # If download failed, fall back to PowerShell dialog
+            if (-not $downloadSuccess) {
+                Write-Log -Message "ServiceUI.exe download failed, falling back to PowerShell dialog" | Out-Null
+                return Show-PowerShellDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
             }
         }
         
-        # Clean up scheduled task now that we've waited
+        # Create PowerShell script that shows MessageBox
+        $messageBoxScript = @"
+param([string]`$ResponseFile, [string]`$FriendlyName)
+
+# Log script execution
+Add-Content -Path "`$ResponseFile.log" -Value "ServiceUI script started at `$(Get-Date)"
+Add-Content -Path "`$ResponseFile.log" -Value "Current user: `$(whoami)"
+Add-Content -Path "`$ResponseFile.log" -Value "Session name: `$env:SESSIONNAME"
+Add-Content -Path "`$ResponseFile.log" -Value "FriendlyName: `$FriendlyName"
+
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Content -Path "`$ResponseFile.log" -Value "System.Windows.Forms loaded successfully"
+    
+    `$message = "An update is available for `$FriendlyName, but it cannot be installed while the application is running.``n``nWould you like to close `$FriendlyName now to allow the update to proceed?"
+    `$title = "Application Update Available"
+    
+    Add-Content -Path "`$ResponseFile.log" -Value "About to show MessageBox"
+    
+    # Show MessageBox with TopMost to ensure visibility
+    `$result = [System.Windows.Forms.MessageBox]::Show(`$message, `$title, [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question, [System.Windows.Forms.MessageBoxDefaultButton]::Button2, [System.Windows.Forms.MessageBoxOptions]::DefaultDesktopOnly)
+    
+    Add-Content -Path "`$ResponseFile.log" -Value "MessageBox result: `$result"
+    
+    if (`$result -eq [System.Windows.Forms.DialogResult]::Yes) {
+        "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+        Add-Content -Path "`$ResponseFile.log" -Value "User clicked YES - wrote to response file"
+    } else {
+        "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+        Add-Content -Path "`$ResponseFile.log" -Value "User clicked NO - wrote to response file"
+    }
+    
+} catch {
+    Add-Content -Path "`$ResponseFile.log" -Value "Error: `$(`$_.Exception.Message)"
+    # Default to NO on error
+    "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+    Add-Content -Path "`$ResponseFile.log" -Value "Used default NO due to error"
+}
+
+Add-Content -Path "`$ResponseFile.log" -Value "ServiceUI script completed at `$(Get-Date)"
+"@
+        
+        # Write the PowerShell script to temp file
+        $scriptPath = "$env:TEMP\ServiceUIScript_$([guid]::NewGuid().ToString().Substring(0,8)).ps1"
+        $messageBoxScript | Out-File -FilePath $scriptPath -Encoding UTF8
+        
+        # Execute using ServiceUI.exe
         try {
-            $taskName = $taskName  # Should be available from scope above
-            if ($taskName) {
-                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-                Write-Log -Message "Scheduled task cleaned up: $taskName" | Out-Null
-            }
+            Write-Log -Message "Executing dialog via ServiceUI.exe" | Out-Null
+            
+            # ServiceUI.exe syntax: ServiceUI.exe -process:explorer.exe powershell.exe -args
+            $serviceUIArgs = @(
+                "-process:explorer.exe",
+                "powershell.exe",
+                "-ExecutionPolicy", "Bypass",
+                "-WindowStyle", "Normal",
+                "-File", "`"$scriptPath`"",
+                "-ResponseFile", "`"$responseFile`"",
+                "-FriendlyName", "`"$FriendlyName`""
+            )
+            
+            Write-Log -Message "ServiceUI command: $serviceUIPath $($serviceUIArgs -join ' ')" | Out-Null
+            
+            # Start ServiceUI process and wait for completion
+            $process = Start-Process -FilePath $serviceUIPath -ArgumentList $serviceUIArgs -Wait -PassThru -WindowStyle Hidden
+            Write-Log -Message "ServiceUI.exe exit code: $($process.ExitCode)" | Out-Null
+            
+            $scriptExecuted = $true
+            
         } catch {
-            Write-Log -Message "Error cleaning up scheduled task: $($_.Exception.Message)" | Out-Null
+            Write-Log -Message "ServiceUI.exe execution failed: $($_.Exception.Message)" | Out-Null
+            $scriptExecuted = $false
+        }
+        
+        if (-not $scriptExecuted) {
+            Write-Log -Message "ServiceUI.exe failed, falling back to PowerShell dialog" | Out-Null
+            Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+            return Show-PowerShellDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
         }
         
         # Read response
@@ -418,30 +346,30 @@ logFileObj.Close
                 
                 if ($responseContent -eq "YES") {
                     $userResponse = $true
-                    Write-Log -Message "User chose to close $FriendlyName via toast notification" | Out-Null
+                    Write-Log -Message "User chose to close $FriendlyName via ServiceUI dialog" | Out-Null
                 } elseif ($responseContent -eq "NO") {
                     $userResponse = $false
-                    Write-Log -Message "User chose to keep $FriendlyName open via toast notification" | Out-Null
+                    Write-Log -Message "User chose to keep $FriendlyName open via ServiceUI dialog" | Out-Null
                 } else {
-                    Write-Log -Message "Unexpected toast response: $responseContent, using default action" | Out-Null
+                    Write-Log -Message "Unexpected ServiceUI response: $responseContent, using default action" | Out-Null
                 }
                 
                 Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
             } catch {
-                Write-Log -Message "Error reading toast response: $($_.Exception.Message)" | Out-Null
+                Write-Log -Message "Error reading ServiceUI response: $($_.Exception.Message)" | Out-Null
             }
         } else {
-            Write-Log -Message "No response file created, assuming timeout with default action: $DefaultTimeoutAction" | Out-Null
+            Write-Log -Message "No ServiceUI response file created, using default action: $DefaultTimeoutAction" | Out-Null
         }
         
-        # Check for debug log and report key information
+        # Check for debug log and report information
         $debugLogFile = $responseFile + ".log"
         if (Test-Path $debugLogFile) {
             try {
                 $debugContent = Get-Content $debugLogFile -ErrorAction SilentlyContinue
-                Write-Log -Message "Debug log found with $($debugContent.Count) lines" | Out-Null
+                Write-Log -Message "ServiceUI debug log found with $($debugContent.Count) lines" | Out-Null
                 
-                # Report ALL lines from debug log for better troubleshooting
+                # Report all lines from debug log
                 foreach ($line in $debugContent) {
                     if (-not [string]::IsNullOrWhiteSpace($line)) {
                         Write-Log -Message "DEBUG: $line" | Out-Null
@@ -450,15 +378,14 @@ logFileObj.Close
                 
                 Remove-Item $debugLogFile -Force -ErrorAction SilentlyContinue
             } catch {
-                Write-Log -Message "Error reading debug log: $($_.Exception.Message)" | Out-Null
+                Write-Log -Message "Error reading ServiceUI debug log: $($_.Exception.Message)" | Out-Null
             }
         } else {
-            Write-Log -Message "No debug log file found - script may not have executed properly" | Out-Null
+            Write-Log -Message "No ServiceUI debug log found" | Out-Null
         }
         
         # Clean up files
         Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-        Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
         
         return $userResponse
         
