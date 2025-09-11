@@ -334,16 +334,16 @@ Add-Content -Path "`$ResponseFile.log" -Value "ServiceUI script completed at `$(
         try {
             Write-Log -Message "Executing dialog via ServiceUI.exe" | Out-Null
             
-            # ServiceUI.exe correct syntax from help: serviceui [-session:<sessionid>] program [arg(x)]
-            # Use single quotes inside to avoid nested quote issues
+            # ServiceUI.exe syntax from help examples - need proper quote escaping for paths with spaces
+            # Example: serviceui -process:calc.exe "%windir%\notepad.exe" "\"my file.txt\""
             $serviceUIArgs = @(
                 "-session:$($primarySession.SessionId)",
                 "powershell.exe",
                 "-ExecutionPolicy", "Bypass",
                 "-WindowStyle", "Normal",
-                "-File", "'$scriptPath'",
-                "-ResponseFile", "'$responseFile'",
-                "-FriendlyName", "'$FriendlyName'"
+                "-File", "`"$scriptPath`"",
+                "-ResponseFile", "`"$responseFile`"",
+                "-FriendlyName", "`"$FriendlyName`""
             )
             
             Write-Log -Message "ServiceUI command: $serviceUIPath $($serviceUIArgs -join ' ')" | Out-Null
