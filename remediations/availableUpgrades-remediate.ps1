@@ -151,10 +151,10 @@ function Get-ActiveUserSessions {
 function Show-ToastNotification {
     <#
     .SYNOPSIS
-        Shows a user notification using ServiceUI.exe for cross-session messaging
+        Shows actual Windows Toast Notifications with interactive Yes/No buttons
     .DESCRIPTION
-        Uses ServiceUI.exe from Microsoft Deployment Toolkit to display dialogs from SYSTEM context to user sessions
-        This is the most reliable method for system service to user UI communication
+        Uses Windows Runtime to display native toast notifications from SYSTEM context to user sessions
+        This provides true interactive notifications with proper user response handling
     .PARAMETER AppID
         Application ID for the update
     .PARAMETER FriendlyName
@@ -182,12 +182,349 @@ function Show-ToastNotification {
         # Get active user sessions
         $activeSessions = Get-ActiveUserSessions
         if ($activeSessions.Count -eq 0) {
-            Write-Log -Message "No active user sessions found for notification" | Out-Null
+            Write-Log -Message "No active user sessions found for toast notification" | Out-Null
             return $DefaultTimeoutAction
         }
         
         $primarySession = $activeSessions[0]
-        Write-Log -Message "Using session $($primarySession.SessionId) for user notification" | Out-Null
+        Write-Log -Message "Using session $($primarySession.SessionId) for toast notification" | Out-Null
+        
+        # Create unique response file for toast interaction
+        $responseFile = "$env:TEMP\ToastResponse_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
+        
+        # Create PowerShell script that shows actual Windows Toast notifications
+        $toastScript = @"
+param([string]`$ResponseFile, [string]`$FriendlyName, [int]`$TimeoutSeconds, [bool]`$DefaultTimeoutAction)
+
+# Log script execution
+Add-Content -Path "`$ResponseFile.log" -Value "Toast script started at `$(Get-Date)"
+Add-Content -Path "`$ResponseFile.log" -Value "Current user: `$(whoami)"
+Add-Content -Path "`$ResponseFile.log" -Value "Session name: `$env:SESSIONNAME"
+Add-Content -Path "`$ResponseFile.log" -Value "FriendlyName: `$FriendlyName"
+
+try {
+    # Check Windows version for toast support
+    `$osVersion = [System.Environment]::OSVersion.Version
+    Add-Content -Path "`$ResponseFile.log" -Value "OS Version: `$(`$osVersion.Major).`$(`$osVersion.Minor).`$(`$osVersion.Build)"
+    
+    if (`$osVersion.Major -lt 10) {
+        Add-Content -Path "`$ResponseFile.log" -Value "Toast notifications require Windows 10 or later"
+        # Fallback to MessageBox for older Windows
+        Add-Type -AssemblyName System.Windows.Forms
+        `$message = "An update is available for `$FriendlyName, but it cannot be installed while the application is running.``n``nWould you like to close `$FriendlyName now to allow the update to proceed?"
+        `$result = [System.Windows.Forms.MessageBox]::Show(`$message, "Application Update Available", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+        
+        if (`$result -eq [System.Windows.Forms.DialogResult]::Yes) {
+            "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+        } else {
+            "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+        }
+        return
+    }
+    
+    Add-Content -Path "`$ResponseFile.log" -Value "Loading Windows Runtime assemblies"
+    
+    # Load Windows Runtime assemblies for Toast notifications
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    `$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+    `$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+    
+    # Alternative method if above fails
+    if (-not ([System.Management.Automation.PSTypeName]'Windows.UI.Notifications.ToastNotificationManager').Type) {
+        [void][Windows.UI.Notifications.ToastNotificationManager]
+        [void][Windows.Data.Xml.Dom.XmlDocument]
+    }
+    
+    Add-Content -Path "`$ResponseFile.log" -Value "Windows Runtime assemblies loaded successfully"
+    
+    # Create toast XML template with protocol activation for button responses
+    `$toastXml = @"
+<toast activationType="protocol" launch="action=timeout" duration="long">
+    <visual>
+        <binding template="ToastGeneric">
+            <text>Application Update Available</text>
+            <text>An update is available for `$FriendlyName, but it cannot be installed while the application is running. Would you like to close `$FriendlyName now to allow the update to proceed?</text>
+        </binding>
+    </visual>
+    <actions>
+        <action content="Yes, Close App" arguments="action=yes" activationType="protocol" />
+        <action content="No, Keep Open" arguments="action=no" activationType="protocol" />
+    </actions>
+</toast>
+"@
+
+    Add-Content -Path "`$ResponseFile.log" -Value "Toast XML template created"
+    
+    # Create XmlDocument
+    `$xmlDoc = New-Object Windows.Data.Xml.Dom.XmlDocument
+    `$xmlDoc.LoadXml(`$toastXml)
+    
+    Add-Content -Path "`$ResponseFile.log" -Value "XML document loaded"
+    
+    # Create toast notification
+    `$toast = New-Object Windows.UI.Notifications.ToastNotification `$xmlDoc
+    
+    # Set expiration time
+    `$toast.ExpirationTime = [DateTimeOffset]::Now.AddSeconds(`$TimeoutSeconds)
+    
+    Add-Content -Path "`$ResponseFile.log" -Value "Toast notification object created with expiration"
+    
+    # Get toast notifier for PowerShell
+    `$appId = "Microsoft.PowerShell_8wekyb3d8bbwe!powershell"
+    `$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(`$appId)
+    
+    Add-Content -Path "`$ResponseFile.log" -Value "Toast notifier created for app ID: `$appId"
+    
+    # Add event handlers for user interaction
+    `$activated = `$false
+    `$activationArgs = ""
+    
+    # Register activation handler
+    Register-ObjectEvent -InputObject `$toast -EventName Activated -Action {
+        `$activationArgs = `$Event.SourceEventArgs.Arguments
+        `$activated = `$true
+        Add-Content -Path "`$ResponseFile.log" -Value "Toast activated with arguments: `$activationArgs"
+        
+        if (`$activationArgs -like "*action=yes*") {
+            "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+            Add-Content -Path "`$ResponseFile.log" -Value "User clicked YES"
+        } elseif (`$activationArgs -like "*action=no*") {
+            "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+            Add-Content -Path "`$ResponseFile.log" -Value "User clicked NO"
+        } else {
+            # Default action on timeout or unexpected activation
+            if (`$DefaultTimeoutAction) {
+                "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+                Add-Content -Path "`$ResponseFile.log" -Value "Timeout - used default action YES"
+            } else {
+                "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+                Add-Content -Path "`$ResponseFile.log" -Value "Timeout - used default action NO"
+            }
+        }
+    } | Out-Null
+    
+    # Register dismissed handler
+    Register-ObjectEvent -InputObject `$toast -EventName Dismissed -Action {
+        `$dismissedReason = `$Event.SourceEventArgs.Reason
+        Add-Content -Path "`$ResponseFile.log" -Value "Toast dismissed with reason: `$dismissedReason"
+        
+        if (-not (Test-Path `$ResponseFile)) {
+            # Only write default if no response was already recorded
+            if (`$DefaultTimeoutAction) {
+                "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+                Add-Content -Path "`$ResponseFile.log" -Value "Dismissed - used default action YES"
+            } else {
+                "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+                Add-Content -Path "`$ResponseFile.log" -Value "Dismissed - used default action NO"
+            }
+        }
+    } | Out-Null
+    
+    # Show the toast
+    Add-Content -Path "`$ResponseFile.log" -Value "About to show toast notification"
+    `$notifier.Show(`$toast)
+    Add-Content -Path "`$ResponseFile.log" -Value "Toast notification displayed successfully"
+    
+    # Wait for user response or timeout
+    `$waitTime = 0
+    while (`$waitTime -lt `$TimeoutSeconds -and -not (Test-Path `$ResponseFile)) {
+        Start-Sleep -Seconds 1
+        `$waitTime++
+    }
+    
+    # If no response file exists after timeout, create default response
+    if (-not (Test-Path `$ResponseFile)) {
+        if (`$DefaultTimeoutAction) {
+            "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+            Add-Content -Path "`$ResponseFile.log" -Value "Final timeout - used default action YES"
+        } else {
+            "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+            Add-Content -Path "`$ResponseFile.log" -Value "Final timeout - used default action NO"
+        }
+    }
+    
+} catch {
+    Add-Content -Path "`$ResponseFile.log" -Value "Error in toast script: `$(`$_.Exception.Message)"
+    Add-Content -Path "`$ResponseFile.log" -Value "Exception details: `$(`$_.Exception.ToString())"
+    
+    # Fallback to MessageBox on toast failure
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        `$message = "An update is available for `$FriendlyName, but it cannot be installed while the application is running.``n``nWould you like to close `$FriendlyName now to allow the update to proceed?"
+        `$result = [System.Windows.Forms.MessageBox]::Show(`$message, "Application Update Available", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+        
+        if (`$result -eq [System.Windows.Forms.DialogResult]::Yes) {
+            "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+            Add-Content -Path "`$ResponseFile.log" -Value "Fallback MessageBox - User clicked YES"
+        } else {
+            "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+            Add-Content -Path "`$ResponseFile.log" -Value "Fallback MessageBox - User clicked NO"
+        }
+    } catch {
+        # Ultimate fallback
+        if (`$DefaultTimeoutAction) {
+            "YES" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+            Add-Content -Path "`$ResponseFile.log" -Value "Ultimate fallback - used default action YES"
+        } else {
+            "NO" | Out-File -FilePath `$ResponseFile -Encoding ASCII
+            Add-Content -Path "`$ResponseFile.log" -Value "Ultimate fallback - used default action NO"
+        }
+    }
+}
+
+Add-Content -Path "`$ResponseFile.log" -Value "Toast script completed at `$(Get-Date)"
+"@
+        
+        # Write the PowerShell script to temp file
+        $scriptPath = "$env:TEMP\ToastScript_$([guid]::NewGuid().ToString().Substring(0,8)).ps1"
+        $toastScript | Out-File -FilePath $scriptPath -Encoding UTF8
+        
+        # Execute toast script in user session
+        $scriptExecuted = $false
+        
+        # Force Windows PowerShell 5.1 execution for Windows Runtime compatibility
+        $windowsPSPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        if (-not (Test-Path $windowsPSPath)) {
+            $windowsPSPath = "powershell.exe"  # Fallback to PATH
+        }
+        
+        Write-Log -Message "Using Windows PowerShell for toast notifications: $windowsPSPath" | Out-Null
+        
+        # Try to execute via scheduled task (most reliable for user context)
+        try {
+            Write-Log -Message "Executing toast notification via scheduled task with Windows PowerShell 5.1" | Out-Null
+            $taskName = "ToastTask_$([guid]::NewGuid().ToString().Substring(0,8))"
+            
+            $action = New-ScheduledTaskAction -Execute $windowsPSPath -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -ResponseFile `"$responseFile`" -FriendlyName `"$FriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction"
+            $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -LogonType Interactive
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+            
+            Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+            Start-ScheduledTask -TaskName $taskName
+            
+            Start-Sleep -Seconds 2
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            $scriptExecuted = $true
+            
+        } catch {
+            Write-Log -Message "Scheduled task toast execution failed: $($_.Exception.Message)" | Out-Null
+        }
+        
+        if (-not $scriptExecuted) {
+            Write-Log -Message "Could not execute toast script, falling back to ServiceUI.exe approach" | Out-Null
+            Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+            return Show-ServiceUIDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
+        }
+        
+        # Wait for response with extended timeout
+        $waitTime = 0
+        $maxWaitTime = $TimeoutSeconds + 15
+        
+        while ($waitTime -lt $maxWaitTime -and -not (Test-Path $responseFile)) {
+            Start-Sleep -Seconds 1
+            $waitTime++
+        }
+        
+        # Read response
+        $userResponse = $DefaultTimeoutAction
+        if (Test-Path $responseFile) {
+            try {
+                $responseContent = Get-Content $responseFile -Raw -ErrorAction SilentlyContinue
+                $responseContent = $responseContent.Trim()
+                
+                if ($responseContent -eq "YES") {
+                    $userResponse = $true
+                    Write-Log -Message "User chose to close $FriendlyName via toast notification" | Out-Null
+                } elseif ($responseContent -eq "NO") {
+                    $userResponse = $false
+                    Write-Log -Message "User chose to keep $FriendlyName open via toast notification" | Out-Null
+                } else {
+                    Write-Log -Message "Unexpected toast response: $responseContent, using default action" | Out-Null
+                }
+                
+                Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-Log -Message "Error reading toast response: $($_.Exception.Message)" | Out-Null
+            }
+        } else {
+            Write-Log -Message "No toast response file created, using default action: $DefaultTimeoutAction" | Out-Null
+        }
+        
+        # Check for debug log and report information
+        $debugLogFile = $responseFile + ".log"
+        if (Test-Path $debugLogFile) {
+            try {
+                $debugContent = Get-Content $debugLogFile -ErrorAction SilentlyContinue
+                Write-Log -Message "Toast debug log found with $($debugContent.Count) lines" | Out-Null
+                
+                # Report key lines from debug log
+                foreach ($line in $debugContent) {
+                    if (-not [string]::IsNullOrWhiteSpace($line) -and
+                        ($line -like "*successfully*" -or $line -like "*error*" -or $line -like "*clicked*" -or $line -like "*timeout*")) {
+                        Write-Log -Message "TOAST: $line" | Out-Null
+                    }
+                }
+                
+                Remove-Item $debugLogFile -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-Log -Message "Error reading toast debug log: $($_.Exception.Message)" | Out-Null
+            }
+        } else {
+            Write-Log -Message "No toast debug log found" | Out-Null
+        }
+        
+        # Clean up files
+        Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+        
+        return $userResponse
+        
+    } catch {
+        Write-Log -Message "Toast notification system failed: $($_.Exception.Message)" | Out-Null
+        Write-Log -Message "Falling back to ServiceUI dialog" | Out-Null
+        return Show-ServiceUIDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
+    }
+}
+
+function Show-ServiceUIDialog {
+    <#
+    .SYNOPSIS
+        Shows a user notification using ServiceUI.exe for cross-session messaging (fallback)
+    .DESCRIPTION
+        Uses ServiceUI.exe from Microsoft Deployment Toolkit to display dialogs from SYSTEM context to user sessions
+        This is a fallback when toast notifications fail
+    .PARAMETER AppID
+        Application ID for the update
+    .PARAMETER FriendlyName
+        User-friendly name of the application
+    .PARAMETER ProcessName
+        Name of the blocking process
+    .PARAMETER TimeoutSeconds
+        Timeout in seconds before auto-action
+    .PARAMETER DefaultTimeoutAction
+        Action to take on timeout (true = close app, false = keep open)
+    .OUTPUTS
+        Boolean indicating user choice (true = close app, false = keep open)
+    #>
+    param(
+        [string]$AppID,
+        [string]$FriendlyName,
+        [string]$ProcessName,
+        [int]$TimeoutSeconds = 60,
+        [bool]$DefaultTimeoutAction = $false
+    )
+    
+    Write-Log -Message "Show-ServiceUIDialog called for $AppID ($FriendlyName)" | Out-Null
+    
+    try {
+        # Get active user sessions
+        $activeSessions = Get-ActiveUserSessions
+        if ($activeSessions.Count -eq 0) {
+            Write-Log -Message "No active user sessions found for ServiceUI dialog" | Out-Null
+            return $DefaultTimeoutAction
+        }
+        
+        $primarySession = $activeSessions[0]
+        Write-Log -Message "Using session $($primarySession.SessionId) for ServiceUI dialog" | Out-Null
         
         # Create unique response file
         $responseFile = "$env:TEMP\ServiceUIResponse_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
@@ -212,76 +549,8 @@ function Show-ToastNotification {
         }
         
         if (-not $serviceUIPath) {
-            Write-Log -Message "ServiceUI.exe not found locally, attempting to download" | Out-Null
-            
-            # Try to download ServiceUI.exe to a permanent location
-            $downloadPath = "$env:ProgramData\ServiceUI\ServiceUI.exe"
-            
-            # Ensure directory exists
-            $downloadDir = Split-Path $downloadPath -Parent
-            if (-not (Test-Path $downloadDir)) {
-                New-Item -Path $downloadDir -ItemType Directory -Force | Out-Null
-                Write-Log -Message "Created directory: $downloadDir" | Out-Null
-            }
-            
-            # ServiceUI.exe download URLs (multiple sources for reliability)
-            $downloadUrls = @(
-                "https://github.com/woodyard/public-scripts/raw/refs/heads/main/tools/ServiceUI.exe",
-                "https://github.com/microsoft/Microsoft-Deployment-Toolkit/raw/main/Source/Tools/ServiceUI.exe"
-            )
-            
-            $downloadSuccess = $false
-            
-            # Try multiple download methods and sources
-            foreach ($url in $downloadUrls) {
-                try {
-                    Write-Log -Message "Attempting to download ServiceUI.exe from: $url" | Out-Null
-                    
-                    # Method 1: Try Invoke-WebRequest (more reliable)
-                    try {
-                        $response = Invoke-WebRequest -Uri $url -OutFile $downloadPath -UseBasicParsing -UserAgent "PowerShell-WingetScript/6.0" -TimeoutSec 30
-                        if (Test-Path $downloadPath) {
-                            $fileSize = (Get-Item $downloadPath).Length
-                            if ($fileSize -gt 10KB) {
-                                $serviceUIPath = $downloadPath
-                                $downloadSuccess = $true
-                                Write-Log -Message "Successfully downloaded ServiceUI.exe using Invoke-WebRequest to: $downloadPath" | Out-Null
-                                break
-                            }
-                        }
-                    } catch {
-                        Write-Log -Message "Invoke-WebRequest failed: $($_.Exception.Message)" | Out-Null
-                        
-                        # Method 2: Fallback to WebClient
-                        try {
-                            $webClient = New-Object System.Net.WebClient
-                            $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/6.0")
-                            $webClient.DownloadFile($url, $downloadPath)
-                            
-                            if (Test-Path $downloadPath) {
-                                $fileSize = (Get-Item $downloadPath).Length
-                                if ($fileSize -gt 10KB) {
-                                    $serviceUIPath = $downloadPath
-                                    $downloadSuccess = $true
-                                    Write-Log -Message "Successfully downloaded ServiceUI.exe using WebClient to: $downloadPath" | Out-Null
-                                    break
-                                }
-                            }
-                        } catch {
-                            Write-Log -Message "WebClient download also failed: $($_.Exception.Message)" | Out-Null
-                        }
-                    }
-                    
-                } catch {
-                    Write-Log -Message "Failed to download from $url : $($_.Exception.Message)" | Out-Null
-                }
-            }
-            
-            # If download failed, fall back to PowerShell dialog
-            if (-not $downloadSuccess) {
-                Write-Log -Message "ServiceUI.exe download failed, falling back to PowerShell dialog" | Out-Null
-                return Show-PowerShellDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
-            }
+            Write-Log -Message "ServiceUI.exe not found, falling back to PowerShell dialog" | Out-Null
+            return Show-PowerShellDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
         }
         
         # Create PowerShell script that shows MessageBox
@@ -394,10 +663,11 @@ Add-Content -Path "`$ResponseFile.log" -Value "ServiceUI script completed at `$(
                 $debugContent = Get-Content $debugLogFile -ErrorAction SilentlyContinue
                 Write-Log -Message "ServiceUI debug log found with $($debugContent.Count) lines" | Out-Null
                 
-                # Report all lines from debug log
+                # Report key lines from debug log
                 foreach ($line in $debugContent) {
-                    if (-not [string]::IsNullOrWhiteSpace($line)) {
-                        Write-Log -Message "DEBUG: $line" | Out-Null
+                    if (-not [string]::IsNullOrWhiteSpace($line) -and
+                        ($line -like "*successfully*" -or $line -like "*error*" -or $line -like "*clicked*")) {
+                        Write-Log -Message "SERVICEUI: $line" | Out-Null
                     }
                 }
                 
@@ -415,7 +685,7 @@ Add-Content -Path "`$ResponseFile.log" -Value "ServiceUI script completed at `$(
         return $userResponse
         
     } catch {
-        Write-Log -Message "Toast notification system failed: $($_.Exception.Message)" | Out-Null
+        Write-Log -Message "ServiceUI dialog system failed: $($_.Exception.Message)" | Out-Null
         Write-Log -Message "Falling back to PowerShell dialog" | Out-Null
         return Show-PowerShellDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
     }
