@@ -399,11 +399,27 @@ Add-Content -Path "$ResponseFile.log" -Value "Toast script completed at $(Get-Da
             $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -LogonType Interactive
             $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
             
+            Write-Log -Message "Registering scheduled task: $taskName" | Out-Null
             Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+            Write-Log -Message "Starting scheduled task: $taskName" | Out-Null
             Start-ScheduledTask -TaskName $taskName
             
-            Start-Sleep -Seconds 2
+            Write-Log -Message "Waiting 5 seconds for task execution" | Out-Null
+            Start-Sleep -Seconds 5
+            
+            # Check task status
+            try {
+                $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                if ($task) {
+                    $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+                    Write-Log -Message "Task last run time: $($taskInfo.LastRunTime), Last result: $($taskInfo.LastTaskResult)" | Out-Null
+                }
+            } catch {
+                Write-Log -Message "Could not get task status: $($_.Exception.Message)" | Out-Null
+            }
+            
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Log -Message "Scheduled task $taskName completed and removed" | Out-Null
             $scriptExecuted = $true
             
         } catch {
@@ -416,13 +432,17 @@ Add-Content -Path "$ResponseFile.log" -Value "Toast script completed at $(Get-Da
             return Show-ServiceUIDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
         }
         
-        # Wait for response with extended timeout
+        # Wait for response with shorter timeout since scheduled tasks may not work
+        Write-Log -Message "Waiting for toast response file: $responseFile" | Out-Null
         $waitTime = 0
-        $maxWaitTime = $TimeoutSeconds + 15
+        $maxWaitTime = 15  # Shorter wait time to fail fast to fallback
         
         while ($waitTime -lt $maxWaitTime -and -not (Test-Path $responseFile)) {
             Start-Sleep -Seconds 1
             $waitTime++
+            if ($waitTime % 5 -eq 0) {
+                Write-Log -Message "Still waiting for toast response... ($waitTime/$maxWaitTime seconds)" | Out-Null
+            }
         }
         
         # Read response
@@ -447,7 +467,10 @@ Add-Content -Path "$ResponseFile.log" -Value "Toast script completed at $(Get-Da
                 Write-Log -Message "Error reading toast response: $($_.Exception.Message)" | Out-Null
             }
         } else {
-            Write-Log -Message "No toast response file created, using default action: $DefaultTimeoutAction" | Out-Null
+            Write-Log -Message "No toast response file created after $maxWaitTime seconds - toast notification may have failed" | Out-Null
+            Write-Log -Message "Falling back to ServiceUI dialog approach" | Out-Null
+            Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+            return Show-ServiceUIDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
         }
         
         # Check for debug log and report information
