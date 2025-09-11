@@ -103,9 +103,10 @@ public static extern int OOBEComplete(ref int bIsOOBEComplete);
 function Get-ActiveUserSessions {
     <#
     .SYNOPSIS
-        Gets active user sessions using multiple detection methods
+        Gets active user sessions using Explorer process detection
     .DESCRIPTION
-        Attempts to find active user sessions using WMI, Explorer processes, and other methods
+        Finds active desktop sessions by looking for explorer.exe processes
+        Uses the correct session ID format for user interaction
     .OUTPUTS
         Array of session objects with SessionId and UserName properties
     #>
@@ -113,43 +114,32 @@ function Get-ActiveUserSessions {
     $activeSessions = @()
     
     try {
-        # Method 1: Use WMI to get interactive logon sessions
-        Write-Log -Message "Detecting active user sessions via WMI" | Out-Null
-        $logonSessions = Get-CimInstance -ClassName Win32_LogonSession -ErrorAction SilentlyContinue |
-            Where-Object { $_.LogonType -eq 2 -or $_.LogonType -eq 10 } # Interactive or RemoteInteractive
+        Write-Log -Message "Detecting active user sessions via Explorer processes" | Out-Null
         
-        foreach ($session in $logonSessions) {
-            try {
-                $logonUser = Get-CimInstance -ClassName Win32_LoggedOnUser -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Dependent.LogonId -eq $session.LogonId }
-                
-                if ($logonUser) {
-                    $username = $logonUser.Antecedent.Name
-                    $activeSessions += [PSCustomObject]@{
-                        SessionId = $session.LogonId
-                        UserName = $username
-                        LogonType = $session.LogonType
-                    }
-                }
-            } catch {
-                # Continue if unable to get user for this session
-            }
-        }
-        
-        # Method 2: Use Explorer process to find active desktop sessions
+        # Primary method: Use Explorer process to find active desktop sessions
+        # This gives us the correct session ID format for user interaction
         $explorerProcesses = Get-Process -Name explorer -ErrorAction SilentlyContinue
+        
         foreach ($process in $explorerProcesses) {
-            $sessionExists = $activeSessions | Where-Object { $_.SessionId -eq $process.SessionId }
-            if (-not $sessionExists) {
-                $activeSessions += [PSCustomObject]@{
-                    SessionId = $process.SessionId
-                    UserName = $process.ProcessName
-                    LogonType = "Desktop"
-                }
+            Write-Log -Message "Found explorer.exe in session $($process.SessionId)" | Out-Null
+            $activeSessions += [PSCustomObject]@{
+                SessionId = $process.SessionId
+                UserName = "User"
+                LogonType = "Desktop"
+                ProcessId = $process.Id
             }
         }
         
-        Write-Log -Message "Found $($activeSessions.Count) active user session(s)" | Out-Null
+        # Sort by session ID to get the most likely user session first
+        $activeSessions = $activeSessions | Sort-Object SessionId
+        
+        Write-Log -Message "Found $($activeSessions.Count) active desktop session(s)" | Out-Null
+        
+        # Log all sessions for debugging
+        foreach ($session in $activeSessions) {
+            Write-Log -Message "Session ID: $($session.SessionId)" | Out-Null
+        }
+        
         return $activeSessions
         
     } catch {
@@ -210,36 +200,62 @@ function Show-ToastNotification {
         $responseFile = "$env:TEMP\ToastResponse_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
         $lockFile = "$responseFile.lock"
         
-        # Create the toast notification script - use simple message box as fallback
+        # Create the toast notification script with comprehensive debugging
         $toastScript = @'
 param([string]$AppID, [string]$FriendlyName, [int]$TimeoutSeconds, [bool]$DefaultTimeoutAction, [string]$ResponseFile)
 
 # Create lock file to indicate script is running
-"RUNNING" | Out-File -FilePath ($ResponseFile + ".lock") -Encoding ASCII
+$lockFile = $ResponseFile + ".lock"
+$logFile = $ResponseFile + ".log"
+"RUNNING" | Out-File -FilePath $lockFile -Encoding ASCII
+
+# Log script start
+"Toast script started at $(Get-Date)" | Out-File -FilePath $logFile -Encoding ASCII
+"Parameters: AppID=$AppID, FriendlyName=$FriendlyName, TimeoutSeconds=$TimeoutSeconds, DefaultTimeoutAction=$DefaultTimeoutAction" | Out-File -FilePath $logFile -Append -Encoding ASCII
+"ResponseFile: $ResponseFile" | Out-File -FilePath $logFile -Append -Encoding ASCII
+"Current user: $(whoami)" | Out-File -FilePath $logFile -Append -Encoding ASCII
+"Session ID: $env:SESSIONNAME" | Out-File -FilePath $logFile -Append -Encoding ASCII
 
 try {
+    "Loading System.Windows.Forms assembly" | Out-File -FilePath $logFile -Append -Encoding ASCII
     Add-Type -AssemblyName System.Windows.Forms
+    "Successfully loaded System.Windows.Forms" | Out-File -FilePath $logFile -Append -Encoding ASCII
     
     $message = "An update is available for $FriendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $FriendlyName now to allow the update to proceed?"
-    $result = [System.Windows.Forms.MessageBox]::Show($message, "Application Update Available", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+    
+    "About to show MessageBox with message: $message" | Out-File -FilePath $logFile -Append -Encoding ASCII
+    
+    # Use TopMost to ensure visibility
+    $result = [System.Windows.Forms.MessageBox]::Show($message, "Application Update Available", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+    
+    "MessageBox result: $result" | Out-File -FilePath $logFile -Append -Encoding ASCII
     
     if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
         "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
+        "User clicked YES - writing YES to response file" | Out-File -FilePath $logFile -Append -Encoding ASCII
     } else {
         "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
+        "User clicked NO or dialog was cancelled - writing NO to response file" | Out-File -FilePath $logFile -Append -Encoding ASCII
     }
     
 } catch {
-    # Toast notification failed, write error and use default
+    $errorMessage = "Error in toast script: $($_.Exception.Message)"
+    $errorMessage | Out-File -FilePath $logFile -Append -Encoding ASCII
+    "Exception details: $($_.Exception.ToString())" | Out-File -FilePath $logFile -Append -Encoding ASCII
+    
+    # Use default action on error
     if ($DefaultTimeoutAction) {
         "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
+        "Used default action YES due to error" | Out-File -FilePath $logFile -Append -Encoding ASCII
     } else {
         "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
+        "Used default action NO due to error" | Out-File -FilePath $logFile -Append -Encoding ASCII
     }
 } finally {
+    "Toast script ended at $(Get-Date)" | Out-File -FilePath $logFile -Append -Encoding ASCII
     # Remove lock file
-    if (Test-Path ($ResponseFile + ".lock")) {
-        Remove-Item ($ResponseFile + ".lock") -Force -ErrorAction SilentlyContinue
+    if (Test-Path $lockFile) {
+        Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
     }
 }
 '@
@@ -267,23 +283,54 @@ try {
         # Fallback to scheduled task approach
         if (-not $scriptExecuted) {
             try {
-                Write-Log -Message "Executing toast script via scheduled task" | Out-Null
+                Write-Log -Message "Executing toast script via scheduled task for session $($primarySession.SessionId)" | Out-Null
                 $taskName = "ToastNotificationTask_$([guid]::NewGuid().ToString().Substring(0,8))"
                 
-                $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$scriptPath`" -AppID `"$AppID`" -FriendlyName `"$FriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction -ResponseFile `"$responseFile`""
-                $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -LogonType Interactive
-                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DeleteExpiredTaskAfter (New-TimeSpan -Minutes 5)
+                # Get current logged-on user for the task
+                $currentUser = try {
+                    (Get-CimInstance -ClassName Win32_ComputerSystem).UserName
+                } catch {
+                    "NT AUTHORITY\INTERACTIVE"
+                }
                 
+                Write-Log -Message "Creating scheduled task for user: $currentUser" | Out-Null
+                
+                $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -AppID `"$AppID`" -FriendlyName `"$FriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction -ResponseFile `"$responseFile`""
+                
+                # Try to create principal for the actual logged-on user
+                $principal = if ($currentUser -and $currentUser -ne "NT AUTHORITY\INTERACTIVE") {
+                    New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive
+                } else {
+                    New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -LogonType Interactive
+                }
+                
+                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+                
+                Write-Log -Message "Registering scheduled task: $taskName" | Out-Null
                 Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+                
+                Write-Log -Message "Starting scheduled task: $taskName" | Out-Null
                 Start-ScheduledTask -TaskName $taskName
                 
-                # Clean up task after a delay (let it run first)
+                # Wait a bit longer for the task to start and create the lock file
+                Start-Sleep -Seconds 5
+                
+                # Check if task is running
+                $taskInfo = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                if ($taskInfo) {
+                    Write-Log -Message "Task state: $($taskInfo.State)" | Out-Null
+                }
+                
+                # Clean up task (but let it finish first)
                 Start-Sleep -Seconds 2
                 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                Write-Log -Message "Scheduled task cleaned up" | Out-Null
+                
                 $scriptExecuted = $true
                 
             } catch {
                 Write-Log -Message "Scheduled task execution failed: $($_.Exception.Message)" | Out-Null
+                Write-Log -Message "Task creation error details: $($_.Exception.ToString())" | Out-Null
             }
         }
         
@@ -340,6 +387,35 @@ try {
             }
         } else {
             Write-Log -Message "No response file created, assuming timeout with default action: $DefaultTimeoutAction" | Out-Null
+        }
+        
+        # Check for debug log and report key information
+        $debugLogFile = $responseFile + ".log"
+        if (Test-Path $debugLogFile) {
+            try {
+                $debugContent = Get-Content $debugLogFile -ErrorAction SilentlyContinue
+                Write-Log -Message "Debug log found with $($debugContent.Count) lines" | Out-Null
+                
+                # Report key lines from debug log
+                $keyLines = $debugContent | Where-Object {
+                    $_ -like "*Current user:*" -or
+                    $_ -like "*Session ID:*" -or
+                    $_ -like "*MessageBox result:*" -or
+                    $_ -like "*Error*" -or
+                    $_ -like "*Successfully loaded*" -or
+                    $_ -like "*About to show MessageBox*"
+                }
+                
+                foreach ($line in $keyLines) {
+                    Write-Log -Message "DEBUG: $line" | Out-Null
+                }
+                
+                Remove-Item $debugLogFile -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-Log -Message "Error reading debug log: $($_.Exception.Message)" | Out-Null
+            }
+        } else {
+            Write-Log -Message "No debug log file found - script may not have executed" | Out-Null
         }
         
         # Clean up files
