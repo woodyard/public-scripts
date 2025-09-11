@@ -200,69 +200,76 @@ function Show-ToastNotification {
         $responseFile = "$env:TEMP\ToastResponse_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
         $lockFile = "$responseFile.lock"
         
-        # Create the toast notification script with comprehensive debugging
-        $toastScript = @'
-param([string]$AppID, [string]$FriendlyName, [int]$TimeoutSeconds, [bool]$DefaultTimeoutAction, [string]$ResponseFile)
+        # Create VBScript for more reliable MessageBox display in scheduled tasks
+        $vbScript = @"
+Dim AppID, FriendlyName, ResponseFile, LogFile, LockFile
+AppID = "$AppID"
+FriendlyName = "$FriendlyName"
+ResponseFile = "$responseFile"
+LogFile = ResponseFile + ".log"
+LockFile = ResponseFile + ".lock"
 
-# Create lock file to indicate script is running
-$lockFile = $ResponseFile + ".lock"
-$logFile = $ResponseFile + ".log"
-"RUNNING" | Out-File -FilePath $lockFile -Encoding ASCII
+' Create lock file
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set lockFileObj = fso.CreateTextFile(LockFile, True)
+lockFileObj.WriteLine "RUNNING"
+lockFileObj.Close
 
-# Log script start
-"Toast script started at $(Get-Date)" | Out-File -FilePath $logFile -Encoding ASCII
-"Parameters: AppID=$AppID, FriendlyName=$FriendlyName, TimeoutSeconds=$TimeoutSeconds, DefaultTimeoutAction=$DefaultTimeoutAction" | Out-File -FilePath $logFile -Append -Encoding ASCII
-"ResponseFile: $ResponseFile" | Out-File -FilePath $logFile -Append -Encoding ASCII
-"Current user: $(whoami)" | Out-File -FilePath $logFile -Append -Encoding ASCII
-"Session ID: $env:SESSIONNAME" | Out-File -FilePath $logFile -Append -Encoding ASCII
+' Log script start
+Set logFileObj = fso.CreateTextFile(LogFile, True)
+logFileObj.WriteLine "VBScript started at " & Now()
+logFileObj.WriteLine "AppID: " & AppID
+logFileObj.WriteLine "FriendlyName: " & FriendlyName
+logFileObj.WriteLine "User: " & CreateObject("WScript.Network").UserName
+logFileObj.WriteLine "Computer: " & CreateObject("WScript.Network").ComputerName
+logFileObj.Close
 
-try {
-    "Loading System.Windows.Forms assembly" | Out-File -FilePath $logFile -Append -Encoding ASCII
-    Add-Type -AssemblyName System.Windows.Forms
-    "Successfully loaded System.Windows.Forms" | Out-File -FilePath $logFile -Append -Encoding ASCII
+On Error Resume Next
+Dim Message, Title, Result
+Message = "An update is available for " & FriendlyName & ", but it cannot be installed while the application is running." & vbCrLf & vbCrLf & "Would you like to close " & FriendlyName & " now to allow the update to proceed?"
+Title = "Application Update Available"
+
+' Show MessageBox with Yes/No buttons and Question icon
+Result = MsgBox(Message, vbYesNo + vbQuestion + vbSystemModal, Title)
+
+' Log the result
+Set logFileObj = fso.OpenTextFile(LogFile, 8, True)
+logFileObj.WriteLine "MessageBox result: " & Result
+logFileObj.Close
+
+' Write response based on user choice
+If Result = vbYes Then
+    Set responseFileObj = fso.CreateTextFile(ResponseFile, True)
+    responseFileObj.WriteLine "YES"
+    responseFileObj.Close
     
-    $message = "An update is available for $FriendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $FriendlyName now to allow the update to proceed?"
+    Set logFileObj = fso.OpenTextFile(LogFile, 8, True)
+    logFileObj.WriteLine "User clicked YES - wrote YES to response file"
+    logFileObj.Close
+Else
+    Set responseFileObj = fso.CreateTextFile(ResponseFile, True)
+    responseFileObj.WriteLine "NO"
+    responseFileObj.Close
     
-    "About to show MessageBox with message: $message" | Out-File -FilePath $logFile -Append -Encoding ASCII
-    
-    # Use TopMost to ensure visibility
-    $result = [System.Windows.Forms.MessageBox]::Show($message, "Application Update Available", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
-    
-    "MessageBox result: $result" | Out-File -FilePath $logFile -Append -Encoding ASCII
-    
-    if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-        "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
-        "User clicked YES - writing YES to response file" | Out-File -FilePath $logFile -Append -Encoding ASCII
-    } else {
-        "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
-        "User clicked NO or dialog was cancelled - writing NO to response file" | Out-File -FilePath $logFile -Append -Encoding ASCII
-    }
-    
-} catch {
-    $errorMessage = "Error in toast script: $($_.Exception.Message)"
-    $errorMessage | Out-File -FilePath $logFile -Append -Encoding ASCII
-    "Exception details: $($_.Exception.ToString())" | Out-File -FilePath $logFile -Append -Encoding ASCII
-    
-    # Use default action on error
-    if ($DefaultTimeoutAction) {
-        "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
-        "Used default action YES due to error" | Out-File -FilePath $logFile -Append -Encoding ASCII
-    } else {
-        "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
-        "Used default action NO due to error" | Out-File -FilePath $logFile -Append -Encoding ASCII
-    }
-} finally {
-    "Toast script ended at $(Get-Date)" | Out-File -FilePath $logFile -Append -Encoding ASCII
-    # Remove lock file
-    if (Test-Path $lockFile) {
-        Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
-    }
-}
-'@
+    Set logFileObj = fso.OpenTextFile(LogFile, 8, True)
+    logFileObj.WriteLine "User clicked NO - wrote NO to response file"
+    logFileObj.Close
+End If
+
+' Clean up lock file
+If fso.FileExists(LockFile) Then
+    fso.DeleteFile LockFile
+End If
+
+' Log completion
+Set logFileObj = fso.OpenTextFile(LogFile, 8, True)
+logFileObj.WriteLine "VBScript completed at " & Now()
+logFileObj.Close
+"@
         
-        # Write toast script to temp file
-        $scriptPath = "$env:TEMP\ToastScript_$([guid]::NewGuid().ToString().Substring(0,8)).ps1"
-        $toastScript | Out-File -FilePath $scriptPath -Encoding UTF8
+        # Write VBScript to temp file
+        $scriptPath = "$env:TEMP\ToastScript_$([guid]::NewGuid().ToString().Substring(0,8)).vbs"
+        $vbScript | Out-File -FilePath $scriptPath -Encoding ASCII
         
         # Execute toast script in user context using multiple approaches
         $scriptExecuted = $false
@@ -319,8 +326,8 @@ try {
                 
                 Write-Log -Message "Creating scheduled task for user: $currentUser" | Out-Null
                 
-                # Create action with normal window style for better UI visibility
-                $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Normal -File `"$scriptPath`" -AppID `"$AppID`" -FriendlyName `"$FriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction -ResponseFile `"$responseFile`""
+                # Create action to execute VBScript with cscript
+                $action = New-ScheduledTaskAction -Execute "cscript.exe" -Argument "`"$scriptPath`" //NoLogo"
                 
                 # Create principal with the correct user and highest privileges
                 $principal = if ($currentUser -and $currentUser -ne "NT AUTHORITY\INTERACTIVE") {
