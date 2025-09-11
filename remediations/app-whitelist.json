@@ -235,7 +235,8 @@
     {
         "AppID": "Adobe.Acrobat.Reader.64-bit",
         "BlockingProcess": "AcroRd32,Acrobat,AcroBroker,AdobeARM,AdobeCollabSync",
-        "AutoCloseProcesses": "AdobeCollabSync"
+        "AutoCloseProcesses": "AdobeCollabSync",
+        "PromptWhenBlocked": true
     },
     {
         "AppID": "RazerInc.RazerInstaller"
