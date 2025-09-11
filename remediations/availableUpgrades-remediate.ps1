@@ -286,25 +286,50 @@ try {
                 Write-Log -Message "Executing toast script via scheduled task for session $($primarySession.SessionId)" | Out-Null
                 $taskName = "ToastNotificationTask_$([guid]::NewGuid().ToString().Substring(0,8))"
                 
-                # Get current logged-on user for the task
-                $currentUser = try {
-                    (Get-CimInstance -ClassName Win32_ComputerSystem).UserName
+                # Get the actual logged-on user using more reliable methods
+                $currentUser = $null
+                
+                # Method 1: Try to get the user from the explorer process
+                try {
+                    $explorerProcess = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($explorerProcess) {
+                        $processOwner = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($explorerProcess.Id)" |
+                            Invoke-CimMethod -MethodName GetOwner
+                        if ($processOwner.Domain -and $processOwner.User) {
+                            $currentUser = "$($processOwner.Domain)\$($processOwner.User)"
+                        }
+                    }
                 } catch {
-                    "NT AUTHORITY\INTERACTIVE"
+                    Write-Log -Message "Could not get user from explorer process: $($_.Exception.Message)" | Out-Null
+                }
+                
+                # Method 2: Fallback to computer system info
+                if (-not $currentUser) {
+                    try {
+                        $currentUser = (Get-CimInstance -ClassName Win32_ComputerSystem).UserName
+                    } catch {
+                        Write-Log -Message "Could not get user from Win32_ComputerSystem: $($_.Exception.Message)" | Out-Null
+                    }
+                }
+                
+                # Method 3: Ultimate fallback
+                if (-not $currentUser) {
+                    $currentUser = "NT AUTHORITY\INTERACTIVE"
                 }
                 
                 Write-Log -Message "Creating scheduled task for user: $currentUser" | Out-Null
                 
-                $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -AppID `"$AppID`" -FriendlyName `"$FriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction -ResponseFile `"$responseFile`""
+                # Create action with normal window style for better UI visibility
+                $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Normal -File `"$scriptPath`" -AppID `"$AppID`" -FriendlyName `"$FriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction -ResponseFile `"$responseFile`""
                 
-                # Try to create principal for the actual logged-on user
+                # Create principal with the correct user and highest privileges
                 $principal = if ($currentUser -and $currentUser -ne "NT AUTHORITY\INTERACTIVE") {
-                    New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive
+                    New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
                 } else {
-                    New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -LogonType Interactive
+                    New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -LogonType Interactive -RunLevel Highest
                 }
                 
-                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew
                 
                 Write-Log -Message "Registering scheduled task: $taskName" | Out-Null
                 Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
@@ -312,19 +337,21 @@ try {
                 Write-Log -Message "Starting scheduled task: $taskName" | Out-Null
                 Start-ScheduledTask -TaskName $taskName
                 
-                # Wait a bit longer for the task to start and create the lock file
-                Start-Sleep -Seconds 5
+                # Wait longer for the task to start and create the lock file
+                Start-Sleep -Seconds 8
                 
-                # Check if task is running
+                # Check if task is running or completed
                 $taskInfo = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
                 if ($taskInfo) {
                     Write-Log -Message "Task state: $($taskInfo.State)" | Out-Null
+                    $lastTaskResult = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+                    if ($lastTaskResult) {
+                        Write-Log -Message "Last task result: $($lastTaskResult.LastTaskResult)" | Out-Null
+                    }
                 }
                 
-                # Clean up task (but let it finish first)
-                Start-Sleep -Seconds 2
-                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-                Write-Log -Message "Scheduled task cleaned up" | Out-Null
+                # Don't clean up task immediately - let it finish completely
+                # We'll clean it up later after checking for responses
                 
                 $scriptExecuted = $true
                 
@@ -342,7 +369,7 @@ try {
         
         # Wait for response file or lock file to disappear (indicating completion)
         $waitTime = 0
-        $maxWaitTime = $TimeoutSeconds + 10
+        $maxWaitTime = $TimeoutSeconds + 15
         
         while ($waitTime -lt $maxWaitTime) {
             if (Test-Path $responseFile) {
@@ -351,7 +378,7 @@ try {
             }
             if (-not (Test-Path $lockFile)) {
                 # Script completed but no response file yet, wait a bit more
-                if ($waitTime -gt ($TimeoutSeconds + 2)) {
+                if ($waitTime -gt ($TimeoutSeconds + 5)) {
                     break
                 }
             }
@@ -362,6 +389,17 @@ try {
             if ($waitTime % 10 -eq 0) {
                 Write-Log -Message "Still waiting for toast response... ($waitTime seconds elapsed)" | Out-Null
             }
+        }
+        
+        # Clean up scheduled task now that we've waited
+        try {
+            $taskName = $taskName  # Should be available from scope above
+            if ($taskName) {
+                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                Write-Log -Message "Scheduled task cleaned up: $taskName" | Out-Null
+            }
+        } catch {
+            Write-Log -Message "Error cleaning up scheduled task: $($_.Exception.Message)" | Out-Null
         }
         
         # Read response
@@ -396,18 +434,11 @@ try {
                 $debugContent = Get-Content $debugLogFile -ErrorAction SilentlyContinue
                 Write-Log -Message "Debug log found with $($debugContent.Count) lines" | Out-Null
                 
-                # Report key lines from debug log
-                $keyLines = $debugContent | Where-Object {
-                    $_ -like "*Current user:*" -or
-                    $_ -like "*Session ID:*" -or
-                    $_ -like "*MessageBox result:*" -or
-                    $_ -like "*Error*" -or
-                    $_ -like "*Successfully loaded*" -or
-                    $_ -like "*About to show MessageBox*"
-                }
-                
-                foreach ($line in $keyLines) {
-                    Write-Log -Message "DEBUG: $line" | Out-Null
+                # Report ALL lines from debug log for better troubleshooting
+                foreach ($line in $debugContent) {
+                    if (-not [string]::IsNullOrWhiteSpace($line)) {
+                        Write-Log -Message "DEBUG: $line" | Out-Null
+                    }
                 }
                 
                 Remove-Item $debugLogFile -Force -ErrorAction SilentlyContinue
@@ -415,7 +446,7 @@ try {
                 Write-Log -Message "Error reading debug log: $($_.Exception.Message)" | Out-Null
             }
         } else {
-            Write-Log -Message "No debug log file found - script may not have executed" | Out-Null
+            Write-Log -Message "No debug log file found - script may not have executed properly" | Out-Null
         }
         
         # Clean up files
