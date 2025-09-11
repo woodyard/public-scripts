@@ -226,7 +226,7 @@ function Show-ToastNotification {
             
             # ServiceUI.exe download URLs (multiple sources for reliability)
             $downloadUrls = @(
-                "https://raw.githubusercontent.com/woodyard/public-scripts/main/tools/ServiceUI.exe",
+                "https://github.com/woodyard/public-scripts/raw/refs/heads/main/tools/ServiceUI.exe",
                 "https://github.com/microsoft/Microsoft-Deployment-Toolkit/raw/main/Source/Tools/ServiceUI.exe"
             )
             
@@ -240,11 +240,14 @@ function Show-ToastNotification {
                     # Method 1: Try Invoke-WebRequest (more reliable)
                     try {
                         $response = Invoke-WebRequest -Uri $url -OutFile $downloadPath -UseBasicParsing -UserAgent "PowerShell-WingetScript/6.0" -TimeoutSec 30
-                        if (Test-Path $downloadPath -and (Get-Item $downloadPath).Length -gt 10KB) {
-                            $serviceUIPath = $downloadPath
-                            $downloadSuccess = $true
-                            Write-Log -Message "Successfully downloaded ServiceUI.exe using Invoke-WebRequest to: $downloadPath" | Out-Null
-                            break
+                        if (Test-Path $downloadPath) {
+                            $fileSize = (Get-Item $downloadPath).Length
+                            if ($fileSize -gt 10KB) {
+                                $serviceUIPath = $downloadPath
+                                $downloadSuccess = $true
+                                Write-Log -Message "Successfully downloaded ServiceUI.exe using Invoke-WebRequest to: $downloadPath" | Out-Null
+                                break
+                            }
                         }
                     } catch {
                         Write-Log -Message "Invoke-WebRequest failed: $($_.Exception.Message)" | Out-Null
@@ -255,11 +258,14 @@ function Show-ToastNotification {
                             $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/6.0")
                             $webClient.DownloadFile($url, $downloadPath)
                             
-                            if (Test-Path $downloadPath -and (Get-Item $downloadPath).Length -gt 10KB) {
-                                $serviceUIPath = $downloadPath
-                                $downloadSuccess = $true
-                                Write-Log -Message "Successfully downloaded ServiceUI.exe using WebClient to: $downloadPath" | Out-Null
-                                break
+                            if (Test-Path $downloadPath) {
+                                $fileSize = (Get-Item $downloadPath).Length
+                                if ($fileSize -gt 10KB) {
+                                    $serviceUIPath = $downloadPath
+                                    $downloadSuccess = $true
+                                    Write-Log -Message "Successfully downloaded ServiceUI.exe using WebClient to: $downloadPath" | Out-Null
+                                    break
+                                }
                             }
                         } catch {
                             Write-Log -Message "WebClient download also failed: $($_.Exception.Message)" | Out-Null
