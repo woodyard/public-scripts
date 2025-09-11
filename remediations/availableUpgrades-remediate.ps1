@@ -224,30 +224,51 @@ function Show-ToastNotification {
                 Write-Log -Message "Created directory: $downloadDir" | Out-Null
             }
             
-            # ServiceUI.exe download URLs (Microsoft official sources)
+            # ServiceUI.exe download URLs (multiple sources for reliability)
             $downloadUrls = @(
-                "https://github.com/microsoft/Microsoft-Deployment-Toolkit/raw/main/Source/Tools/ServiceUI.exe",
-                "https://download.microsoft.com/download/3/3/9/339BE62D-B4B8-4956-B58D-73C4685FC492/MicrosoftDeploymentToolkit_x64.msi"
+                "https://raw.githubusercontent.com/woodyard/public-scripts/main/tools/ServiceUI.exe",
+                "https://github.com/microsoft/Microsoft-Deployment-Toolkit/raw/main/Source/Tools/ServiceUI.exe"
             )
             
             $downloadSuccess = $false
             
-            # Try direct ServiceUI.exe download first
-            try {
-                Write-Log -Message "Attempting to download ServiceUI.exe from GitHub" | Out-Null
-                $webClient = New-Object System.Net.WebClient
-                $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/6.0")
-                $webClient.DownloadFile($downloadUrls[0], $downloadPath)
-                
-                if (Test-Path $downloadPath -and (Get-Item $downloadPath).Length -gt 10KB) {
-                    $serviceUIPath = $downloadPath
-                    $downloadSuccess = $true
-                    Write-Log -Message "Successfully downloaded ServiceUI.exe to: $downloadPath" | Out-Null
-                } else {
-                    Write-Log -Message "Download completed but file appears invalid" | Out-Null
+            # Try multiple download methods and sources
+            foreach ($url in $downloadUrls) {
+                try {
+                    Write-Log -Message "Attempting to download ServiceUI.exe from: $url" | Out-Null
+                    
+                    # Method 1: Try Invoke-WebRequest (more reliable)
+                    try {
+                        $response = Invoke-WebRequest -Uri $url -OutFile $downloadPath -UseBasicParsing -UserAgent "PowerShell-WingetScript/6.0" -TimeoutSec 30
+                        if (Test-Path $downloadPath -and (Get-Item $downloadPath).Length -gt 10KB) {
+                            $serviceUIPath = $downloadPath
+                            $downloadSuccess = $true
+                            Write-Log -Message "Successfully downloaded ServiceUI.exe using Invoke-WebRequest to: $downloadPath" | Out-Null
+                            break
+                        }
+                    } catch {
+                        Write-Log -Message "Invoke-WebRequest failed: $($_.Exception.Message)" | Out-Null
+                        
+                        # Method 2: Fallback to WebClient
+                        try {
+                            $webClient = New-Object System.Net.WebClient
+                            $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/6.0")
+                            $webClient.DownloadFile($url, $downloadPath)
+                            
+                            if (Test-Path $downloadPath -and (Get-Item $downloadPath).Length -gt 10KB) {
+                                $serviceUIPath = $downloadPath
+                                $downloadSuccess = $true
+                                Write-Log -Message "Successfully downloaded ServiceUI.exe using WebClient to: $downloadPath" | Out-Null
+                                break
+                            }
+                        } catch {
+                            Write-Log -Message "WebClient download also failed: $($_.Exception.Message)" | Out-Null
+                        }
+                    }
+                    
+                } catch {
+                    Write-Log -Message "Failed to download from $url : $($_.Exception.Message)" | Out-Null
                 }
-            } catch {
-                Write-Log -Message "Failed to download ServiceUI.exe: $($_.Exception.Message)" | Out-Null
             }
             
             # If download failed, fall back to PowerShell dialog
