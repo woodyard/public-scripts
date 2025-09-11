@@ -7,7 +7,9 @@
         "UserContext": true,
         "UserContextPath": "$Env:LocalAppData\\Mozilla Firefox\\firefox.exe",
         "BlockingProcess": "firefox",
-        "PromptWhenBlocked": true
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 60
     },
     {
         "AppID": "Google.Chrome",
@@ -16,7 +18,9 @@
         "UserContext": true,
         "UserContextPath": "$Env:LocalAppData\\Google\\Chrome\\Application\\chrome.exe",
         "BlockingProcess": "chrome",
-        "PromptWhenBlocked": true
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 60
     },
     {
         "AppID": "Microsoft.VisualStudioCode",
@@ -25,7 +29,9 @@
         "UserContext": true,
         "UserContextPath": "$Env:LocalAppData\\Programs\\Microsoft VS Code\\Code.exe",
         "BlockingProcess": "Code",
-        "PromptWhenBlocked": true
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 60
     },
     {
         "AppID": "Salesforce.sfdx-cli",
@@ -234,9 +240,12 @@
     },
     {
         "AppID": "Adobe.Acrobat.Reader.64-bit",
+        "FriendlyName": "Adobe Acrobat Reader",
         "BlockingProcess": "AcroRd32,Acrobat,AcroBroker,AdobeARM,AdobeCollabSync",
         "AutoCloseProcesses": "AdobeCollabSync",
-        "PromptWhenBlocked": true
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 90
     },
     {
         "AppID": "RazerInc.RazerInstaller"
@@ -265,8 +274,11 @@
     },
     {
         "AppID": "Microsoft.AzureDataStudio",
+        "FriendlyName": "Azure Data Studio",
         "BlockingProcess": "azuredatastudio",
-        "PromptWhenBlocked": true
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 60
     },
     {
         "AppID": "Mythicsoft.AgentRansack",

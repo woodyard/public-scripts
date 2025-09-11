@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 4.0
-    Tag: 3O
+    Version: 4.1
+    Tag: 3P
     
     Version History:
     1.0 - Initial version
@@ -35,6 +35,7 @@
     3.8 - Made context filtering logic more robust to handle apps without explicit SystemContext/UserContext properties
     3.9 - Improved log management: dynamic path selection (Intune logs for system context), automatic cleanup of logs older than 1 month
     4.0 - Added PromptWhenBlocked property for granular control over interactive dialogs vs silent waiting when blocking processes are running
+    4.1 - Updated to work with new Toast notification remediation system (Version 6.0/9R), enhanced app configuration with TimeoutSeconds and DefaultTimeoutAction support
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -109,7 +110,7 @@ function Remove-OldLogs {
 }
 
 <# Script variables #>
-$ScriptTag = "3O" # Update this tag for each script version
+$ScriptTag = "3P" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -150,7 +151,7 @@ Write-Log -Message "Fetching whitelist configuration from GitHub"
 
 try {
     $webClient = New-Object System.Net.WebClient
-    $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/3.4")
+    $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/4.1")
     $whitelistJSON = $webClient.DownloadString($whitelistUrl)
     Write-Log -Message "Successfully downloaded whitelist configuration from GitHub"
 } catch {
