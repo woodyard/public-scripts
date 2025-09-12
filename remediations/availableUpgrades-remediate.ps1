@@ -426,51 +426,84 @@ Add-Content -Path "$ResponseFile.log" -Value "Toast script completed at $(Get-Da
         $toastScript | Out-File -FilePath $scriptPath -Encoding UTF8
         
         # Execute toast script in user session
-        $scriptExecuted = $false
-        
-        # Force Windows PowerShell 5.1 execution for Windows Runtime compatibility
-        $windowsPSPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-        if (-not (Test-Path $windowsPSPath)) {
-            $windowsPSPath = "powershell.exe"  # Fallback to PATH
-        }
-        
-        Write-Log -Message "Using Windows PowerShell for toast notifications: $windowsPSPath" | Out-Null
-        
-        # Try to execute via scheduled task (most reliable for user context)
-        try {
-            Write-Log -Message "Executing toast notification via scheduled task with Windows PowerShell 5.1" | Out-Null
-            $taskName = "ToastTask_$([guid]::NewGuid().ToString().Substring(0,8))"
-            
-            $action = New-ScheduledTaskAction -Execute $windowsPSPath -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -ResponseFile `"$responseFile`" -FriendlyName `"$FriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction"
-            $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -LogonType Interactive
-            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-            
-            Write-Log -Message "Registering scheduled task: $taskName" | Out-Null
-            Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-            Write-Log -Message "Starting scheduled task: $taskName" | Out-Null
-            Start-ScheduledTask -TaskName $taskName
-            
-            Write-Log -Message "Waiting 5 seconds for task execution" | Out-Null
-            Start-Sleep -Seconds 5
-            
-            # Check task status
-            try {
-                $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-                if ($task) {
-                    $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
-                    Write-Log -Message "Task last run time: $($taskInfo.LastRunTime), Last result: $($taskInfo.LastTaskResult)" | Out-Null
+                $scriptExecuted = $false
+                
+                # Force Windows PowerShell 5.1 execution for Windows Runtime compatibility
+                $windowsPSPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+                if (-not (Test-Path $windowsPSPath)) {
+                    $windowsPSPath = "powershell.exe"  # Fallback to PATH
                 }
-            } catch {
-                Write-Log -Message "Could not get task status: $($_.Exception.Message)" | Out-Null
-            }
-            
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-            Write-Log -Message "Scheduled task $taskName completed and removed" | Out-Null
-            $scriptExecuted = $true
-            
-        } catch {
-            Write-Log -Message "Scheduled task toast execution failed: $($_.Exception.Message)" | Out-Null
-        }
+                
+                Write-Log -Message "Using Windows PowerShell for toast notifications: $windowsPSPath" | Out-Null
+                
+                # Try direct user context execution first (more likely to work)
+                try {
+                    Write-Log -Message "Trying direct user context execution via PsExec if available" | Out-Null
+                    $psexecPath = "$env:ProgramData\chocolatey\bin\PsExec.exe"
+                    
+                    if (Test-Path $psexecPath) {
+                        Write-Log -Message "PsExec found, attempting direct user session execution" | Out-Null
+                        $psexecArgs = "-accepteula -s -i $($primarySession.SessionId) -d `"$windowsPSPath`" -ExecutionPolicy Bypass -WindowStyle Normal -File `"$scriptPath`" -ResponseFile `"$responseFile`" -FriendlyName `"$FriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction"
+                        
+                        Write-Log -Message "PsExec command: $psexecPath $psexecArgs" | Out-Null
+                        Start-Process -FilePath $psexecPath -ArgumentList $psexecArgs -WindowStyle Hidden -Wait:$false
+                        $scriptExecuted = $true
+                        Write-Log -Message "PsExec execution started" | Out-Null
+                    } else {
+                        Write-Log -Message "PsExec not available, trying scheduled task approach" | Out-Null
+                    }
+                } catch {
+                    Write-Log -Message "PsExec execution failed: $($_.Exception.Message)" | Out-Null
+                }
+                
+                # Try scheduled task if PsExec wasn't available or failed
+                if (-not $scriptExecuted) {
+                    try {
+                        Write-Log -Message "Executing toast notification via scheduled task with Windows PowerShell 5.1" | Out-Null
+                        $taskName = "ToastTask_$([guid]::NewGuid().ToString().Substring(0,8))"
+                        
+                        # Enhanced task arguments with better logging
+                        $taskArgs = "-ExecutionPolicy Bypass -WindowStyle Normal -NoProfile -Command `"& '$scriptPath' -ResponseFile '$responseFile' -FriendlyName '$FriendlyName' -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction`""
+                        
+                        $action = New-ScheduledTaskAction -Execute $windowsPSPath -Argument $taskArgs
+                        $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -LogonType Interactive -RunLevel Highest
+                        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+                        
+                        Write-Log -Message "Task arguments: $taskArgs" | Out-Null
+                        Write-Log -Message "Registering scheduled task: $taskName" | Out-Null
+                        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+                        Write-Log -Message "Starting scheduled task: $taskName" | Out-Null
+                        Start-ScheduledTask -TaskName $taskName
+                        
+                        Write-Log -Message "Waiting 10 seconds for task execution" | Out-Null
+                        Start-Sleep -Seconds 10
+                        
+                        # Check task status with more detail
+                        try {
+                            $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                            if ($task) {
+                                $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+                                Write-Log -Message "Task last run time: $($taskInfo.LastRunTime), Last result: 0x$([Convert]::ToString($taskInfo.LastTaskResult, 16))" | Out-Null
+                                Write-Log -Message "Task state: $($task.State)" | Out-Null
+                                
+                                # Check if task is still running
+                                if ($task.State -eq "Running") {
+                                    Write-Log -Message "Task is still running, waiting additional 10 seconds" | Out-Null
+                                    Start-Sleep -Seconds 10
+                                }
+                            }
+                        } catch {
+                            Write-Log -Message "Could not get task status: $($_.Exception.Message)" | Out-Null
+                        }
+                        
+                        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                        Write-Log -Message "Scheduled task $taskName completed and removed" | Out-Null
+                        $scriptExecuted = $true
+                        
+                    } catch {
+                        Write-Log -Message "Scheduled task toast execution failed: $($_.Exception.Message)" | Out-Null
+                    }
+                }
         
         if (-not $scriptExecuted) {
             Write-Log -Message "Could not execute toast script, falling back to ServiceUI.exe approach" | Out-Null
@@ -1110,11 +1143,59 @@ if (Test-Path $testTriggerFile) {
         
         Write-Log -Message "Toast test completed with result: $testResult"
         
-        if ($testResult -ne $null) {
+        # Check if we have any evidence that the toast actually worked
+        $toastWorked = $false
+        $responseFiles = Get-ChildItem -Path "$env:TEMP" -Filter "ToastResponse_*.txt" -ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) }
+        $debugFiles = Get-ChildItem -Path "$env:TEMP" -Filter "ToastResponse_*.log" -ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) }
+        
+        if ($responseFiles.Count -gt 0) {
+            Write-Log -Message "Found recent toast response file(s) - toast mechanism worked"
+            $toastWorked = $true
+            
+            # Show what was in the response files
+            foreach ($responseFile in $responseFiles) {
+                try {
+                    $content = Get-Content $responseFile.FullName -ErrorAction SilentlyContinue
+                    Write-Log -Message "Response file content: $content"
+                } catch {
+                    Write-Log -Message "Could not read response file: $($_.Exception.Message)"
+                }
+            }
+        }
+        
+        if ($debugFiles.Count -gt 0) {
+            Write-Log -Message "Found toast debug log(s), checking for evidence of successful display"
+            foreach ($debugFile in $debugFiles) {
+                try {
+                    $debugContent = Get-Content $debugFile.FullName -ErrorAction SilentlyContinue
+                    if ($debugContent -like "*Toast notification displayed successfully*") {
+                        Write-Log -Message "Debug log shows toast was displayed successfully"
+                        $toastWorked = $true
+                        break
+                    } elseif ($debugContent -like "*Error in toast script*" -or $debugContent -like "*Failed to redirect*") {
+                        Write-Log -Message "Debug log shows toast script errors"
+                    } elseif ($debugContent -like "*Windows Runtime assemblies loaded successfully*") {
+                        Write-Log -Message "Debug log shows Windows Runtime loaded successfully"
+                        # This suggests the toast should have worked
+                        $toastWorked = $true
+                    }
+                } catch {
+                    Write-Log -Message "Error reading debug file: $($_.Exception.Message)"
+                }
+            }
+        } else {
+            Write-Log -Message "No toast debug log found - this means the scheduled task script never executed properly"
+        }
+        
+        if ($toastWorked) {
             Write-Log -Message "✅ SUCCESS: Toast notification system is working!"
             Write-Log -Message "User response: $($testResult.ToString())"
+            Write-Log -Message "Evidence: Toast was successfully displayed to the user"
         } else {
-            Write-Log -Message "❌ FAILED: Toast notification system returned null"
+            Write-Log -Message "❌ FAILED: Toast notification system is not working properly"
+            Write-Log -Message "No evidence of successful toast display found"
+            Write-Log -Message "Returned value: $($testResult.ToString()) (but this doesn't indicate the toast was visible)"
+            Write-Log -Message "Check: Windows notification settings, Focus Assist, scheduled task execution, PowerShell execution policy"
         }
         
         # Remove the trigger file so test doesn't run again immediately
