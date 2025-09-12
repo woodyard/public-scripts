@@ -194,13 +194,41 @@ function Show-ToastNotification {
         
         # Create PowerShell script that shows actual Windows Toast notifications
         $toastScript = @'
-param([string]$ResponseFile, [string]$FriendlyName, [int]$TimeoutSeconds, [bool]$DefaultTimeoutAction)
-
-# Log script execution
-Add-Content -Path "$ResponseFile.log" -Value "Toast script started at $(Get-Date)"
-Add-Content -Path "$ResponseFile.log" -Value "Current user: $(whoami)"
-Add-Content -Path "$ResponseFile.log" -Value "Session name: $env:SESSIONNAME"
-Add-Content -Path "$ResponseFile.log" -Value "FriendlyName: $FriendlyName"
+        param([string]$ResponseFile, [string]$FriendlyName, [int]$TimeoutSeconds, [bool]$DefaultTimeoutAction)
+        
+        # Force execution via Windows PowerShell 5.1 if running from PowerShell 7+
+        if ($PSVersionTable.PSVersion.Major -ge 6) {
+            $windowsPSPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+            Add-Content -Path "$ResponseFile.log" -Value "Detected PowerShell $($PSVersionTable.PSVersion) - redirecting to Windows PowerShell 5.1"
+            
+            $arguments = @(
+                "-ExecutionPolicy", "Bypass",
+                "-WindowStyle", "Hidden",
+                "-File", "`"$PSCommandPath`"",
+                "-ResponseFile", "`"$ResponseFile`"",
+                "-FriendlyName", "`"$FriendlyName`"",
+                "-TimeoutSeconds", "$TimeoutSeconds",
+                "-DefaultTimeoutAction", "`$$DefaultTimeoutAction"
+            )
+            
+            try {
+                Start-Process -FilePath $windowsPSPath -ArgumentList $arguments -Wait -NoNewWindow
+                Add-Content -Path "$ResponseFile.log" -Value "Successfully redirected to Windows PowerShell 5.1"
+            } catch {
+                Add-Content -Path "$ResponseFile.log" -Value "Failed to redirect to Windows PowerShell 5.1: $($_.Exception.Message)"
+            }
+            exit
+        }
+        
+        # Log script execution
+        Add-Content -Path "$ResponseFile.log" -Value "Toast script started at $(Get-Date)"
+        Add-Content -Path "$ResponseFile.log" -Value "Current user: $(whoami)"
+        Add-Content -Path "$ResponseFile.log" -Value "Session name: $env:SESSIONNAME"
+        Add-Content -Path "$ResponseFile.log" -Value "PowerShell version: $($PSVersionTable.PSVersion)"
+        Add-Content -Path "$ResponseFile.log" -Value "Execution policy: $(Get-ExecutionPolicy)"
+        Add-Content -Path "$ResponseFile.log" -Value "FriendlyName: $FriendlyName"
+        Add-Content -Path "$ResponseFile.log" -Value "TimeoutSeconds: $TimeoutSeconds"
+        Add-Content -Path "$ResponseFile.log" -Value "DefaultTimeoutAction: $DefaultTimeoutAction"
 
 try {
     # Check Windows version for toast support
@@ -238,20 +266,38 @@ try {
     Add-Content -Path "$ResponseFile.log" -Value "Windows Runtime assemblies loaded successfully"
     
     # Create toast XML template with protocol activation for button responses
-    $toastXml = @"
-<toast activationType="protocol" launch="action=timeout" duration="long">
-    <visual>
-        <binding template="ToastGeneric">
-            <text>Application Update Available</text>
-            <text>An update is available for $FriendlyName, but it cannot be installed while the application is running. Would you like to close $FriendlyName now to allow the update to proceed?</text>
-        </binding>
-    </visual>
-    <actions>
-        <action content="Yes, Close App" arguments="action=yes" activationType="protocol" />
-        <action content="No, Keep Open" arguments="action=no" activationType="protocol" />
-    </actions>
-</toast>
-"@
+        # For test mode, show a different message
+        if ($FriendlyName -eq "Toast Test Application") {
+            $toastXml = @"
+    <toast duration="long">
+        <visual>
+            <binding template="ToastGeneric">
+                <text>🎉 SYSTEM Toast Test Success!</text>
+                <text>This toast notification was sent from SYSTEM context to your user session. The cross-session toast mechanism is working correctly!</text>
+            </binding>
+        </visual>
+        <actions>
+            <action content="Great!" arguments="action=success" activationType="background" />
+            <action content="Dismiss" arguments="action=dismiss" activationType="background" />
+        </actions>
+    </toast>
+    "@
+        } else {
+            $toastXml = @"
+    <toast activationType="protocol" launch="action=timeout" duration="long">
+        <visual>
+            <binding template="ToastGeneric">
+                <text>Application Update Available</text>
+                <text>An update is available for $FriendlyName, but it cannot be installed while the application is running. Would you like to close $FriendlyName now to allow the update to proceed?</text>
+            </binding>
+        </visual>
+        <actions>
+            <action content="Yes, Close App" arguments="action=yes" activationType="protocol" />
+            <action content="No, Keep Open" arguments="action=no" activationType="protocol" />
+        </actions>
+    </toast>
+    "@
+        }
 
     Add-Content -Path "$ResponseFile.log" -Value "Toast XML template created"
     
@@ -1050,6 +1096,40 @@ Remove-OldLogs -LogPath $LogPath
 
 # Log script start with full date
 Write-Log -Message "Script started on $(Get-Date -Format 'dd.MM.yyyy')"
+
+<# TEST MODE: Check for toast test trigger file #>
+$testTriggerFile = "C:\Temp\toast-test-trigger.txt"
+if (Test-Path $testTriggerFile) {
+    Write-Log -Message "Toast test trigger file detected: $testTriggerFile"
+    Write-Log -Message "Running toast notification test instead of normal remediation"
+    
+    try {
+        # Test the toast notification system with a simple message
+        Write-Log -Message "Testing SYSTEM-to-user toast notification"
+        $testResult = Show-UserNotification -AppID "TestApp.ToastTest" -FriendlyName "Toast Test Application" -ProcessName "test" -TimeoutSeconds 30 -DefaultTimeoutAction $false
+        
+        Write-Log -Message "Toast test completed with result: $testResult"
+        
+        if ($testResult -ne $null) {
+            Write-Log -Message "✅ SUCCESS: Toast notification system is working!"
+            Write-Log -Message "User response: $($testResult.ToString())"
+        } else {
+            Write-Log -Message "❌ FAILED: Toast notification system returned null"
+        }
+        
+        # Remove the trigger file so test doesn't run again immediately
+        Remove-Item $testTriggerFile -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Removed trigger file: $testTriggerFile"
+        
+        Write-Log -Message "Toast test completed - exiting"
+        exit 0
+        
+    } catch {
+        Write-Log -Message "❌ ERROR: Toast test failed with exception: $($_.Exception.Message)"
+        Write-Log -Message "Full exception: $($_.Exception.ToString())"
+        exit 1
+    }
+}
 
 <# Abort script in OOBE phase #>
 if (-not (OOBEComplete)) {
