@@ -462,8 +462,12 @@ Add-Content -Path "$ResponseFile.log" -Value "Toast script completed at $(Get-Da
                         Write-Log -Message "Executing toast notification via scheduled task with Windows PowerShell 5.1" | Out-Null
                         $taskName = "ToastTask_$([guid]::NewGuid().ToString().Substring(0,8))"
                         
-                        # Enhanced task arguments with better logging
-                        $taskArgs = "-ExecutionPolicy Bypass -WindowStyle Normal -NoProfile -Command `"& '$scriptPath' -ResponseFile '$responseFile' -FriendlyName '$FriendlyName' -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction`""
+                        # Fix argument escaping to prevent XML formatting errors
+                        $escapedScriptPath = $scriptPath -replace "'", "''"
+                        $escapedResponseFile = $responseFile -replace "'", "''"
+                        $escapedFriendlyName = $FriendlyName -replace "'", "''"
+                        
+                        $taskArgs = "-ExecutionPolicy Bypass -WindowStyle Hidden -NoProfile -File `"$escapedScriptPath`" -ResponseFile `"$escapedResponseFile`" -FriendlyName `"$escapedFriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction"
                         
                         $action = New-ScheduledTaskAction -Execute $windowsPSPath -Argument $taskArgs
                         $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -LogonType Interactive -RunLevel Highest
