@@ -137,6 +137,15 @@ Remove-OldLogs -LogPath $LogPath
 # Log script start with full date
 Write-Log -Message "Script started on $(Get-Date -Format 'dd.MM.yyyy')"
 
+<# TEST MODE: Check for toast test trigger file #>
+$testTriggerFile = "C:\Temp\toast-test-trigger.txt"
+if (Test-Path $testTriggerFile) {
+    Write-Log -Message "Toast test trigger file detected: $testTriggerFile"
+    Write-Log -Message "Exiting with code 1 to trigger remediation script for toast testing"
+    Write-Log -Message "The remediation script will run the toast notification test"
+    exit 1
+}
+
 <# Abort script in OOBE phase #>
 if (-not (OOBEComplete)) {
     "OOBE"
