@@ -1198,9 +1198,9 @@ if (Test-Path $testTriggerFile) {
             Write-Log -Message "Check: Windows notification settings, Focus Assist, scheduled task execution, PowerShell execution policy"
         }
         
-        # Remove the trigger file so test doesn't run again immediately
-        Remove-Item $testTriggerFile -Force -ErrorAction SilentlyContinue
-        Write-Log -Message "Removed trigger file: $testTriggerFile"
+        # Keep the trigger file for repeated testing (don't delete it)
+        # Remove-Item $testTriggerFile -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Keeping trigger file for repeated testing: $testTriggerFile"
         
         Write-Log -Message "Toast test completed - exiting"
         exit 0
