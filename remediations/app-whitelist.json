@@ -324,7 +324,7 @@
     {
         "AppID": "Mythicsoft.AgentRansack",
         "FriendlyName": "Agent Ransack",
-        "BlockingProcess": "FileLocator",
+        "BlockingProcess": "AgentRansack",
         "PromptWhenBlocked": true,
         "DefaultTimeoutAction": false,
         "TimeoutSeconds": 75
