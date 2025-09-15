@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.3
-    Tag: 3B
+    Version: 3.4
+    Tag: 3C
     
     Version History:
     1.0 - Initial version
@@ -28,6 +28,7 @@
     3.1 - CRITICAL BUG FIX: Fixed exclude list being overwritten with empty string, added detailed debugging
     3.2 - CRITICAL BUG FIX: Fixed second filter removing ALL app IDs (changed "*.*" to "." filter)
     3.3 - CRITICAL BUG FIX: Fixed empty string in exclude list matching ALL apps - cleared exclude list to allow ALL upgrades
+    3.4 - Added Remove-OldLogs function for automatic cleanup of logs older than 1 month (synchronize with other scripts)
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -44,7 +45,7 @@ function Test-RunningAsSystem {
 	}
 }
 
-$ScriptTag = "3B"
+$ScriptTag = "3C"
 $LogName = 'DetectAvailableUpgradesAll'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -85,6 +86,26 @@ function Write-Log($message) #Log script messages to temp directory
     $ConsoleMessage
 	Out-File -InputObject $LogMessage -FilePath "$LogPath\$LogFullName" -Append -Encoding utf8
 }
+
+function Remove-OldLogs {
+	   param([string]$LogPath)
+	   
+	   try {
+	       $cutoffDate = (Get-Date).AddMonths(-1)
+	       $logFiles = Get-ChildItem -Path $LogPath -Filter "*AvailableUpgrades*.log" -ErrorAction SilentlyContinue
+	       foreach ($logFile in $logFiles) {
+	           if ($logFile.LastWriteTime -lt $cutoffDate) {
+	               Remove-Item -Path $logFile.FullName -Force -ErrorAction SilentlyContinue
+	               Write-Log -Message "Removed old log file: $($logFile.Name)"
+	           }
+	       }
+	   } catch {
+	       # Don't use Write-Log here as it may not be ready yet - just silently continue
+	   }
+}
+
+# Clean up old log files (older than 1 month)
+Remove-OldLogs -LogPath $LogPath
 
 # Log script start with full date
 Write-Log -Message "Script started on $(Get-Date -Format 'dd.MM.yyyy')"
