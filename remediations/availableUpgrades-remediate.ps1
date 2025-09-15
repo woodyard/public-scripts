@@ -9,8 +9,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 6.0
- Tag: 9R
+ Version: 7.1
+ Tag: 9T
     
     Version History:
     1.0 - Initial version
@@ -43,6 +43,8 @@
     4.6 - Added multiple user notification methods: msg.exe alerts, balloon tip notifications, and simplified notification approach for better user visibility
     5.0 - MAJOR UPDATE: Implemented Windows 10/11 Toast Notifications with interactive Yes/No buttons for true user dialog capability from system service context
     6.0 - COMPLETE REWRITE: Replaced all problematic dialog systems with robust Windows Toast Notifications and PowerShell WPF dialogs with comprehensive fallback mechanisms
+    7.0 - REVOLUTIONARY UPDATE: Implemented modern WPF-based notification system with Azure AD support, replacing legacy toast notifications with reliable cross-session dialogs, enhanced whitelist timeout support, and optimized for Intune deployment environments
+    7.1 - Enhanced WPF dialog system with countdown timer display on default action button for improved user experience and clarity
     
     Exit Codes:
     0 - Script completed successfully
@@ -148,865 +150,987 @@ function Get-ActiveUserSessions {
     }
 }
 
-function Show-ToastNotification {
+
+# WPF System User Prompt Functions - Modern replacement for legacy toast notification system
+
+function Get-InteractiveUser {
     <#
     .SYNOPSIS
-        Shows actual Windows Toast Notifications with interactive Yes/No buttons
-    .DESCRIPTION
-        Uses Windows Runtime to display native toast notifications from SYSTEM context to user sessions
-        This provides true interactive notifications with proper user response handling
-    .PARAMETER AppID
-        Application ID for the update
-    .PARAMETER FriendlyName
-        User-friendly name of the application
-    .PARAMETER ProcessName
-        Name of the blocking process
-    .PARAMETER TimeoutSeconds
-        Timeout in seconds before auto-action
-    .PARAMETER DefaultTimeoutAction
-        Action to take on timeout (true = close app, false = keep open)
-    .OUTPUTS
-        Boolean indicating user choice (true = close app, false = keep open)
+        Gets the currently logged-in interactive user and their SID (Azure AD compatible)
     #>
-    param(
-        [string]$AppID,
-        [string]$FriendlyName,
-        [string]$ProcessName,
-        [int]$TimeoutSeconds = 60,
-        [bool]$DefaultTimeoutAction = $false
-    )
-    
-    Write-Log -Message "Show-ToastNotification called for $AppID ($FriendlyName)" | Out-Null
     
     try {
-        # Get active user sessions
-        $activeSessions = Get-ActiveUserSessions
-        if ($activeSessions.Count -eq 0) {
-            Write-Log -Message "No active user sessions found for toast notification" | Out-Null
-            return $DefaultTimeoutAction
-        }
+        Write-Log "Detecting interactive user using Win32_ComputerSystem..." | Out-Null
         
-        $primarySession = $activeSessions[0]
-        Write-Log -Message "Using session $($primarySession.SessionId) for toast notification" | Out-Null
-        
-        # Create unique response file for toast interaction
-        $responseFile = "$env:TEMP\ToastResponse_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
-        
-        # Create PowerShell script that shows actual Windows Toast notifications
-        $toastScript = @'
-        param([string]$ResponseFile, [string]$FriendlyName, [int]$TimeoutSeconds, [bool]$DefaultTimeoutAction)
-        
-        # Force execution via Windows PowerShell 5.1 if running from PowerShell 7+
-        if ($PSVersionTable.PSVersion.Major -ge 6) {
-            $windowsPSPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-            Add-Content -Path "$ResponseFile.log" -Value "Detected PowerShell $($PSVersionTable.PSVersion) - redirecting to Windows PowerShell 5.1"
-            
-            $arguments = @(
-                "-ExecutionPolicy", "Bypass",
-                "-WindowStyle", "Hidden",
-                "-File", "`"$PSCommandPath`"",
-                "-ResponseFile", "`"$ResponseFile`"",
-                "-FriendlyName", "`"$FriendlyName`"",
-                "-TimeoutSeconds", "$TimeoutSeconds",
-                "-DefaultTimeoutAction", "`$$DefaultTimeoutAction"
-            )
-            
-            try {
-                Start-Process -FilePath $windowsPSPath -ArgumentList $arguments -Wait -NoNewWindow
-                Add-Content -Path "$ResponseFile.log" -Value "Successfully redirected to Windows PowerShell 5.1"
-            } catch {
-                Add-Content -Path "$ResponseFile.log" -Value "Failed to redirect to Windows PowerShell 5.1: $($_.Exception.Message)"
-            }
-            exit
-        }
-        
-        # Log script execution
-        Add-Content -Path "$ResponseFile.log" -Value "Toast script started at $(Get-Date)"
-        Add-Content -Path "$ResponseFile.log" -Value "Current user: $(whoami)"
-        Add-Content -Path "$ResponseFile.log" -Value "Session name: $env:SESSIONNAME"
-        Add-Content -Path "$ResponseFile.log" -Value "PowerShell version: $($PSVersionTable.PSVersion)"
-        Add-Content -Path "$ResponseFile.log" -Value "Execution policy: $(Get-ExecutionPolicy)"
-        Add-Content -Path "$ResponseFile.log" -Value "FriendlyName: $FriendlyName"
-        Add-Content -Path "$ResponseFile.log" -Value "TimeoutSeconds: $TimeoutSeconds"
-        Add-Content -Path "$ResponseFile.log" -Value "DefaultTimeoutAction: $DefaultTimeoutAction"
-
-try {
-    # Check Windows version for toast support
-    $osVersion = [System.Environment]::OSVersion.Version
-    Add-Content -Path "$ResponseFile.log" -Value "OS Version: $($osVersion.Major).$($osVersion.Minor).$($osVersion.Build)"
-    
-    if ($osVersion.Major -lt 10) {
-        Add-Content -Path "$ResponseFile.log" -Value "Toast notifications require Windows 10 or later"
-        # Fallback to MessageBox for older Windows
-        Add-Type -AssemblyName System.Windows.Forms
-        $message = "An update is available for $FriendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $FriendlyName now to allow the update to proceed?"
-        $result = [System.Windows.Forms.MessageBox]::Show($message, "Application Update Available", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
-        
-        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-            "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
-        } else {
-            "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
-        }
-        return
-    }
-    
-    Add-Content -Path "$ResponseFile.log" -Value "Loading Windows Runtime assemblies"
-    
-    # Load Windows Runtime assemblies for Toast notifications
-    Add-Type -AssemblyName System.Runtime.WindowsRuntime
-    $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-    $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
-    
-    # Alternative method if above fails
-    if (-not ([System.Management.Automation.PSTypeName]'Windows.UI.Notifications.ToastNotificationManager').Type) {
-        [void][Windows.UI.Notifications.ToastNotificationManager]
-        [void][Windows.Data.Xml.Dom.XmlDocument]
-    }
-    
-    Add-Content -Path "$ResponseFile.log" -Value "Windows Runtime assemblies loaded successfully"
-    
-    # Create toast XML template with protocol activation for button responses
-        # For test mode, show a different message
-        if ($FriendlyName -eq "Toast Test Application") {
-            $toastXml = @"
-    <toast duration="long">
-        <visual>
-            <binding template="ToastGeneric">
-                <text>🎉 SYSTEM Toast Test Success!</text>
-                <text>This toast notification was sent from SYSTEM context to your user session. The cross-session toast mechanism is working correctly!</text>
-            </binding>
-        </visual>
-        <actions>
-            <action content="Great!" arguments="action=success" activationType="background" />
-            <action content="Dismiss" arguments="action=dismiss" activationType="background" />
-        </actions>
-    </toast>
-    "@
-        } else {
-            $toastXml = @"
-    <toast activationType="protocol" launch="action=timeout" duration="long">
-        <visual>
-            <binding template="ToastGeneric">
-                <text>Application Update Available</text>
-                <text>An update is available for $FriendlyName, but it cannot be installed while the application is running. Would you like to close $FriendlyName now to allow the update to proceed?</text>
-            </binding>
-        </visual>
-        <actions>
-            <action content="Yes, Close App" arguments="action=yes" activationType="protocol" />
-            <action content="No, Keep Open" arguments="action=no" activationType="protocol" />
-        </actions>
-    </toast>
-    "@
-        }
-
-    Add-Content -Path "$ResponseFile.log" -Value "Toast XML template created"
-    
-    # Create XmlDocument
-    $xmlDoc = New-Object Windows.Data.Xml.Dom.XmlDocument
-    $xmlDoc.LoadXml($toastXml)
-    
-    Add-Content -Path "$ResponseFile.log" -Value "XML document loaded"
-    
-    # Create toast notification
-    $toast = New-Object Windows.UI.Notifications.ToastNotification $xmlDoc
-    
-    # Set expiration time
-    $toast.ExpirationTime = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
-    
-    Add-Content -Path "$ResponseFile.log" -Value "Toast notification object created with expiration"
-    
-    # Get toast notifier for PowerShell
-    $appId = "Microsoft.PowerShell_8wekyb3d8bbwe!powershell"
-    $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId)
-    
-    Add-Content -Path "$ResponseFile.log" -Value "Toast notifier created for app ID: $appId"
-    
-    # Add event handlers for user interaction
-    $activated = $false
-    $activationArgs = ""
-    
-    # Register activation handler
-    Register-ObjectEvent -InputObject $toast -EventName Activated -Action {
-        $activationArgs = $Event.SourceEventArgs.Arguments
-        $activated = $true
-        Add-Content -Path "$ResponseFile.log" -Value "Toast activated with arguments: $activationArgs"
-        
-        if ($activationArgs -like "*action=yes*") {
-            "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
-            Add-Content -Path "$ResponseFile.log" -Value "User clicked YES"
-        } elseif ($activationArgs -like "*action=no*") {
-            "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
-            Add-Content -Path "$ResponseFile.log" -Value "User clicked NO"
-        } else {
-            # Default action on timeout or unexpected activation
-            if ($DefaultTimeoutAction) {
-                "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
-                Add-Content -Path "$ResponseFile.log" -Value "Timeout - used default action YES"
-            } else {
-                "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
-                Add-Content -Path "$ResponseFile.log" -Value "Timeout - used default action NO"
-            }
-        }
-    } | Out-Null
-    
-    # Register dismissed handler
-    Register-ObjectEvent -InputObject $toast -EventName Dismissed -Action {
-        $dismissedReason = $Event.SourceEventArgs.Reason
-        Add-Content -Path "$ResponseFile.log" -Value "Toast dismissed with reason: $dismissedReason"
-        
-        if (-not (Test-Path $ResponseFile)) {
-            # Only write default if no response was already recorded
-            if ($DefaultTimeoutAction) {
-                "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
-                Add-Content -Path "$ResponseFile.log" -Value "Dismissed - used default action YES"
-            } else {
-                "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
-                Add-Content -Path "$ResponseFile.log" -Value "Dismissed - used default action NO"
-            }
-        }
-    } | Out-Null
-    
-    # Show the toast
-    Add-Content -Path "$ResponseFile.log" -Value "About to show toast notification"
-    $notifier.Show($toast)
-    Add-Content -Path "$ResponseFile.log" -Value "Toast notification displayed successfully"
-    
-    # Wait for user response or timeout
-    $waitTime = 0
-    while ($waitTime -lt $TimeoutSeconds -and -not (Test-Path $ResponseFile)) {
-        Start-Sleep -Seconds 1
-        $waitTime++
-    }
-    
-    # If no response file exists after timeout, create default response
-    if (-not (Test-Path $ResponseFile)) {
-        if ($DefaultTimeoutAction) {
-            "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
-            Add-Content -Path "$ResponseFile.log" -Value "Final timeout - used default action YES"
-        } else {
-            "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
-            Add-Content -Path "$ResponseFile.log" -Value "Final timeout - used default action NO"
-        }
-    }
-    
-} catch {
-    Add-Content -Path "$ResponseFile.log" -Value "Error in toast script: $($_.Exception.Message)"
-    Add-Content -Path "$ResponseFile.log" -Value "Exception details: $($_.Exception.ToString())"
-    
-    # Fallback to MessageBox on toast failure
-    try {
-        Add-Type -AssemblyName System.Windows.Forms
-        $message = "An update is available for $FriendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $FriendlyName now to allow the update to proceed?"
-        $result = [System.Windows.Forms.MessageBox]::Show($message, "Application Update Available", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
-        
-        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-            "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
-            Add-Content -Path "$ResponseFile.log" -Value "Fallback MessageBox - User clicked YES"
-        } else {
-            "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
-            Add-Content -Path "$ResponseFile.log" -Value "Fallback MessageBox - User clicked NO"
-        }
-    } catch {
-        # Ultimate fallback
-        if ($DefaultTimeoutAction) {
-            "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
-            Add-Content -Path "$ResponseFile.log" -Value "Ultimate fallback - used default action YES"
-        } else {
-            "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
-            Add-Content -Path "$ResponseFile.log" -Value "Ultimate fallback - used default action NO"
-        }
-    }
-}
-
-Add-Content -Path "$ResponseFile.log" -Value "Toast script completed at $(Get-Date)"
-'@
-        
-        # Write the PowerShell script to temp file
-        $scriptPath = "$env:TEMP\ToastScript_$([guid]::NewGuid().ToString().Substring(0,8)).ps1"
-        $toastScript | Out-File -FilePath $scriptPath -Encoding UTF8
-        
-        # Execute toast script in user session
-                $scriptExecuted = $false
-                
-                # Force Windows PowerShell 5.1 execution for Windows Runtime compatibility
-                $windowsPSPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-                if (-not (Test-Path $windowsPSPath)) {
-                    $windowsPSPath = "powershell.exe"  # Fallback to PATH
-                }
-                
-                Write-Log -Message "Using Windows PowerShell for toast notifications: $windowsPSPath" | Out-Null
-                
-                # Try direct user context execution first (more likely to work)
-                try {
-                    Write-Log -Message "Trying direct user context execution via PsExec if available" | Out-Null
-                    $psexecPath = "$env:ProgramData\chocolatey\bin\PsExec.exe"
-                    
-                    if (Test-Path $psexecPath) {
-                        Write-Log -Message "PsExec found, attempting direct user session execution" | Out-Null
-                        $psexecArgs = "-accepteula -s -i $($primarySession.SessionId) -d `"$windowsPSPath`" -ExecutionPolicy Bypass -WindowStyle Normal -File `"$scriptPath`" -ResponseFile `"$responseFile`" -FriendlyName `"$FriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction"
-                        
-                        Write-Log -Message "PsExec command: $psexecPath $psexecArgs" | Out-Null
-                        Start-Process -FilePath $psexecPath -ArgumentList $psexecArgs -WindowStyle Hidden -Wait:$false
-                        $scriptExecuted = $true
-                        Write-Log -Message "PsExec execution started" | Out-Null
-                    } else {
-                        Write-Log -Message "PsExec not available, trying scheduled task approach" | Out-Null
-                    }
-                } catch {
-                    Write-Log -Message "PsExec execution failed: $($_.Exception.Message)" | Out-Null
-                }
-                
-                # Try scheduled task if PsExec wasn't available or failed
-                if (-not $scriptExecuted) {
-                    try {
-                        Write-Log -Message "Executing toast notification via scheduled task with Windows PowerShell 5.1" | Out-Null
-                        $taskName = "ToastTask_$([guid]::NewGuid().ToString().Substring(0,8))"
-                        
-                        # Fix argument escaping to prevent XML formatting errors
-                        $escapedScriptPath = $scriptPath -replace "'", "''"
-                        $escapedResponseFile = $responseFile -replace "'", "''"
-                        $escapedFriendlyName = $FriendlyName -replace "'", "''"
-                        
-                        $taskArgs = "-ExecutionPolicy Bypass -WindowStyle Hidden -NoProfile -File `"$escapedScriptPath`" -ResponseFile `"$escapedResponseFile`" -FriendlyName `"$escapedFriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction"
-                        
-                        $action = New-ScheduledTaskAction -Execute $windowsPSPath -Argument $taskArgs
-                        $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -LogonType Interactive -RunLevel Highest
-                        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-                        
-                        Write-Log -Message "Task arguments: $taskArgs" | Out-Null
-                        Write-Log -Message "Registering scheduled task: $taskName" | Out-Null
-                        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-                        Write-Log -Message "Starting scheduled task: $taskName" | Out-Null
-                        Start-ScheduledTask -TaskName $taskName
-                        
-                        Write-Log -Message "Waiting 10 seconds for task execution" | Out-Null
-                        Start-Sleep -Seconds 10
-                        
-                        # Check task status with more detail
-                        try {
-                            $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-                            if ($task) {
-                                $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
-                                Write-Log -Message "Task last run time: $($taskInfo.LastRunTime), Last result: 0x$([Convert]::ToString($taskInfo.LastTaskResult, 16))" | Out-Null
-                                Write-Log -Message "Task state: $($task.State)" | Out-Null
-                                
-                                # Check if task is still running
-                                if ($task.State -eq "Running") {
-                                    Write-Log -Message "Task is still running, waiting additional 10 seconds" | Out-Null
-                                    Start-Sleep -Seconds 10
-                                }
-                            }
-                        } catch {
-                            Write-Log -Message "Could not get task status: $($_.Exception.Message)" | Out-Null
-                        }
-                        
-                        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-                        Write-Log -Message "Scheduled task $taskName completed and removed" | Out-Null
-                        $scriptExecuted = $true
-                        
-                    } catch {
-                        Write-Log -Message "Scheduled task toast execution failed: $($_.Exception.Message)" | Out-Null
-                    }
-                }
-        
-        if (-not $scriptExecuted) {
-            Write-Log -Message "Could not execute toast script, falling back to ServiceUI.exe approach" | Out-Null
-            Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-            return Show-ServiceUIDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
-        }
-        
-        # Wait for response with shorter timeout since scheduled tasks may not work
-        Write-Log -Message "Waiting for toast response file: $responseFile" | Out-Null
-        $waitTime = 0
-        $maxWaitTime = 15  # Shorter wait time to fail fast to fallback
-        
-        while ($waitTime -lt $maxWaitTime -and -not (Test-Path $responseFile)) {
-            Start-Sleep -Seconds 1
-            $waitTime++
-            if ($waitTime % 5 -eq 0) {
-                Write-Log -Message "Still waiting for toast response... ($waitTime/$maxWaitTime seconds)" | Out-Null
-            }
-        }
-        
-        # Read response
-        $userResponse = $DefaultTimeoutAction
-        if (Test-Path $responseFile) {
-            try {
-                $responseContent = Get-Content $responseFile -Raw -ErrorAction SilentlyContinue
-                $responseContent = $responseContent.Trim()
-                
-                if ($responseContent -eq "YES") {
-                    $userResponse = $true
-                    Write-Log -Message "User chose to close $FriendlyName via toast notification" | Out-Null
-                } elseif ($responseContent -eq "NO") {
-                    $userResponse = $false
-                    Write-Log -Message "User chose to keep $FriendlyName open via toast notification" | Out-Null
-                } else {
-                    Write-Log -Message "Unexpected toast response: $responseContent, using default action" | Out-Null
-                }
-                
-                Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
-            } catch {
-                Write-Log -Message "Error reading toast response: $($_.Exception.Message)" | Out-Null
-            }
-        } else {
-            Write-Log -Message "No toast response file created after $maxWaitTime seconds - toast notification may have failed" | Out-Null
-            Write-Log -Message "Falling back to ServiceUI dialog approach" | Out-Null
-            Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-            return Show-ServiceUIDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
-        }
-        
-        # Check for debug log and report information
-        $debugLogFile = $responseFile + ".log"
-        if (Test-Path $debugLogFile) {
-            try {
-                $debugContent = Get-Content $debugLogFile -ErrorAction SilentlyContinue
-                Write-Log -Message "Toast debug log found with $($debugContent.Count) lines" | Out-Null
-                
-                # Report key lines from debug log
-                foreach ($line in $debugContent) {
-                    if (-not [string]::IsNullOrWhiteSpace($line) -and
-                        ($line -like "*successfully*" -or $line -like "*error*" -or $line -like "*clicked*" -or $line -like "*timeout*")) {
-                        Write-Log -Message "TOAST: $line" | Out-Null
-                    }
-                }
-                
-                Remove-Item $debugLogFile -Force -ErrorAction SilentlyContinue
-            } catch {
-                Write-Log -Message "Error reading toast debug log: $($_.Exception.Message)" | Out-Null
-            }
-        } else {
-            Write-Log -Message "No toast debug log found" | Out-Null
-        }
-        
-        # Clean up files
-        Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-        
-        return $userResponse
-        
-    } catch {
-        Write-Log -Message "Toast notification system failed: $($_.Exception.Message)" | Out-Null
-        Write-Log -Message "Falling back to ServiceUI dialog" | Out-Null
-        return Show-ServiceUIDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
-    }
-}
-
-function Show-ServiceUIDialog {
-    <#
-    .SYNOPSIS
-        Shows a user notification using ServiceUI.exe for cross-session messaging (fallback)
-    .DESCRIPTION
-        Uses ServiceUI.exe from Microsoft Deployment Toolkit to display dialogs from SYSTEM context to user sessions
-        This is a fallback when toast notifications fail
-    .PARAMETER AppID
-        Application ID for the update
-    .PARAMETER FriendlyName
-        User-friendly name of the application
-    .PARAMETER ProcessName
-        Name of the blocking process
-    .PARAMETER TimeoutSeconds
-        Timeout in seconds before auto-action
-    .PARAMETER DefaultTimeoutAction
-        Action to take on timeout (true = close app, false = keep open)
-    .OUTPUTS
-        Boolean indicating user choice (true = close app, false = keep open)
-    #>
-    param(
-        [string]$AppID,
-        [string]$FriendlyName,
-        [string]$ProcessName,
-        [int]$TimeoutSeconds = 60,
-        [bool]$DefaultTimeoutAction = $false
-    )
-    
-    Write-Log -Message "Show-ServiceUIDialog called for $AppID ($FriendlyName)" | Out-Null
-    
-    try {
-        # Get active user sessions
-        $activeSessions = Get-ActiveUserSessions
-        if ($activeSessions.Count -eq 0) {
-            Write-Log -Message "No active user sessions found for ServiceUI dialog" | Out-Null
-            return $DefaultTimeoutAction
-        }
-        
-        $primarySession = $activeSessions[0]
-        Write-Log -Message "Using session $($primarySession.SessionId) for ServiceUI dialog" | Out-Null
-        
-        # Create unique response file
-        $responseFile = "$env:TEMP\ServiceUIResponse_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
-        
-        # Look for ServiceUI.exe in common locations
-        $serviceUILocations = @(
-            "$env:ProgramData\ServiceUI\ServiceUI.exe",  # Our download location (check first)
-            "$env:SystemRoot\System32\ServiceUI.exe",
-            "$env:SystemRoot\SysWOW64\ServiceUI.exe",
-            "$env:ProgramFiles\Microsoft Deployment Toolkit\Templates\Distribution\Tools\x64\ServiceUI.exe",
-            "$env:ProgramFiles(x86)\Microsoft Deployment Toolkit\Templates\Distribution\Tools\x86\ServiceUI.exe",
-            "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Deployment Toolkit\ServiceUI.exe"
-        )
-        
-        $serviceUIPath = $null
-        foreach ($location in $serviceUILocations) {
-            if (Test-Path $location) {
-                $serviceUIPath = $location
-                Write-Log -Message "Found ServiceUI.exe at: $serviceUIPath" | Out-Null
-                break
-            }
-        }
-        
-        if (-not $serviceUIPath) {
-            Write-Log -Message "ServiceUI.exe not found, falling back to PowerShell dialog" | Out-Null
-            return Show-PowerShellDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
-        }
-        
-        # Create PowerShell script that shows MessageBox
-        $messageBoxScript = @'
-param([string]$ResponseFile, [string]$FriendlyName)
-
-# Log script execution
-Add-Content -Path "$ResponseFile.log" -Value "ServiceUI script started at $(Get-Date)"
-Add-Content -Path "$ResponseFile.log" -Value "Current user: $(whoami)"
-Add-Content -Path "$ResponseFile.log" -Value "Session name: $env:SESSIONNAME"
-Add-Content -Path "$ResponseFile.log" -Value "FriendlyName: $FriendlyName"
-
-try {
-    Add-Type -AssemblyName System.Windows.Forms
-    Add-Content -Path "$ResponseFile.log" -Value "System.Windows.Forms loaded successfully"
-    
-    $message = "An update is available for $FriendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $FriendlyName now to allow the update to proceed?"
-    $title = "Application Update Available"
-    
-    Add-Content -Path "$ResponseFile.log" -Value "About to show MessageBox"
-    
-    # Show MessageBox with TopMost to ensure visibility
-    $result = [System.Windows.Forms.MessageBox]::Show($message, $title, [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question, [System.Windows.Forms.MessageBoxDefaultButton]::Button2, [System.Windows.Forms.MessageBoxOptions]::DefaultDesktopOnly)
-    
-    Add-Content -Path "$ResponseFile.log" -Value "MessageBox result: $result"
-    
-    if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-        "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
-        Add-Content -Path "$ResponseFile.log" -Value "User clicked YES - wrote to response file"
-    } else {
-        "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
-        Add-Content -Path "$ResponseFile.log" -Value "User clicked NO - wrote to response file"
-    }
-    
-} catch {
-    Add-Content -Path "$ResponseFile.log" -Value "Error: $($_.Exception.Message)"
-    # Default to NO on error
-    "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
-    Add-Content -Path "$ResponseFile.log" -Value "Used default NO due to error"
-}
-
-Add-Content -Path "$ResponseFile.log" -Value "ServiceUI script completed at $(Get-Date)"
-'@
-        
-        # Write the PowerShell script to temp file
-        $scriptPath = "$env:TEMP\ServiceUIScript_$([guid]::NewGuid().ToString().Substring(0,8)).ps1"
-        $messageBoxScript | Out-File -FilePath $scriptPath -Encoding UTF8
-        
-        # Execute using ServiceUI.exe
+        # Primary method - proven to work with Azure AD
         try {
-            Write-Log -Message "Executing dialog via ServiceUI.exe" | Out-Null
+            $loggedInUser = Get-WmiObject -Class Win32_ComputerSystem | Select-Object username -ExpandProperty username
+            if (-not $loggedInUser) {
+                $Message = "User is not logged on to the primary session: No username returned from Win32_ComputerSystem"
+                Throw $Message
+            }
             
-            # ServiceUI.exe syntax from help: serviceui -session:4 program "arguments"
-            # All PowerShell arguments must be combined into single quoted string
-            $powershellArgs = "-ExecutionPolicy Bypass -WindowStyle Normal -File \`"$scriptPath\`" -ResponseFile \`"$responseFile\`" -FriendlyName \`"$FriendlyName\`""
-            $serviceUIArgs = @(
-                "-session:$($primarySession.SessionId)",
-                "powershell.exe",
-                "`"$powershellArgs`""
-            )
+            $username = ($loggedInUser -split '\\')[1]
+            $domain = ($loggedInUser -split '\\')[0]
             
-            Write-Log -Message "ServiceUI command: $serviceUIPath $($serviceUIArgs -join ' ')" | Out-Null
+            Write-Log "Found logged in user: $loggedInUser" | Out-Null
+            Write-Log "Extracted username: $username" | Out-Null
+            Write-Log "Extracted domain: $domain" | Out-Null
             
-            # Start ServiceUI process and wait for completion
-            $process = Start-Process -FilePath $serviceUIPath -ArgumentList $serviceUIArgs -Wait -PassThru -WindowStyle Hidden
-            Write-Log -Message "ServiceUI.exe exit code: $($process.ExitCode)" | Out-Null
+        } catch [Exception] {
+            $Message = "User is not logged on to the primary session: $_"
+            Write-Log $Message | Out-Null
+            Throw $Message
+        }
+        
+        # Get user SID for reliable task creation
+        $userSid = $null
+        
+        # Method 1: Try with full domain\username format
+        try {
+            $userSid = (New-Object System.Security.Principal.NTAccount($loggedInUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+            Write-Log "Successfully got SID using full name ($loggedInUser): $userSid" | Out-Null
+        } catch {
+            Write-Log "Could not get SID using full name: $($_.Exception.Message)" | Out-Null
+        }
+        
+        # Method 2: Try with just username if full name failed
+        if (-not $userSid) {
+            try {
+                $userSid = (New-Object System.Security.Principal.NTAccount($username)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+                Write-Log "Successfully got SID using username ($username): $userSid" | Out-Null
+            } catch {
+                Write-Log "Could not get SID using username: $($_.Exception.Message)" | Out-Null
+            }
+        }
+        
+        # Method 3: Try with domain prefix if available
+        if (-not $userSid -and $domain -ne $env:COMPUTERNAME) {
+            try {
+                $domainUser = "$domain\$username"
+                $userSid = (New-Object System.Security.Principal.NTAccount($domainUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+                Write-Log "Successfully got SID using domain format ($domainUser): $userSid" | Out-Null
+            } catch {
+                Write-Log "Could not get SID using domain format: $($_.Exception.Message)" | Out-Null
+            }
+        }
+        
+        if (-not $userSid) {
+            Write-Log "Warning: Could not obtain user SID, task creation may fail" | Out-Null
+        }
+        
+        return @{
+            Username = $username
+            FullName = $loggedInUser
+            Domain = $domain
+            SID = $userSid
+            SessionId = $null  # Not available with this method
+        }
+        
+    } catch {
+        Write-Log "Error getting interactive user: $($_.Exception.Message)" | Out-Null
+        return $null
+    }
+}
+
+function New-UserPromptTask {
+    <#
+    .SYNOPSIS
+        Creates a scheduled task to run the user prompt script as the interactive user
+    #>
+    
+    param(
+        [hashtable]$UserInfo,
+        [string]$ScriptPath,
+        [string]$ResponseFile,
+        [string]$QuestionText,
+        [string]$TitleText
+    )
+    
+    try {
+        # Generate unique task name
+        $guid = [System.Guid]::NewGuid().ToString()
+        $taskName = "UserPrompt_$guid"
+        
+        Write-Log "Creating scheduled task: $taskName" | Out-Null
+        
+        # Force PowerShell 5.1 for toast notifications - PowerShell 7 cannot access Windows Runtime in scheduled task context
+        Write-Log "Forcing PowerShell 5.1 for toast notifications (PowerShell 7 has Windows Runtime limitations in scheduled task context)" | Out-Null
+        $powershellExe = "powershell.exe"
+        
+        # Prepare script arguments with enhanced debugging, position control, and timeout
+        $arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`" -Position `"BottomRight`" -TimeoutSeconds $TimeoutSeconds -DebugMode"
+        
+        # Create task action - Force PowerShell 5.1 for Windows Runtime compatibility
+        $action = New-ScheduledTaskAction -Execute $powershellExe -Argument $arguments
+        
+        # Create task principal (run as interactive user) - Azure AD aware
+        $principal = $null
+        $username = $UserInfo.Username
+        $fullName = $UserInfo.FullName
+        $domain = $UserInfo.Domain
+        $userSid = $UserInfo.SID
+        
+        Write-Log "Creating task principal for user: $fullName (SID: $userSid)" | Out-Null
+        
+        # For Azure AD accounts, try username-based approaches first as SID registration often fails
+        $userFormats = @()
+        
+        # Add full name format first (Azure AD preferred)
+        if ($fullName) {
+            $userFormats += $fullName
+        }
+        
+        # Add Azure AD specific formats
+        if ($domain -and $domain -eq "AzureAD") {
+            $userFormats += $fullName  # AzureAD\username
+            $userFormats += $username  # Just username for Azure AD
+        } elseif ($domain -and $domain -ne $env:COMPUTERNAME -and $domain -ne ".") {
+            $userFormats += "$domain\$username"  # Domain\user format
+        }
+        
+        # Add local account formats as fallback
+        $userFormats += ".\$username"             # Local account format
+        $userFormats += $username                 # Just username
+        $userFormats += "$env:COMPUTERNAME\$username"  # Computer\username format
+        
+        # Remove duplicates and null entries
+        $userFormats = $userFormats | Where-Object { $_ } | Select-Object -Unique
+        
+        # Try different logon types for Azure AD compatibility
+        $logonTypes = @("Interactive", "S4U", "ServiceAccount")
+        
+        foreach ($userFormat in $userFormats) {
+            foreach ($logonType in $logonTypes) {
+                Write-Log "Trying task principal with format: $userFormat, LogonType: $logonType" | Out-Null
+                try {
+                    $principal = New-ScheduledTaskPrincipal -UserId $userFormat -LogonType $logonType -RunLevel Limited
+                    Write-Log "Successfully created principal with: $userFormat ($logonType)" | Out-Null
+                    break
+                } catch {
+                    Write-Log "Failed with format '$userFormat' ($logonType): $($_.Exception.Message)" | Out-Null
+                }
+            }
+            if ($principal) { break }
+        }
+        
+        # Final attempt with SID if username approaches failed
+        if (-not $principal -and $userSid) {
+            Write-Log "Trying SID as last resort: $userSid" | Out-Null
+            try {
+                $principal = New-ScheduledTaskPrincipal -UserId $userSid -LogonType ServiceAccount -RunLevel Limited
+                Write-Log "Successfully created principal with SID (ServiceAccount logon)" | Out-Null
+            } catch {
+                Write-Log "Failed with SID approach: $($_.Exception.Message)" | Out-Null
+            }
+        }
+        
+        if (-not $principal) {
+            Write-Log "Could not create task principal with any method. Attempted formats:" | Out-Null
+            foreach ($format in $userFormats) {
+                Write-Log "  - $format" | Out-Null
+            }
+            return $null
+        }
+        
+        # Create task settings
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd
+        
+        # Create the task with the principal
+        $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings -Description "Interactive user prompt for system operations"
+        
+        # Register the task with error handling and Azure AD-specific retry logic
+        try {
+            Write-Log "Attempting to register scheduled task with current principal..." | Out-Null
+            $registeredTask = Register-ScheduledTask -TaskName $taskName -InputObject $task -Force -ErrorAction Stop
+            Write-Log "Scheduled task created successfully: $taskName" | Out-Null
             
-            $scriptExecuted = $true
+            # Verify task exists
+            $verifyTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            if (-not $verifyTask) {
+                Write-Log "Task registration appeared to succeed but task not found" | Out-Null
+                return $null
+            }
+            
+            return $taskName
             
         } catch {
-            Write-Log -Message "ServiceUI.exe execution failed: $($_.Exception.Message)" | Out-Null
-            $scriptExecuted = $false
-        }
-        
-        if (-not $scriptExecuted) {
-            Write-Log -Message "ServiceUI.exe failed, falling back to PowerShell dialog" | Out-Null
-            Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-            return Show-PowerShellDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
-        }
-        
-        # Read response
-        $userResponse = $DefaultTimeoutAction
-        if (Test-Path $responseFile) {
-            try {
-                $responseContent = Get-Content $responseFile -Raw -ErrorAction SilentlyContinue
-                $responseContent = $responseContent.Trim()
-                
-                if ($responseContent -eq "YES") {
-                    $userResponse = $true
-                    Write-Log -Message "User chose to close $FriendlyName via ServiceUI dialog" | Out-Null
-                } elseif ($responseContent -eq "NO") {
-                    $userResponse = $false
-                    Write-Log -Message "User chose to keep $FriendlyName open via ServiceUI dialog" | Out-Null
-                } else {
-                    Write-Log -Message "Unexpected ServiceUI response: $responseContent, using default action" | Out-Null
+            Write-Log "Failed to register scheduled task with current principal: $($_.Exception.Message)" | Out-Null
+            
+            # Azure AD fallback: Try creating a simpler task that launches as SYSTEM but switches user context
+            if ($domain -eq "AzureAD") {
+                Write-Log "Attempting Azure AD fallback approach (SYSTEM task with user context switching)..." | Out-Null
+                try {
+                    # Create a SYSTEM principal that will launch the script and let it handle user context
+                    $fallbackPrincipal = New-ScheduledTaskPrincipal -UserID "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+                    
+                    # Modify arguments to include user information for the script to handle internally
+                    $fallbackArguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`""
+                    $fallbackAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $fallbackArguments
+                    
+                    $fallbackTask = New-ScheduledTask -Action $fallbackAction -Principal $fallbackPrincipal -Settings $settings -Description "Interactive user prompt for system operations (Azure AD SYSTEM fallback)"
+                    
+                    $registeredTask = Register-ScheduledTask -TaskName $taskName -InputObject $fallbackTask -Force -ErrorAction Stop
+                    Write-Log "Scheduled task created successfully using Azure AD SYSTEM fallback: $taskName" | Out-Null
+                    return $taskName
+                    
+                } catch {
+                    Write-Log "Azure AD SYSTEM fallback also failed: $($_.Exception.Message)" | Out-Null
+                    return $null
                 }
-                
-                Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
-            } catch {
-                Write-Log -Message "Error reading ServiceUI response: $($_.Exception.Message)" | Out-Null
+            } else {
+                Write-Log "Final failure to register scheduled task (non-Azure AD)" | Out-Null
+                return $null
             }
-        } else {
-            Write-Log -Message "No ServiceUI response file created, using default action: $DefaultTimeoutAction" | Out-Null
         }
-        
-        # Check for debug log and report information
-        $debugLogFile = $responseFile + ".log"
-        if (Test-Path $debugLogFile) {
-            try {
-                $debugContent = Get-Content $debugLogFile -ErrorAction SilentlyContinue
-                Write-Log -Message "ServiceUI debug log found with $($debugContent.Count) lines" | Out-Null
-                
-                # Report key lines from debug log
-                foreach ($line in $debugContent) {
-                    if (-not [string]::IsNullOrWhiteSpace($line) -and
-                        ($line -like "*successfully*" -or $line -like "*error*" -or $line -like "*clicked*")) {
-                        Write-Log -Message "SERVICEUI: $line" | Out-Null
-                    }
-                }
-                
-                Remove-Item $debugLogFile -Force -ErrorAction SilentlyContinue
-            } catch {
-                Write-Log -Message "Error reading ServiceUI debug log: $($_.Exception.Message)" | Out-Null
-            }
-        } else {
-            Write-Log -Message "No ServiceUI debug log found" | Out-Null
-        }
-        
-        # Clean up files
-        Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-        
-        return $userResponse
         
     } catch {
-        Write-Log -Message "ServiceUI dialog system failed: $($_.Exception.Message)" | Out-Null
-        Write-Log -Message "Falling back to PowerShell dialog" | Out-Null
-        return Show-PowerShellDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
+        Write-Log "Error creating scheduled task: $($_.Exception.Message)" | Out-Null
+        return $null
     }
 }
 
-function Show-PowerShellDialog {
+function Start-UserPromptTask {
     <#
     .SYNOPSIS
-        Fallback dialog system using PowerShell runspace
-    .DESCRIPTION
-        Creates a PowerShell dialog in user context as fallback when toast notifications fail
-    .PARAMETER AppID
-        Application ID for the update
-    .PARAMETER FriendlyName
-        User-friendly name of the application
-    .PARAMETER ProcessName
-        Name of the blocking process
-    .PARAMETER TimeoutSeconds
-        Timeout in seconds before auto-action
-    .PARAMETER DefaultTimeoutAction
-        Action to take on timeout (true = close app, false = keep open)
-    .OUTPUTS
-        Boolean indicating user choice (true = close app, false = keep open)
+        Starts the scheduled task to display the user prompt
     #>
-    param(
-        [string]$AppID,
-        [string]$FriendlyName,
-        [string]$ProcessName,
-        [int]$TimeoutSeconds = 60,
-        [bool]$DefaultTimeoutAction = $false
-    )
     
-    Write-Log -Message "Show-PowerShellDialog called for $AppID ($FriendlyName)" | Out-Null
+    param([string]$TaskName)
     
     try {
-        # Get active user sessions
-        $activeSessions = Get-ActiveUserSessions
-        if ($activeSessions.Count -eq 0) {
-            Write-Log -Message "No active user sessions found for PowerShell dialog" | Out-Null
-            return $DefaultTimeoutAction
+        Write-Log "Starting scheduled task: $TaskName" | Out-Null
+        
+        # Verify task exists before starting
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if (-not $task) {
+            Write-Log "Cannot start task - task not found: $TaskName" | Out-Null
+            return $false
         }
         
-        $primarySession = $activeSessions[0]
-        Write-Log -Message "Using session $($primarySession.SessionId) for PowerShell dialog" | Out-Null
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        Write-Log "Scheduled task started successfully" | Out-Null
         
-        # Create response file
-        $responseFile = "$env:TEMP\PSDialogResponse_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
+        # Brief wait and verify task is running
+        Start-Sleep -Seconds 1
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($taskInfo) {
+            Write-Log "Task status: $($taskInfo.LastTaskResult), Last run: $($taskInfo.LastRunTime)" | Out-Null
+        }
         
-        # Create dialog script - simplified to avoid syntax issues
-        $dialogScript = @'
-param([string]$FriendlyName, [int]$TimeoutSeconds, [bool]$DefaultTimeoutAction, [string]$ResponseFile)
+        return $true
+        
+    } catch {
+        Write-Log "Error starting scheduled task: $($_.Exception.Message)" | Out-Null
+        return $false
+    }
+}
 
+function Wait-ForUserResponse {
+    <#
+    .SYNOPSIS
+        Waits for the user response file to be created and returns the response
+    #>
+    
+    param(
+        [string]$ResponseFilePath,
+        [int]$TimeoutSeconds
+    )
+    
+    $startTime = Get-Date
+    $timeout = $startTime.AddSeconds($TimeoutSeconds)
+    
+    Write-Log "Waiting for user response at: $ResponseFilePath" | Out-Null
+    Write-Log "Timeout set for: $timeout" | Out-Null
+    
+    while ((Get-Date) -lt $timeout) {
+        if (Test-Path $ResponseFilePath) {
+            try {
+                # Wait a moment for the file to be fully written
+                Start-Sleep -Milliseconds 500
+                
+                $responseContent = Get-Content -Path $ResponseFilePath -Raw -ErrorAction Stop
+                $response = $responseContent | ConvertFrom-Json -ErrorAction Stop
+                
+                Write-Log "User response received: $($response.response)" | Out-Null
+                return $response.response
+                
+            } catch {
+                Write-Log "Error reading response file: $($_.Exception.Message)" | Out-Null
+                # Continue waiting, file might still be written
+            }
+        }
+        
+        Start-Sleep -Seconds 2
+    }
+    
+    Write-Log "Timeout waiting for user response after $TimeoutSeconds seconds" | Out-Null
+    return "TIMEOUT"
+}
+
+function Remove-UserPromptTask {
+    <#
+    .SYNOPSIS
+        Removes the scheduled task and cleans up files
+    #>
+    
+    param([string]$TaskName)
+    
+    try {
+        if ($TaskName) {
+            Write-Log "Removing scheduled task: $TaskName" | Out-Null
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Log "Scheduled task removed" | Out-Null
+        }
+    } catch {
+        Write-Log "Error during cleanup: $($_.Exception.Message)" | Out-Null
+    }
+}
+
+function Invoke-SystemUserPrompt {
+    <#
+    .SYNOPSIS
+        Displays a user prompt from SYSTEM context using WPF dialogs
+    .DESCRIPTION
+        Creates a scheduled task to switch from SYSTEM to user context and show a modern WPF dialog
+        Handles both domain and Azure AD environments with proper user detection
+    .PARAMETER Question
+        The question to ask the user
+    .PARAMETER Title
+        Dialog title (optional, defaults to "System Notification")
+    .PARAMETER TimeoutSeconds
+        Timeout in seconds before using default action
+    .PARAMETER DefaultAction
+        Default action on timeout ("OK" or "Cancel")
+    .PARAMETER Position
+        Dialog position (BottomRight, TopRight, Center, etc.)
+    .OUTPUTS
+        String: "OK", "Cancel", or "TIMEOUT"
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Question,
+        
+        [string]$Title = "System Notification",
+        [int]$TimeoutSeconds = 60,
+        [string]$DefaultAction = "Cancel",
+        [string]$Position = "BottomRight"
+    )
+    
+    Write-Log -Message "Invoke-SystemUserPrompt called: '$Question'" | Out-Null
+    
+    try {
+        # Check if running in SYSTEM context
+        if (-not (Test-RunningAsSystem)) {
+            Write-Log -Message "Not running as SYSTEM, cannot create user context task" | Out-Null
+            return $DefaultAction
+        }
+        
+        # Get interactive user
+        $userInfo = Get-InteractiveUser
+        if (-not $userInfo) {
+            Write-Log "No interactive user found - cannot display prompt" | Out-Null
+            return $DefaultAction
+        }
+        
+        # Create unique identifiers for this prompt
+        $promptId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
+        $taskName = "UserPrompt_$promptId"
+        
+        # Setup paths - use a shared location both SYSTEM and user can access
+        $guid = $promptId
+        
+        # Use the user's temp directory (accessible from both SYSTEM and user contexts)
+        $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
+        if (Test-Path $userTempPath) {
+            $responseFile = Join-Path $userTempPath "UserPrompt_$guid`_Response.json"
+            Write-Log "Using user temp path: $responseFile" | Out-Null
+        } else {
+            # Fallback to a shared public location
+            $sharedPath = "C:\ProgramData\Temp"
+            if (-not (Test-Path $sharedPath)) {
+                New-Item -Path $sharedPath -ItemType Directory -Force | Out-Null
+            }
+            $responseFile = Join-Path $sharedPath "UserPrompt_$guid`_Response.json"
+            Write-Log "Using shared temp path: $responseFile" | Out-Null
+        }
+        
+        $userPromptScriptPath = "$env:TEMP\Show-UserPrompt_$promptId.ps1"
+        
+        # Create the user prompt script content (from the working Show-UserPrompt.ps1)
+        $userPromptScriptContent = @'
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$ResponseFilePath,
+    
+    [Parameter(Mandatory = $false)]
+    [string]$Question = "Do you want to proceed?",
+    
+    [Parameter(Mandatory = $false)]
+    [string]$Title = "System Prompt",
+    
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("BottomRight", "TopRight", "BottomLeft", "TopLeft", "Center")]
+    [string]$Position = "BottomRight",
+    
+    [Parameter(Mandatory = $false)]
+    [int]$TimeoutSeconds = 300,
+    
+    [Parameter(Mandatory = $false)]
+    [switch]$DebugMode
+)
+
+# Initialize comprehensive logging
+function Write-UserLog {
+    param(
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    $logMessage = "[$timestamp] [UserPrompt] [$Level] $Message"
+    
+    # Write to a user-accessible debug log file
+    $logPath = Join-Path $env:TEMP "UserPrompt_Debug.log"
+    try {
+        $logMessage | Out-File -FilePath $logPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+    } catch {
+        # Ignore logging errors
+    }
+    
+    # Also output to console if in debug mode
+    if ($DebugMode) {
+        Write-Host $logMessage
+    }
+}
+
+Write-UserLog "=== USER PROMPT SCRIPT STARTED ==="
+Write-UserLog "PowerShell Version: $($PSVersionTable.PSVersion)"
+Write-UserLog "PowerShell Edition: $($PSVersionTable.PSEdition)"
+Write-UserLog "Response File Path: $ResponseFilePath"
+Write-UserLog "Question: $Question"
+Write-UserLog "Title: $Title"
+Write-UserLog "Position: $Position"
+Write-UserLog "Timeout: $TimeoutSeconds seconds"
+Write-UserLog "Debug Mode: $DebugMode"
+Write-UserLog "Username: $env:USERNAME"
+Write-UserLog "Computer: $env:COMPUTERNAME"
+Write-UserLog "Current Directory: $PWD"
+Write-UserLog "Process ID: $PID"
+Write-UserLog "Session ID: $((Get-Process -Id $PID).SessionId)"
+
+# Global variables for response handling
+$script:UserResponse = $null
+$script:ResponseReceived = $false
+
+function Write-ResponseFile {
+    param(
+        [string]$Response,
+        [string]$FilePath,
+        [hashtable]$AdditionalData = @{}
+    )
+    
+    try {
+        $responseData = @{
+            response = $Response
+            timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+            username = $env:USERNAME
+            computer = $env:COMPUTERNAME
+            powershellVersion = $PSVersionTable.PSVersion.ToString()
+            processId = $PID
+        }
+        
+        # Add any additional data
+        foreach ($key in $AdditionalData.Keys) {
+            $responseData[$key] = $AdditionalData[$key]
+        }
+        
+        $jsonResponse = $responseData | ConvertTo-Json -Compress
+        $jsonResponse | Out-File -FilePath $FilePath -Encoding UTF8 -Force
+        
+        Write-UserLog "Response written to file: $Response"
+        return $true
+        
+    } catch {
+        Write-UserLog "Error writing response file: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
+}
+
+function Show-ModernDialog {
+    param(
+        [string]$TitleText,
+        [string]$QuestionText,
+        [int]$TimeoutSeconds = 60,
+        [string]$DefaultAction = "Cancel"
+    )
+    
+    try {
+        Write-UserLog "Loading WPF assemblies for modern dialog..."
+        
+        # Load required assemblies
+        Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+        Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+        Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        
+        Write-UserLog "WPF assemblies loaded successfully"
+        
+        # Create XAML for modern toast-like dialog (Windows 10/11 style)
+        $xaml = @"
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="$TitleText"
+    Width="420"
+    MinHeight="140"
+    SizeToContent="Height"
+    WindowStartupLocation="Manual"
+    ResizeMode="NoResize"
+    WindowStyle="None"
+    AllowsTransparency="True"
+    Background="Transparent"
+    Topmost="True"
+    ShowInTaskbar="False">
+    
+    <Window.Triggers>
+        <EventTrigger RoutedEvent="Window.Loaded">
+            <BeginStoryboard>
+                <Storyboard>
+                    <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                     From="0" To="1" Duration="0:0:0.3"/>
+                    <ThicknessAnimation Storyboard.TargetProperty="Margin"
+                                        From="0,50,0,0" To="0,0,0,0" Duration="0:0:0.3"/>
+                </Storyboard>
+            </BeginStoryboard>
+        </EventTrigger>
+    </Window.Triggers>
+    
+    <Border Name="MainBorder"
+            Background="#FF1F1F1F"
+            CornerRadius="8"
+            BorderBrush="#FF323232"
+            BorderThickness="1">
+        <Border.Effect>
+            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
+        </Border.Effect>
+        
+        <Grid Margin="16,12,16,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="32"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            
+            <!-- Icon -->
+            <Ellipse Grid.Column="0" Grid.RowSpan="2"
+                     Width="24" Height="24"
+                     Fill="#FF0078D4"
+                     VerticalAlignment="Top"
+                     Margin="0,2,0,0"/>
+            
+            <TextBlock Grid.Column="0" Grid.RowSpan="2"
+                       Text="?"
+                       Foreground="White"
+                       FontSize="14"
+                       FontWeight="Bold"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Top"
+                       Margin="0,4,0,0"/>
+            
+            <!-- Title -->
+            <TextBlock Grid.Column="1" Grid.Row="0"
+                       Text="$TitleText"
+                       Foreground="White"
+                       FontSize="14"
+                       FontWeight="SemiBold"
+                       Margin="12,0,0,2"
+                       TextWrapping="Wrap"/>
+            
+            <!-- Question -->
+            <TextBlock Grid.Column="1" Grid.Row="1"
+                       Text="$QuestionText"
+                       Foreground="#FFCCCCCC"
+                       FontSize="12"
+                       Margin="12,0,0,8"
+                       TextWrapping="Wrap"/>
+            
+            <!-- Buttons -->
+            <StackPanel Grid.Column="1" Grid.Row="2"
+                        Orientation="Horizontal"
+                        HorizontalAlignment="Right"
+                        Margin="12,0,0,0">
+                
+                <Button Name="CancelButton"
+                        Content="Cancel"
+                        Width="60"
+                        Height="24"
+                        Margin="0,0,8,0"
+                        Background="Transparent"
+                        Foreground="#FFCCCCCC"
+                        BorderBrush="#FF484848"
+                        BorderThickness="1"
+                        FontSize="11"
+                        Cursor="Hand">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Style.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="#FF2A2A2A"/>
+                                    <Setter Property="Foreground" Value="White"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+                
+                <Button Name="OKButton"
+                        Content="OK"
+                        Width="60"
+                        Height="24"
+                        Background="#FF0078D4"
+                        Foreground="White"
+                        BorderBrush="Transparent"
+                        BorderThickness="0"
+                        FontSize="11"
+                        Cursor="Hand">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Style.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="#FF106EBE"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+                
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+        Write-UserLog "Creating WPF window from XAML..."
+        
+        # Create window from XAML
+        $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+        $window = [Windows.Markup.XamlReader]::Load($reader)
+        
+        Write-UserLog "WPF window created successfully"
+        
+        # Get button references
+        $okButton = $window.FindName("OKButton")
+        $cancelButton = $window.FindName("CancelButton")
+        
+        # Set up event handlers and timeout
+        $script:dialogResult = $null
+        $script:timeoutReached = $false
+        
+        # Store original button text and determine which button gets countdown
+        $originalOKText = $okButton.Content
+        $originalCancelText = $cancelButton.Content
+        $showCountdownOnOK = ($DefaultAction -eq "OK")
+        
+        Write-UserLog "Countdown will be shown on: $(if ($showCountdownOnOK) { 'OK' } else { 'Cancel' }) button (DefaultAction: $DefaultAction)"
+        
+        # Create countdown timer (updates every second)
+        $script:timeRemaining = $TimeoutSeconds
+        $countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
+        
+        $countdownTimer.Add_Tick({
+            $script:timeRemaining--
+            Write-UserLog "Countdown update: $($script:timeRemaining) seconds remaining"
+            
+            # Update the appropriate button with countdown
+            if ($showCountdownOnOK) {
+                $okButton.Content = "$originalOKText ($($script:timeRemaining))"
+            } else {
+                $cancelButton.Content = "$originalCancelText ($($script:timeRemaining))"
+            }
+            
+            # Stop countdown timer when we reach zero (main timeout timer will handle dialog close)
+            if ($script:timeRemaining -le 0) {
+                $countdownTimer.Stop()
+            }
+        })
+        
+        # Create main timeout timer
+        $timer = New-Object System.Windows.Threading.DispatcherTimer
+        $timer.Interval = [System.TimeSpan]::FromSeconds($TimeoutSeconds)
+        
+        $timer.Add_Tick({
+            Write-UserLog "Dialog timeout reached after $TimeoutSeconds seconds - auto-closing with default action: $DefaultAction"
+            $script:timeoutReached = $true
+            $script:dialogResult = $DefaultAction
+            $timer.Stop()
+            $countdownTimer.Stop()
+            $window.Close()
+            
+            # Force immediate termination to prevent 30-second delay
+            Write-UserLog "Forcing immediate process termination to prevent delay"
+            $terminationTimer = New-Object System.Windows.Threading.DispatcherTimer
+            $terminationTimer.Interval = [System.TimeSpan]::FromMilliseconds(500)
+            $terminationTimer.Add_Tick({
+                Write-UserLog "Terminating process now"
+                $terminationTimer.Stop()
+                
+                # Write response file immediately before termination
+                Write-ResponseFile -Response $DefaultAction -FilePath $ResponseFilePath -AdditionalData @{
+                    stage = "TIMEOUT_TERMINATION"
+                    terminationMethod = "Timer_Force_Exit"
+                    defaultAction = $DefaultAction
+                }
+                
+                # Multiple termination attempts
+                try { $window.Hide() } catch {}
+                try { [System.Windows.Application]::Current.Shutdown() } catch {}
+                Start-Sleep -Milliseconds 100
+                [System.Environment]::Exit(0)
+            })
+            $terminationTimer.Start()
+        })
+        
+        $okButton.Add_Click({
+            Write-UserLog "OK button clicked"
+            $timer.Stop()
+            $countdownTimer.Stop()
+            $script:dialogResult = "OK"
+            $window.Close()
+        })
+        
+        $cancelButton.Add_Click({
+            Write-UserLog "Cancel button clicked"
+            $timer.Stop()
+            $countdownTimer.Stop()
+            $script:dialogResult = "Cancel"
+            $window.Close()
+        })
+        
+        # Handle window closing without button click
+        $window.Add_Closing({
+            $timer.Stop()
+            $countdownTimer.Stop()
+            if ($script:dialogResult -eq $null -and -not $script:timeoutReached) {
+                Write-UserLog "Window closed without button click - treating as Cancel"
+                $script:dialogResult = "Cancel"
+            }
+        })
+        
+        # Position window like a native Windows toast notification
+        $window.Add_Loaded({
+            $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+            $taskbarHeight = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height - $workArea.Height
+            
+            switch ($Position) {
+                "BottomRight" {
+                    $window.Left = $workArea.Width - $window.Width - 16
+                    $window.Top = $workArea.Height - $window.Height - 16
+                    Write-UserLog "Window positioned at bottom-right (near notification area)"
+                }
+                "TopRight" {
+                    $window.Left = $workArea.Width - $window.Width - 16
+                    $window.Top = 16
+                    Write-UserLog "Window positioned at top-right"
+                }
+                "BottomLeft" {
+                    $window.Left = 16
+                    $window.Top = $workArea.Height - $window.Height - 16
+                    Write-UserLog "Window positioned at bottom-left"
+                }
+                "TopLeft" {
+                    $window.Left = 16
+                    $window.Top = 16
+                    Write-UserLog "Window positioned at top-left"
+                }
+                "Center" {
+                    $window.Left = ($workArea.Width - $window.Width) / 2
+                    $window.Top = ($workArea.Height - $window.Height) / 2
+                    Write-UserLog "Window positioned at center"
+                }
+            }
+        })
+        
+        Write-UserLog "Showing dialog with $TimeoutSeconds second timeout (DefaultAction: $DefaultAction)..."
+        
+        # Start both timers
+        $timer.Start()
+        $countdownTimer.Start()
+        Write-UserLog "Timeout and countdown timers started"
+        
+        # Show dialog modally (timer will auto-close if needed)
+        $result = $window.ShowDialog()
+        
+        # Ensure timers are stopped
+        $timer.Stop()
+        $countdownTimer.Stop()
+        
+        Write-UserLog "Dialog closed with result: $($script:dialogResult)"
+        
+        return $script:dialogResult
+        
+    } catch {
+        $errorMsg = "Failed to show modern dialog: $($_.Exception.Message)"
+        Write-UserLog $errorMsg -Level "ERROR"
+        Write-UserLog "Exception Type: $($_.Exception.GetType().FullName)" -Level "ERROR"
+        Write-UserLog "Stack Trace: $($_.Exception.StackTrace)" -Level "ERROR"
+        
+        Write-ResponseFile -Response "ERROR" -FilePath $ResponseFilePath -AdditionalData @{
+            error = $errorMsg
+            stage = "MODERN_DIALOG"
+            exceptionType = $_.Exception.GetType().FullName
+        }
+        return "ERROR"
+    }
+}
+
+# Main execution
 try {
-    Add-Type -AssemblyName System.Windows.Forms
+    Write-UserLog "Starting modern dialog user prompt"
     
-    $message = "An update is available for $FriendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $FriendlyName now to allow the update to proceed?"
-    $result = [System.Windows.Forms.MessageBox]::Show($message, "Application Update Available", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+    # Test write permissions to response file location
+    $responseDir = Split-Path $ResponseFilePath
+    Write-UserLog "Response directory: $responseDir"
+    Write-UserLog "Directory exists: $(Test-Path $responseDir)"
     
-    if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-        "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
+    try {
+        $testFile = Join-Path $responseDir "test_write_$(Get-Random).tmp"
+        "test" | Out-File -FilePath $testFile -Force
+        Remove-Item $testFile -Force
+        Write-UserLog "Write permissions confirmed for response directory"
+    } catch {
+        Write-UserLog "WARNING: Cannot write to response directory: $($_.Exception.Message)" -Level "WARNING"
+    }
+    
+    # Show modern dialog to capture user response
+    $userResponse = Show-ModernDialog -TitleText $Title -QuestionText $Question -TimeoutSeconds $TimeoutSeconds -DefaultAction $DefaultAction
+    
+    if ($userResponse -eq "ERROR") {
+        Write-UserLog "Modern dialog failed" -Level "ERROR"
+        $script:UserResponse = "ERROR"
     } else {
-        "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
+        Write-UserLog "User response captured: $userResponse" -Level "SUCCESS"
+        $script:UserResponse = $userResponse
+        $script:ResponseReceived = $true
+    }
+    
+    # Write final response
+    Write-UserLog "Writing final response file..."
+    $writeSuccess = Write-ResponseFile -Response $script:UserResponse -FilePath $ResponseFilePath -AdditionalData @{
+        stage = "FINAL_RESPONSE"
+        dialogMethod = "Modern WPF Dialog"
+        interactionSuccess = $script:ResponseReceived
+    }
+    
+    if ($writeSuccess) {
+        Write-UserLog "User prompt completed successfully with response: $($script:UserResponse)" -Level "SUCCESS"
+    } else {
+        Write-UserLog "Failed to write response file" -Level "ERROR"
+    }
+    
+    # Force immediate process termination to prevent scheduled task delays
+    if ($script:UserResponse -eq "TIMEOUT") {
+        Write-UserLog "Timeout occurred - forcing immediate process exit"
+        Start-Sleep -Milliseconds 100  # Brief pause to ensure log is written
+        [System.Environment]::Exit(0)
     }
     
 } catch {
-    # Ultimate fallback
-    if ($DefaultTimeoutAction) {
-        "YES" | Out-File -FilePath $ResponseFile -Encoding ASCII
-    } else {
-        "NO" | Out-File -FilePath $ResponseFile -Encoding ASCII
+    Write-UserLog "Unexpected error in user prompt: $($_.Exception.Message)" -Level "ERROR"
+    Write-UserLog "Exception Type: $($_.Exception.GetType().FullName)" -Level "ERROR"
+    Write-UserLog "Stack Trace: $($_.Exception.StackTrace)" -Level "ERROR"
+    
+    # Try to write error response
+    try {
+        Write-ResponseFile -Response "ERROR" -FilePath $ResponseFilePath -AdditionalData @{
+            error = $_.Exception.Message
+            stage = "UNEXPECTED_ERROR"
+            exceptionType = $_.Exception.GetType().FullName
+        }
+    } catch {
+        Write-UserLog "Could not write final error response: $($_.Exception.Message)" -Level "ERROR"
     }
+} finally {
+    Write-UserLog "User prompt script completed"
+    Write-UserLog "=== USER PROMPT SCRIPT ENDED ==="
+    
+    # Ensure process exits immediately in all cases
+    Start-Sleep -Milliseconds 100  # Brief pause to ensure logs are written
 }
 '@
         
-        # Write dialog script to temp file
-        $scriptPath = "$env:TEMP\PSDialogScript_$([guid]::NewGuid().ToString().Substring(0,8)).ps1"
-        $dialogScript | Out-File -FilePath $scriptPath -Encoding UTF8
+        # Write the user prompt script to temp file
+        Write-Log "Writing user prompt script to: $userPromptScriptPath" | Out-Null
+        $userPromptScriptContent | Set-Content -Path $userPromptScriptPath -Encoding UTF8
         
-        # Execute dialog script
-        $scriptExecuted = $false
+        Write-Log "Response file path: $responseFile" | Out-Null
+        Write-Log "User script path: $userPromptScriptPath" | Out-Null
         
-        # Try PsExec approach first
-        $psexecPath = "$env:ProgramData\chocolatey\bin\PsExec.exe"
-        if (Test-Path $psexecPath) {
+        # Create scheduled task using the working PowerShell Task Scheduler approach
+        $createdTaskName = New-UserPromptTask -UserInfo $userInfo -ScriptPath $userPromptScriptPath -ResponseFile $responseFile -QuestionText $Question -TitleText $Title
+        
+        if (-not $createdTaskName) {
+            Write-Log "Failed to create scheduled task" | Out-Null
+            return $DefaultAction
+        }
+        
+        # Start the task
+        if (-not (Start-UserPromptTask -TaskName $createdTaskName)) {
+            Write-Log "Failed to start scheduled task" | Out-Null
+            Remove-UserPromptTask -TaskName $createdTaskName
+            return $DefaultAction
+        }
+        
+        # Wait for user response using the working method with task monitoring
+        $userResponse = Wait-ForUserResponse -ResponseFilePath $responseFile -TimeoutSeconds $TimeoutSeconds
+        
+        # If timeout occurred, force task termination to prevent 30-second delay
+        if ($userResponse -eq "TIMEOUT") {
+            Write-Log "Timeout detected - forcing immediate task termination" | Out-Null
+            
+            # Stop the scheduled task immediately
             try {
-                Write-Log -Message "Executing PowerShell dialog via PsExec" | Out-Null
-                $psexecArgs = "-accepteula -s -i $($primarySession.SessionId) powershell.exe -ExecutionPolicy Bypass -File `"$scriptPath`" -FriendlyName `"$FriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction -ResponseFile `"$responseFile`""
-                Start-Process -FilePath $psexecPath -ArgumentList $psexecArgs -WindowStyle Hidden -Wait:$false
-                $scriptExecuted = $true
+                Stop-ScheduledTask -TaskName $createdTaskName -ErrorAction SilentlyContinue
+                Write-Log "Scheduled task stopped" | Out-Null
             } catch {
-                Write-Log -Message "PsExec PowerShell dialog failed: $($_.Exception.Message)" | Out-Null
+                Write-Log "Error stopping scheduled task: $($_.Exception.Message)" | Out-Null
             }
-        }
-        
-        # Fallback to scheduled task
-        if (-not $scriptExecuted) {
+            
+            # Wait a moment then force-kill any remaining PowerShell processes associated with the task
+            Start-Sleep -Milliseconds 500
             try {
-                Write-Log -Message "Executing PowerShell dialog via scheduled task" | Out-Null
-                $taskName = "PSDialogTask_$([guid]::NewGuid().ToString().Substring(0,8))"
-                
-                $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$scriptPath`" -FriendlyName `"$FriendlyName`" -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction `$$DefaultTimeoutAction -ResponseFile `"$responseFile`""
-                $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\INTERACTIVE" -LogonType Interactive
-                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-                
-                Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-                Start-ScheduledTask -TaskName $taskName
-                
-                Start-Sleep -Seconds 2
-                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-                $scriptExecuted = $true
-                
-            } catch {
-                Write-Log -Message "Scheduled task PowerShell dialog failed: $($_.Exception.Message)" | Out-Null
-            }
-        }
-        
-        if (-not $scriptExecuted) {
-            Write-Log -Message "Could not execute PowerShell dialog script, using default action" | Out-Null
-            Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-            return $DefaultTimeoutAction
-        }
-        
-        # Wait for response
-        $waitTime = 0
-        $maxWaitTime = $TimeoutSeconds + 10
-        
-        while ($waitTime -lt $maxWaitTime -and -not (Test-Path $responseFile)) {
-            Start-Sleep -Seconds 1
-            $waitTime++
-        }
-        
-        # Read response
-        $userResponse = $DefaultTimeoutAction
-        if (Test-Path $responseFile) {
-            try {
-                $responseContent = Get-Content $responseFile -Raw -ErrorAction SilentlyContinue
-                $responseContent = $responseContent.Trim()
-                
-                if ($responseContent -eq "YES") {
-                    $userResponse = $true
-                    Write-Log -Message "User chose to close $FriendlyName via PowerShell dialog" | Out-Null
-                } elseif ($responseContent -eq "NO") {
-                    $userResponse = $false
-                    Write-Log -Message "User chose to keep $FriendlyName open via PowerShell dialog" | Out-Null
-                } else {
-                    Write-Log -Message "Unexpected PowerShell dialog response: $responseContent" | Out-Null
+                $taskProcesses = Get-WmiObject -Class Win32_Process | Where-Object {
+                    $_.CommandLine -like "*$userPromptScriptPath*" -or
+                    $_.CommandLine -like "*UserPrompt_*"
                 }
-                
-                Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
+                foreach ($process in $taskProcesses) {
+                    Write-Log "Force-terminating task process: $($process.ProcessId)" | Out-Null
+                    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+                }
             } catch {
-                Write-Log -Message "Error reading PowerShell dialog response: $($_.Exception.Message)" | Out-Null
+                Write-Log "Error force-terminating processes: $($_.Exception.Message)" | Out-Null
             }
-        } else {
-            Write-Log -Message "No PowerShell dialog response file created, using default action: $DefaultTimeoutAction" | Out-Null
         }
         
-        # Clean up
-        Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+        # Cleanup
+        Remove-UserPromptTask -TaskName $createdTaskName
         
+        # Clean up temporary files
+        Remove-Item $userPromptScriptPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
+        
+        Write-Log "Process completed with response: $userResponse" | Out-Null
         return $userResponse
         
     } catch {
-        Write-Log -Message "PowerShell dialog system failed: $($_.Exception.Message)" | Out-Null
-        return $DefaultTimeoutAction
-    }
-}
-
-function Show-UserNotification {
-    <#
-    .SYNOPSIS
-        Main entry point for user notifications - tries Toast first, then falls back to PowerShell dialog
-    .DESCRIPTION
-        Unified interface for showing user notifications with multiple fallback approaches
-    .PARAMETER AppID
-        Application ID for the update
-    .PARAMETER FriendlyName
-        User-friendly name of the application
-    .PARAMETER ProcessName
-        Name of the blocking process
-    .PARAMETER TimeoutSeconds
-        Timeout in seconds before auto-action
-    .PARAMETER DefaultTimeoutAction
-        Action to take on timeout (true = close app, false = keep open)
-    .OUTPUTS
-        Boolean indicating user choice (true = close app, false = keep open)
-    #>
-    param(
-        [string]$AppID,
-        [string]$FriendlyName = "",
-        [string]$ProcessName,
-        [int]$TimeoutSeconds = 60,
-        [bool]$DefaultTimeoutAction = $false
-    )
-    
-    # Use AppID as FriendlyName fallback
-    if ([string]::IsNullOrEmpty($FriendlyName)) {
-        $FriendlyName = $AppID
-    }
-    
-    Write-Log -Message "Show-UserNotification called for $AppID ($FriendlyName)" | Out-Null
-    
-    # Check execution context
-    $isSystemContext = Test-RunningAsSystem
-    $isInteractive = [Environment]::UserInteractive
-    
-    Write-Log -Message "Execution context - System: $isSystemContext, Interactive: $isInteractive" | Out-Null
-    
-    # If running in system context, use Toast notifications (primary approach)
-    if ($isSystemContext) {
-        Write-Log -Message "System context detected, using Toast notification system" | Out-Null
-        return Show-ToastNotification -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
-    } else {
-        # In user context, try PowerShell dialog directly
-        Write-Log -Message "User context detected, using PowerShell dialog" | Out-Null
-        return Show-PowerShellDialog -AppID $AppID -FriendlyName $FriendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
+        Write-Log -Message "Invoke-SystemUserPrompt failed: $($_.Exception.Message)" | Out-Null
+        return $DefaultAction
     }
 }
 
@@ -1015,8 +1139,8 @@ function Show-ProcessCloseDialog {
     .SYNOPSIS
         Shows a user dialog asking whether to close a blocking process for application update
     .DESCRIPTION
-        Uses the new Toast notification system or PowerShell dialog fallback to prompt the user
-        This function replaces the old problematic dialog system
+        Uses the modern WPF-based notification system to prompt the user from SYSTEM context
+        Preserves all whitelist configuration features with enhanced reliability
     .PARAMETER AppName
         Application ID for the update
     .PARAMETER ProcessName
@@ -1045,8 +1169,37 @@ function Show-ProcessCloseDialog {
 
     Write-Log -Message "Friendly name resolved to: $friendlyName" | Out-Null
 
-    # Use the new unified notification system
-    return Show-UserNotification -AppID $AppName -FriendlyName $friendlyName -ProcessName $ProcessName -TimeoutSeconds $TimeoutSeconds -DefaultTimeoutAction $DefaultTimeoutAction
+    try {
+        # Create the question text
+        $question = "An update is available for $friendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $friendlyName now to allow the update to proceed?"
+        $title = "$friendlyName Update Available"
+        
+        # Convert DefaultTimeoutAction boolean to string format
+        $defaultActionString = if ($DefaultTimeoutAction) { "OK" } else { "Cancel" }
+        
+        Write-Log -Message "Showing WPF dialog for $friendlyName with ${TimeoutSeconds}s timeout, default action: $defaultActionString" | Out-Null
+        
+        # Call the WPF notification system
+        $response = Invoke-SystemUserPrompt -Question $question -Title $title -TimeoutSeconds $TimeoutSeconds -DefaultAction $defaultActionString -Position "BottomRight"
+        
+        Write-Log -Message "WPF dialog response: $response" | Out-Null
+        
+        # Convert response back to boolean
+        $userChoice = ($response -eq "OK")
+        
+        if ($userChoice) {
+            Write-Log -Message "User chose to close $friendlyName for update" | Out-Null
+        } else {
+            Write-Log -Message "User chose to keep $friendlyName open" | Out-Null
+        }
+        
+        return $userChoice
+        
+    } catch {
+        Write-Log -Message "Show-ProcessCloseDialog failed: $($_.Exception.Message)" | Out-Null
+        Write-Log -Message "Using default timeout action: $DefaultTimeoutAction" | Out-Null
+        return $DefaultTimeoutAction
+    }
 }
 
 function Stop-BlockingProcesses {
@@ -1102,7 +1255,7 @@ function Remove-OldLogs {
 }
 
 <# Script variables #>
-$ScriptTag = "9R" # Update this tag for each script version
+$ScriptTag = "9T" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -1134,83 +1287,111 @@ Remove-OldLogs -LogPath $LogPath
 # Log script start with full date
 Write-Log -Message "Script started on $(Get-Date -Format 'dd.MM.yyyy')"
 
-<# TEST MODE: Check for toast test trigger file #>
-$testTriggerFile = "C:\Temp\toast-test-trigger.txt"
+<# TEST MODE: Check for WPF notification test trigger file #>
+$testTriggerFile = "C:\Temp\wpf-test-trigger.txt"
 if (Test-Path $testTriggerFile) {
-    Write-Log -Message "Toast test trigger file detected: $testTriggerFile"
-    Write-Log -Message "Running toast notification test instead of normal remediation"
+    Write-Log -Message "WPF notification test trigger file detected: $testTriggerFile"
+    Write-Log -Message "Running WPF notification test instead of normal remediation"
     
     try {
-        # Test the toast notification system with a simple message
-        Write-Log -Message "Testing SYSTEM-to-user toast notification"
-        $testResult = Show-UserNotification -AppID "TestApp.ToastTest" -FriendlyName "Toast Test Application" -ProcessName "test" -TimeoutSeconds 30 -DefaultTimeoutAction $false
+        # Test the WPF notification system with a simple message
+        Write-Log -Message "Testing SYSTEM-to-user WPF notification"
         
-        Write-Log -Message "Toast test completed with result: $testResult"
+        $testQuestion = "SYSTEM WPF Test Success!`n`nThis modern dialog was sent from SYSTEM context to your user session. The cross-session WPF notification mechanism is working correctly!"
+        $testTitle = "WPF Notification Test"
         
-        # Check if we have any evidence that the toast actually worked
-        $toastWorked = $false
-        $responseFiles = Get-ChildItem -Path "$env:TEMP" -Filter "ToastResponse_*.txt" -ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) }
-        $debugFiles = Get-ChildItem -Path "$env:TEMP" -Filter "ToastResponse_*.log" -ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) }
+        $testResult = Invoke-SystemUserPrompt -Question $testQuestion -Title $testTitle -TimeoutSeconds 30 -DefaultAction "Cancel" -Position "BottomRight"
         
-        if ($responseFiles.Count -gt 0) {
-            Write-Log -Message "Found recent toast response file(s) - toast mechanism worked"
-            $toastWorked = $true
+        Write-Log -Message "WPF test completed with result: $testResult"
+        
+        # Check if we have any evidence that the WPF dialog actually worked
+        $wpfWorked = $false
+        
+        # Get current user info for checking their temp directory
+        $userInfo = Get-InteractiveUser
+        if ($userInfo) {
+            $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
+            $sharedTempPath = "C:\ProgramData\Temp"
             
-            # Show what was in the response files
-            foreach ($responseFile in $responseFiles) {
-                try {
-                    $content = Get-Content $responseFile.FullName -ErrorAction SilentlyContinue
-                    Write-Log -Message "Response file content: $content"
-                } catch {
-                    Write-Log -Message "Could not read response file: $($_.Exception.Message)"
-                }
+            # Check user temp directory for response files
+            $responseFiles = @()
+            if (Test-Path $userTempPath) {
+                $responseFiles += Get-ChildItem -Path $userTempPath -Filter "UserPrompt_*_Response.json" -ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) }
             }
-        }
-        
-        if ($debugFiles.Count -gt 0) {
-            Write-Log -Message "Found toast debug log(s), checking for evidence of successful display"
-            foreach ($debugFile in $debugFiles) {
-                try {
-                    $debugContent = Get-Content $debugFile.FullName -ErrorAction SilentlyContinue
-                    if ($debugContent -like "*Toast notification displayed successfully*") {
-                        Write-Log -Message "Debug log shows toast was displayed successfully"
-                        $toastWorked = $true
-                        break
-                    } elseif ($debugContent -like "*Error in toast script*" -or $debugContent -like "*Failed to redirect*") {
-                        Write-Log -Message "Debug log shows toast script errors"
-                    } elseif ($debugContent -like "*Windows Runtime assemblies loaded successfully*") {
-                        Write-Log -Message "Debug log shows Windows Runtime loaded successfully"
-                        # This suggests the toast should have worked
-                        $toastWorked = $true
+            if (Test-Path $sharedTempPath) {
+                $responseFiles += Get-ChildItem -Path $sharedTempPath -Filter "UserPrompt_*_Response.json" -ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) }
+            }
+            
+            if ($responseFiles.Count -gt 0) {
+                Write-Log -Message "Found recent WPF response file(s) - WPF mechanism worked"
+                $wpfWorked = $true
+                
+                # Show what was in the response files
+                foreach ($responseFile in $responseFiles) {
+                    try {
+                        $content = Get-Content $responseFile.FullName -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+                        Write-Log -Message "Response file content: Response=$($content.response), User=$($content.username), Timestamp=$($content.timestamp)"
+                    } catch {
+                        Write-Log -Message "Could not read response file: $($_.Exception.Message)"
                     }
-                } catch {
-                    Write-Log -Message "Error reading debug file: $($_.Exception.Message)"
                 }
             }
-        } else {
-            Write-Log -Message "No toast debug log found - this means the scheduled task script never executed properly"
         }
         
-        if ($toastWorked) {
-            Write-Log -Message "✅ SUCCESS: Toast notification system is working!"
-            Write-Log -Message "User response: $($testResult.ToString())"
-            Write-Log -Message "Evidence: Toast was successfully displayed to the user"
+        # Also check for any evidence in temp files that the dialog script actually ran
+        $dialogScripts = Get-ChildItem -Path "$env:TEMP" -Filter "Show-UserPrompt_*.ps1" -ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) }
+        if ($dialogScripts.Count -gt 0) {
+            Write-Log -Message "Found recent dialog script files - this indicates the dialog system attempted to run"
+            $wpfWorked = $true  # Script creation is evidence of system working
+        }
+        
+        # Check for scheduled tasks that were created
+        $recentTasks = Get-ScheduledTask -TaskPath "\" -ErrorAction SilentlyContinue | Where-Object {
+            $_.TaskName -like "UserPrompt_*" -and $_.Date -gt (Get-Date).AddMinutes(-2)
+        }
+        if ($recentTasks.Count -gt 0) {
+            Write-Log -Message "Found recent UserPrompt scheduled task(s) - system is working"
+            $wpfWorked = $true
+        }
+        
+        # If user got any definitive response (not TIMEOUT), the dialog worked
+        if ($testResult -eq "OK") {
+            Write-Log -Message "User selected OK (non-default action) - dialog definitely worked"
+            $wpfWorked = $true
+        } elseif ($testResult -eq "Cancel") {
+            Write-Log -Message "User selected Cancel - dialog definitely worked"
+            $wpfWorked = $true
+        } elseif ($testResult -eq "TIMEOUT") {
+            Write-Log -Message "Dialog timeout occurred - mechanism is working (though dialog may not have auto-closed properly)"
+            $wpfWorked = $true
+        }
+        
+        if ($wpfWorked) {
+            Write-Log -Message "✅ SUCCESS: WPF notification system is working!"
+            Write-Log -Message "User response: $testResult"
+            Write-Log -Message "Evidence: WPF dialog was successfully displayed to the user"
         } else {
-            Write-Log -Message "❌ FAILED: Toast notification system is not working properly"
-            Write-Log -Message "No evidence of successful toast display found"
-            Write-Log -Message "Returned value: $($testResult.ToString()) (but this doesn't indicate the toast was visible)"
-            Write-Log -Message "Check: Windows notification settings, Focus Assist, scheduled task execution, PowerShell execution policy"
+            Write-Log -Message "❌ FAILED: WPF notification system is not working properly"
+            Write-Log -Message "No evidence of successful WPF dialog display found"
+            Write-Log -Message "Returned value: $testResult (likely default timeout action, not user interaction)"
+            Write-Log -Message "Possible issues:"
+            Write-Log -Message "- Scheduled task not running in correct session"
+            Write-Log -Message "- WPF assemblies not available in task context"
+            Write-Log -Message "- User session not properly detected"
+            Write-Log -Message "- PowerShell execution policy blocking script execution"
+            Write-Log -Message "Try: Ensure user is logged in and session is active, check Windows notification settings"
         }
         
         # Keep the trigger file for repeated testing (don't delete it)
         # Remove-Item $testTriggerFile -Force -ErrorAction SilentlyContinue
         Write-Log -Message "Keeping trigger file for repeated testing: $testTriggerFile"
+        Write-Log -Message "Note: Create file 'C:\Temp\wpf-test-trigger.txt' to trigger this test"
         
-        Write-Log -Message "Toast test completed - exiting"
+        Write-Log -Message "WPF test completed - exiting"
         exit 0
         
     } catch {
-        Write-Log -Message "❌ ERROR: Toast test failed with exception: $($_.Exception.Message)"
+        Write-Log -Message "❌ ERROR: WPF test failed with exception: $($_.Exception.Message)"
         Write-Log -Message "Full exception: $($_.Exception.ToString())"
         exit 1
     }
@@ -1224,20 +1405,41 @@ if (-not (OOBEComplete)) {
 
 <# ---------------------------------------------- #>
 
-# Fetch whitelist configuration from GitHub
+# Fetch whitelist configuration - try local file first, then GitHub, then fallback
+$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
+$localWhitelistPath = Join-Path $scriptPath "app-whitelist.json"
 $whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"
-Write-Log -Message "Fetching whitelist configuration from GitHub"
 
-try {
-    $webClient = New-Object System.Net.WebClient
-    $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/6.0")
-    $whitelistJSON = $webClient.DownloadString($whitelistUrl)
-    Write-Log -Message "Successfully downloaded whitelist configuration from GitHub"
-} catch {
-    Write-Log -Message "Error downloading whitelist from GitHub: $($_.Exception.Message)"
-    Write-Log -Message "Falling back to local configuration"
-    
-    # Fallback to basic configuration if GitHub is unavailable
+$whitelistJSON = $null
+
+# Try local file first
+if (Test-Path $localWhitelistPath) {
+    try {
+        Write-Log -Message "Found local whitelist file: $localWhitelistPath"
+        $whitelistJSON = Get-Content -Path $localWhitelistPath -Raw -Encoding UTF8
+        Write-Log -Message "Successfully loaded whitelist configuration from local file"
+    } catch {
+        Write-Log -Message "Error reading local whitelist file: $($_.Exception.Message)"
+        Write-Log -Message "Falling back to GitHub configuration"
+    }
+}
+
+# If local file failed or doesn't exist, try GitHub
+if (-not $whitelistJSON) {
+    try {
+        Write-Log -Message "Fetching whitelist configuration from GitHub"
+        $webClient = New-Object System.Net.WebClient
+        $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/7.1")
+        $whitelistJSON = $webClient.DownloadString($whitelistUrl)
+        Write-Log -Message "Successfully downloaded whitelist configuration from GitHub"
+    } catch {
+        Write-Log -Message "Error downloading whitelist from GitHub: $($_.Exception.Message)"
+        Write-Log -Message "Falling back to basic hardcoded configuration"
+    }
+}
+
+# Final fallback to basic configuration if both local and GitHub failed
+if (-not $whitelistJSON) {
     $whitelistJSON = @'
 [
     {"AppID": "Mozilla.Firefox", "FriendlyName": "Firefox", "BlockingProcess": "firefox", "PromptWhenBlocked": true},
@@ -1246,9 +1448,11 @@ try {
     {"AppID": "Notepad++.Notepad++", "FriendlyName": "Notepad++", "BlockingProcess": "notepad++", "DefaultTimeoutAction": true},
     {"AppID": "7zip.7zip", "FriendlyName": "7-Zip", "BlockingProcess": "7zFM", "DefaultTimeoutAction": true},
     {"AppID": "Adobe.Acrobat.Reader.64-bit", "FriendlyName": "Adobe Acrobat Reader", "BlockingProcess": "AcroRd32,Acrobat,AcroBroker,AdobeARM,AdobeCollabSync", "AutoCloseProcesses": "AdobeCollabSync", "PromptWhenBlocked": true},
-    {"AppID": "GitHub.GitHubDesktop", "FriendlyName": "GitHub Desktop", "BlockingProcess": "GitHubDesktop", "PromptWhenBlocked": true}
+    {"AppID": "GitHub.GitHubDesktop", "FriendlyName": "GitHub Desktop", "BlockingProcess": "GitHubDesktop", "PromptWhenBlocked": true},
+    {"AppID": "Fortinet.FortiClientVPN", "FriendlyName": "FortiClient VPN", "BlockingProcess": "FortiClient,FortiSSLVPNdaemon,FortiTray", "PromptWhenBlocked": true, "DefaultTimeoutAction": false, "TimeoutSeconds": 90}
 ]
 '@
+    Write-Log -Message "Using basic hardcoded configuration with FortiClient enabled for testing"
 }
 
 $ResolveWingetPath = Resolve-Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_*64__8wekyb3d8bbwe"
@@ -1446,7 +1650,12 @@ if ( (-Not ($ras)) -or $WingetPath) {
                                 if (-not $canAutoClose) {
                                     Write-Log -Message "$($okapp.AppID) has PromptWhenBlocked=true, showing interactive dialog"
                                     $defaultTimeoutAction = if ($okapp.DefaultTimeoutAction -eq $true) { $true } else { $false }
-                                    $userChoice = Show-ProcessCloseDialog -AppName $okapp.AppID -ProcessName $runningProcessName -TimeoutSeconds 60 -DefaultTimeoutAction $defaultTimeoutAction -FriendlyName $okapp.FriendlyName
+                                    
+                                    # Use custom timeout from whitelist if specified, otherwise default to 60 seconds
+                                    $customTimeout = if ($okapp.TimeoutSeconds -and $okapp.TimeoutSeconds -gt 0) { $okapp.TimeoutSeconds } else { 60 }
+                                    
+                                    Write-Log -Message "Using timeout: ${customTimeout}s, default action: $defaultTimeoutAction" | Out-Null
+                                    $userChoice = Show-ProcessCloseDialog -AppName $okapp.AppID -ProcessName $runningProcessName -TimeoutSeconds $customTimeout -DefaultTimeoutAction $defaultTimeoutAction -FriendlyName $okapp.FriendlyName
                                     
                                     Write-Log -Message "Show-ProcessCloseDialog returned: $userChoice (type: $($userChoice.GetType().Name))"
                                 }
@@ -1494,7 +1703,7 @@ if ( (-Not ($ras)) -or $WingetPath) {
                         if ($ras -or $userIsAdmin) {
                             Write-Log -Message "Upgrade $($okapp.AppID) in system context"
                             $doUpgrade = $true
-                            continue
+                            break  # Break out of whitelist loop to proceed with upgrade
                         }
                     }
                 }

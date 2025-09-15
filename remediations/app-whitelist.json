@@ -66,7 +66,11 @@
     },
     {
         "AppID": "Citrix.Workspace",
-        "BlockingProcess": "cdviewer"
+        "FriendlyName": "Citrix Workspace",
+        "BlockingProcess": "cdviewer",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 90
     },
     {
         "AppID": "Notepad++.Notepad++",
@@ -83,7 +87,10 @@
     {
         "AppID": "Zoom.Zoom",
         "FriendlyName": "Zoom",
-        "BlockingProcess": "Zoom"
+        "BlockingProcess": "Zoom",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 60
     },
     {
         "AppID": "Microsoft.PowerToys",
@@ -94,14 +101,21 @@
     {
         "AppID": "AgileBits.1Password",
         "FriendlyName": "1Password",
-        "BlockingProcess": "1Password"
+        "BlockingProcess": "1Password",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 90
     },
     {
         "AppID": "Logitech.SetPoint"
     },
     {
         "AppID": "TheDocumentFoundation.LibreOffice",
-        "BlockingProcess": "soffice"
+        "FriendlyName": "LibreOffice",
+        "BlockingProcess": "soffice",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 120
     },
     {
         "AppID": "Lenovo.QuickClean"
@@ -109,7 +123,10 @@
     {
         "AppID": "Bitwarden.Bitwarden",
         "FriendlyName": "Bitwarden",
-        "BlockingProcess": "Bitwarden"
+        "BlockingProcess": "Bitwarden",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 90
     },
     {
         "AppID": "SumatraPDF.SumatraPDF",
@@ -129,12 +146,18 @@
     {
         "AppID": "Microsoft.Azure.StorageExplorer",
         "FriendlyName": "Azure Storage Explorer",
-        "BlockingProcess": "StorageExplorer"
+        "BlockingProcess": "StorageExplorer",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 75
     },
     {
         "AppID": "calibre.calibre",
         "FriendlyName": "Calibre",
-        "BlockingProcess": "calibre"
+        "BlockingProcess": "calibre",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 75
     },
     {
         "AppID": "wethat.onenotetaggingkit"
@@ -142,7 +165,10 @@
     {
         "AppID": "LogMeIn.LastPass",
         "FriendlyName": "LastPass",
-        "BlockingProcess": "LastPass"
+        "BlockingProcess": "LastPass",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 90
     },
     {
         "AppID": "Microsoft.PowerShell.Preview"
@@ -158,7 +184,10 @@
     {
         "AppID": "GitHub.GitHubDesktop",
         "FriendlyName": "GitHub Desktop",
-        "BlockingProcess": "GitHubDesktop"
+        "BlockingProcess": "GitHubDesktop",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 90
     },
     {
         "AppID": "RARLab.WinRAR",
@@ -207,7 +236,11 @@
     },
     {
         "AppID": "Apache.OpenOffice",
-        "BlockingProcess": "soffice"
+        "FriendlyName": "Apache OpenOffice",
+        "BlockingProcess": "soffice",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 120
     },
     {
         "AppID": "DominikReichl.KeePass",
@@ -232,11 +265,19 @@
     },
     {
         "AppID": "WinSCP.WinSCP",
-        "BlockingProcess": "WinSCP"
+        "FriendlyName": "WinSCP",
+        "BlockingProcess": "WinSCP",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 75
     },
     {
         "AppID": "WinMerge.WinMerge",
-        "BlockingProcess": "WinMergeU"
+        "FriendlyName": "WinMerge",
+        "BlockingProcess": "WinMergeU",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 75
     },
     {
         "AppID": "Adobe.Acrobat.Reader.64-bit",
@@ -245,7 +286,7 @@
         "AutoCloseProcesses": "AdobeCollabSync",
         "PromptWhenBlocked": true,
         "DefaultTimeoutAction": false,
-        "TimeoutSeconds": 90
+        "TimeoutSeconds": 60
     },
     {
         "AppID": "RazerInc.RazerInstaller"
@@ -289,6 +330,11 @@
     },
     {
         "AppID": "Fortinet.FortiClientVPN",
+        "FriendlyName": "FortiClient VPN",
+        "BlockingProcess": "FortiClient,FortiSSLVPNdaemon,FortiTray",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 60,
         "Disabled": true
     },
     {
@@ -297,7 +343,11 @@
     },
     {
         "AppID": "OBSProject.OBSStudio",
-        "BlockingProcess": "obs64"
+        "FriendlyName": "OBS Studio",
+        "BlockingProcess": "obs64",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 120
     },
     {
         "AppID": "Python.Launcher"
@@ -323,7 +373,10 @@
     {
         "AppID": "Dropbox.Dropbox",
         "FriendlyName": "Dropbox",
-        "BlockingProcess": "Dropbox"
+        "BlockingProcess": "Dropbox",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 90
     },
     {
         "AppID": "Microsoft.AzureCLI",

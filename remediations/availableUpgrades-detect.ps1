@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 4.1
-    Tag: 3P
+    Version: 4.3
+    Tag: 3R
     
     Version History:
     1.0 - Initial version
@@ -36,6 +36,8 @@
     3.9 - Improved log management: dynamic path selection (Intune logs for system context), automatic cleanup of logs older than 1 month
     4.0 - Added PromptWhenBlocked property for granular control over interactive dialogs vs silent waiting when blocking processes are running
     4.1 - Updated to work with new Toast notification remediation system (Version 6.0/9R), enhanced app configuration with TimeoutSeconds and DefaultTimeoutAction support
+    4.2 - Added local whitelist file support with intelligent fallback system (local file > GitHub > hardcoded)
+    4.3 - Fixed critical whitelist loop logic bug: changed 'continue' to 'break' after app match (synchronize with remediation script fix)
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -110,7 +112,7 @@ function Remove-OldLogs {
 }
 
 <# Script variables #>
-$ScriptTag = "3P" # Update this tag for each script version
+$ScriptTag = "3R" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -154,20 +156,43 @@ if (-not (OOBEComplete)) {
 
 <# ---------------------------------------------- #>
 
-# Fetch whitelist configuration from GitHub
-$whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"
-Write-Log -Message "Fetching whitelist configuration from GitHub"
+# Load whitelist configuration with priority: Local file > GitHub > Hardcoded fallback
+$scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+$localWhitelistPath = Join-Path $scriptDirectory "app-whitelist.json"
+$whitelistJSON = $null
 
-try {
-    $webClient = New-Object System.Net.WebClient
-    $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/4.1")
-    $whitelistJSON = $webClient.DownloadString($whitelistUrl)
-    Write-Log -Message "Successfully downloaded whitelist configuration from GitHub"
-} catch {
-    Write-Log -Message "Error downloading whitelist from GitHub: $($_.Exception.Message)"
-    Write-Log -Message "Falling back to local configuration"
+# First, try to load from local file
+if (Test-Path $localWhitelistPath) {
+    try {
+        Write-Log -Message "Loading whitelist configuration from local file: $localWhitelistPath"
+        $whitelistJSON = Get-Content -Path $localWhitelistPath -Raw -Encoding UTF8
+        Write-Log -Message "Successfully loaded local whitelist configuration"
+    } catch {
+        Write-Log -Message "Error reading local whitelist file: $($_.Exception.Message)"
+        $whitelistJSON = $null
+    }
+}
+
+# If no local file or local file failed, try GitHub
+if ([string]::IsNullOrEmpty($whitelistJSON)) {
+    $whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"
+    Write-Log -Message "Loading whitelist configuration from GitHub"
     
-    # Fallback to basic configuration if GitHub is unavailable
+    try {
+        $webClient = New-Object System.Net.WebClient
+        $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/4.2")
+        $whitelistJSON = $webClient.DownloadString($whitelistUrl)
+        Write-Log -Message "Successfully downloaded whitelist configuration from GitHub"
+    } catch {
+        Write-Log -Message "Error downloading whitelist from GitHub: $($_.Exception.Message)"
+        $whitelistJSON = $null
+    }
+}
+
+# If both local file and GitHub failed, use hardcoded fallback
+if ([string]::IsNullOrEmpty($whitelistJSON)) {
+    Write-Log -Message "Using hardcoded fallback configuration"
+    
     $whitelistJSON = @'
 [
     {"AppID": "Mozilla.Firefox", "BlockingProcess": "firefox"},
@@ -321,7 +346,7 @@ if ( (-Not ($ras)) -or $WingetPath) {
                         if ($ras -or $userIsAdmin) {
                             Write-Log -Message "Upgrade $($okapp.AppID) in system context"
                             $doUpgrade = $true
-                            continue
+                            break
                         }
                     }
                 }
