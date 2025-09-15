@@ -323,7 +323,11 @@
     },
     {
         "AppID": "Mythicsoft.AgentRansack",
-        "BlockingProcess": "AgentRansack"
+        "FriendlyName": "Agent Ransack",
+        "BlockingProcess": "FileLocator",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 75
     },
     {
         "AppID": "ParadoxInteractive.ParadoxLauncher"
