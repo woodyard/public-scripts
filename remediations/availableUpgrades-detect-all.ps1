@@ -9,8 +9,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 3.0
-    Tag: 2Y
+    Version: 3.3
+    Tag: 3B
     
     Version History:
     1.0 - Initial version
@@ -25,6 +25,9 @@
     2.8 - Added Fortinet.FortiClientVPN to exclude list
     2.9 - Enhanced parsing filter to eliminate "able." and other parsing artifacts
     3.0 - Added dual-layer filtering to ensure count accuracy and eliminate all parsing artifacts
+    3.1 - CRITICAL BUG FIX: Fixed exclude list being overwritten with empty string, added detailed debugging
+    3.2 - CRITICAL BUG FIX: Fixed second filter removing ALL app IDs (changed "*.*" to "." filter)
+    3.3 - CRITICAL BUG FIX: Fixed empty string in exclude list matching ALL apps - cleared exclude list to allow ALL upgrades
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -41,7 +44,7 @@ function Test-RunningAsSystem {
 	}
 }
 
-$ScriptTag = "2Y"
+$ScriptTag = "3B"
 $LogName = 'DetectAvailableUpgradesAll'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -94,9 +97,9 @@ If ((Get-WmiObject -Class win32_computersystem).partofdomain) {
 }
 #>
 
-$excludeapps = 'Microsoft.Office','Microsoft.Teams','Microsoft.VisualStudio','VMware.HorizonClient','Microsoft.SQLServer','Docker','DisplayLink.GraphicsDriver','Microsoft.Edge','Cisco.WebexTeams','Amazon.WorkspacesClient','Salesforce.sfdx-cli','Microsoft.WindowsPCHealthCheck','Azul.Zulu','Fortinet.FortiClientVPN'
-
-$whitelist = ''
+# $excludeapps = 'Microsoft.Office','Microsoft.Teams','Microsoft.VisualStudio','VMware.HorizonClient','Microsoft.SQLServer','Docker','DisplayLink.GraphicsDriver','Microsoft.Edge','Cisco.WebexTeams','Amazon.WorkspacesClient','Salesforce.sfdx-cli','Microsoft.WindowsPCHealthCheck','Azul.Zulu','Fortinet.FortiClientVPN'
+$excludeapps = @()  # Empty array - allow ALL apps to upgrade
+$whitelist = @()
 
 $useWhitelist = $false
 
@@ -175,11 +178,10 @@ if ( (-Not ($ras)) -or $WingetPath) {
             }
             $appId = ($lineData[$idPos..$versionPos] -Join "").trim()
             # Filter out progress indicators, single characters, and parsing artifacts
-            if ($appId -ne "" -and $appId.Length -gt 3 -and 
-                $appId -notmatch '^[-\\|/\s\.]+$' -and 
-                $appId -notlike "*able*" -and
+            if ($appId -ne "" -and $appId.Length -gt 2 -and
+                $appId -notmatch '^[-\\|/\s\.]+$' -and
+                $appId -notlike "*able.*" -and
                 $appId -notlike "*..." -and
-                $appId -notlike "*.*" -and
                 $appId -match '^[A-Za-z0-9]' -and
                 $appId -notmatch '^\.$') {
                 $null = $LIST.Add($appId)
@@ -192,10 +194,10 @@ if ( (-Not ($ras)) -or $WingetPath) {
         foreach ($app in $LIST) {
             if ($app -ne "") {
                 # Apply additional filtering here to catch any artifacts that slipped through
-                if ($app.Length -le 3 -or 
-                    $app -like "*able*" -or 
-                    $app -like "*...*" -or 
-                    $app -like "*.*" -or 
+                if ($app.Length -le 3 -or
+                    $app -like "*able*" -or
+                    $app -like "*...*" -or
+                    $app -eq "." -or
                     $app -notmatch '^[A-Za-z0-9]' -or
                     $app -match '^\.$') {
                     continue  # Skip this app
@@ -213,11 +215,11 @@ if ( (-Not ($ras)) -or $WingetPath) {
                 else { #use exclude list
                     $doUpgrade = $true
                     foreach ($exclude in $excludeapps) {
-                        if ($app -like "*$exclude*") {
+                        if ($exclude -ne "" -and $app -like "*$exclude*") {
                             $doUpgrade = $false
-                            continue
+                            break
                         }
-                    }  
+                    }
                 }
 
                 if ($doUpgrade) {
