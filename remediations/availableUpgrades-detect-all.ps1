@@ -88,20 +88,20 @@ function Write-Log($message) #Log script messages to temp directory
 }
 
 function Remove-OldLogs {
-	   param([string]$LogPath)
-	   
-	   try {
-	       $cutoffDate = (Get-Date).AddMonths(-1)
-	       $logFiles = Get-ChildItem -Path $LogPath -Filter "*AvailableUpgrades*.log" -ErrorAction SilentlyContinue
-	       foreach ($logFile in $logFiles) {
-	           if ($logFile.LastWriteTime -lt $cutoffDate) {
-	               Remove-Item -Path $logFile.FullName -Force -ErrorAction SilentlyContinue
-	               Write-Log -Message "Removed old log file: $($logFile.Name)"
-	           }
-	       }
-	   } catch {
-	       # Don't use Write-Log here as it may not be ready yet - just silently continue
-	   }
+    param([string]$LogPath)
+    
+    try {
+        $cutoffDate = (Get-Date).AddMonths(-1)
+        $logFiles = Get-ChildItem -Path $LogPath -Filter "*DetectAvailableUpgradesAll*.log" -ErrorAction SilentlyContinue
+        foreach ($logFile in $logFiles) {
+            if ($logFile.LastWriteTime -lt $cutoffDate) {
+                Remove-Item -Path $logFile.FullName -Force -ErrorAction SilentlyContinue
+                Write-Log -Message "Removed old log file: $($logFile.Name)"
+            }
+        }
+    } catch {
+        # Don't use Write-Log here as it may not be ready yet - just silently continue
+    }
 }
 
 # Clean up old log files (older than 1 month)
