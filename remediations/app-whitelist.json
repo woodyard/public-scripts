@@ -213,7 +213,11 @@
     },
     {
         "AppID": "Jabra.Direct",
-        "BlockingProcess": "JabraDirectCoreService"
+        "FriendlyName": "Jabra Direct",
+        "BlockingProcess": "jabra-direct",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 75
     },
     {
         "AppID": "ArtifexSoftware.GhostScript"
