@@ -407,5 +407,13 @@
         "FriendlyName": "Wireshark",
         "BlockingProcess": "Wireshark",
         "DefaultTimeoutAction": true
+    },
+    {
+        "AppID": "Microsoft.DotNet.SDK.8",
+        "FriendlyName": ".NET 8 SDK"
+    },
+    {
+        "AppID": "Microsoft.DotNet.DesktopRuntime.8",
+        "FriendlyName": ".NET 8 Desktop Runtime"
     }
 ]
