@@ -215,9 +215,7 @@
         "AppID": "Jabra.Direct",
         "FriendlyName": "Jabra Direct",
         "BlockingProcess": "jabra-direct",
-        "PromptWhenBlocked": true,
-        "DefaultTimeoutAction": false,
-        "TimeoutSeconds": 75
+        "AutoCloseProcesses": "jabra-direct"
     },
     {
         "AppID": "ArtifexSoftware.GhostScript"
@@ -382,9 +380,7 @@
         "AppID": "Dropbox.Dropbox",
         "FriendlyName": "Dropbox",
         "BlockingProcess": "Dropbox",
-        "PromptWhenBlocked": true,
-        "DefaultTimeoutAction": false,
-        "TimeoutSeconds": 90
+        "AutoCloseProcesses": "Dropbox"
     },
     {
         "AppID": "Microsoft.AzureCLI",
