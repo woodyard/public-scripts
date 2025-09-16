@@ -138,7 +138,9 @@
         "AppID": "Microsoft.WindowsTerminal",
         "FriendlyName": "Windows Terminal",
         "BlockingProcess": "WindowsTerminal",
-        "DefaultTimeoutAction": true
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 60
     },
     {
         "AppID": "Logitech.UnifyingSoftware"
