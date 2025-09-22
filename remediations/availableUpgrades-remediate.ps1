@@ -4,13 +4,16 @@
 
 .DESCRIPTION
     This script performs application updates using winget based on a whitelist approach.
-    It supports both system and user context applications and includes blocking process detection.
+    It supports both system and user context applications using a dual-context architecture.
     The script is designed to work as a remediation script in Microsoft Intune remediation policies.
+
+.PARAMETER UserRemediationOnly
+    When specified, the script runs in user remediation mode (scheduled task execution)
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 7.1
- Tag: 9T
+ Version: 8.3
+ Tag: 8U
     
     Version History:
     1.0 - Initial version
@@ -45,11 +48,18 @@
     6.0 - COMPLETE REWRITE: Replaced all problematic dialog systems with robust Windows Toast Notifications and PowerShell WPF dialogs with comprehensive fallback mechanisms
     7.0 - REVOLUTIONARY UPDATE: Implemented modern WPF-based notification system with Azure AD support, replacing legacy toast notifications with reliable cross-session dialogs, enhanced whitelist timeout support, and optimized for Intune deployment environments
     7.1 - Enhanced WPF dialog system with countdown timer display on default action button for improved user experience and clarity
+    8.1 - CRITICAL UPDATE: Added --scope user support for non-privileged user context upgrades, allowing users without admin rights to upgrade user-scoped applications
+    8.2 - CRITICAL FIX: Fixed empty script path issue in scheduled tasks by capturing $MyInvocation.MyCommand.Path at global scope with multiple fallback methods; Fixed PowerShell syntax errors with Test-RunningAsSystem function calls
+    8.3 - SECURITY IMPROVEMENT: Scripts now copy themselves to user-accessible temp locations before scheduling tasks, improving security and access control with automatic cleanup
     
     Exit Codes:
     0 - Script completed successfully
     1 - OOBE not complete
 #>
+
+param(
+    [switch]$UserRemediationOnly
+)
 
 #Requires -RunAsAdministrator
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -1151,6 +1161,10 @@ function Show-ProcessCloseDialog {
         Action to take on timeout (true = close app, false = keep open)
     .PARAMETER FriendlyName
         User-friendly name of the application
+    .PARAMETER CurrentVersion
+        Current version of the application
+    .PARAMETER AvailableVersion
+        Available version for update
     .OUTPUTS
         Boolean indicating user choice (true = close app, false = keep open)
     #>
@@ -1159,7 +1173,9 @@ function Show-ProcessCloseDialog {
         [string]$ProcessName,
         [int]$TimeoutSeconds = 60,
         [bool]$DefaultTimeoutAction = $false,
-        [string]$FriendlyName = ""
+        [string]$FriendlyName = "",
+        [string]$CurrentVersion = "",
+        [string]$AvailableVersion = ""
     )
 
     Write-Log -Message "Show-ProcessCloseDialog called for $AppName" | Out-Null
@@ -1170,17 +1186,28 @@ function Show-ProcessCloseDialog {
     Write-Log -Message "Friendly name resolved to: $friendlyName" | Out-Null
 
     try {
-        # Create the question text
-        $question = "An update is available for $friendlyName, but it cannot be installed while the application is running.`n`nWould you like to close $friendlyName now to allow the update to proceed?"
-        $title = "$friendlyName Update Available"
+        # Create the question text with version information
+        $versionText = ""
+        if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
+            $versionText = "$friendlyName $CurrentVersion -> $AvailableVersion update available`n`n"
+        } else {
+            $versionText = "An update is available for $friendlyName`n`n"
+        }
+        
+        $question = "${versionText}The application cannot be updated while it is running.`n`nWould you like to close $friendlyName now to allow the update to proceed?"
+        $title = if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
+            "Update ${friendlyName}: ${CurrentVersion} -> ${AvailableVersion}"
+        } else {
+            "${friendlyName} Update Available"
+        }
         
         # Convert DefaultTimeoutAction boolean to string format
         $defaultActionString = if ($DefaultTimeoutAction) { "OK" } else { "Cancel" }
         
         Write-Log -Message "Showing WPF dialog for $friendlyName with ${TimeoutSeconds}s timeout, default action: $defaultActionString" | Out-Null
         
-        # Call the WPF notification system
-        $response = Invoke-SystemUserPrompt -Question $question -Title $title -TimeoutSeconds $TimeoutSeconds -DefaultAction $defaultActionString -Position "BottomRight"
+        # Call the context-aware dialog system
+        $response = Show-UserDialog -Question $question -Title $title -TimeoutSeconds $TimeoutSeconds -DefaultAction $defaultActionString
         
         Write-Log -Message "WPF dialog response: $response" | Out-Null
         
@@ -1202,6 +1229,268 @@ function Show-ProcessCloseDialog {
     }
 }
 
+function Show-DirectUserDialog {
+    <#
+    .SYNOPSIS
+        Shows a simple direct WPF dialog when already running in user context
+    .DESCRIPTION
+        Lightweight version of the dialog system for user context execution
+        No scheduled tasks needed - direct WPF execution
+    #>
+    param(
+        [string]$Question,
+        [string]$Title = "System Notification",
+        [int]$TimeoutSeconds = 60,
+        [string]$DefaultAction = "Cancel"
+    )
+    
+    try {
+        Write-Log -Message "Showing direct user dialog: '$Question'" | Out-Null
+        
+        # Load WPF assemblies
+        Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+        Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+        Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        
+        # Create simple XAML dialog
+        $xaml = @"
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="$Title"
+    Width="420"
+    MinHeight="140"
+    SizeToContent="Height"
+    WindowStartupLocation="CenterScreen"
+    ResizeMode="NoResize"
+    WindowStyle="SingleBorderWindow"
+    Topmost="True"
+    ShowInTaskbar="True">
+    
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        
+        <!-- Question -->
+        <TextBlock Grid.Row="0"
+                   Text="$Question"
+                   TextWrapping="Wrap"
+                   Margin="0,0,0,16"
+                   FontSize="12"/>
+        
+        <!-- Buttons -->
+        <StackPanel Grid.Row="1"
+                    Orientation="Horizontal"
+                    HorizontalAlignment="Right">
+            
+            <Button Name="CancelButton"
+                    Content="Cancel"
+                    Width="60"
+                    Height="24"
+                    Margin="0,0,8,0"
+                    IsDefault="false"/>
+            
+            <Button Name="OKButton"
+                    Content="OK"
+                    Width="60"
+                    Height="24"
+                    IsDefault="true"/>
+            
+        </StackPanel>
+    </Grid>
+</Window>
+"@
+
+        # Create window from XAML
+        $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+        $window = [Windows.Markup.XamlReader]::Load($reader)
+        
+        # Get button references
+        $okButton = $window.FindName("OKButton")
+        $cancelButton = $window.FindName("CancelButton")
+        
+        # Set up result handling
+        $script:dialogResult = $DefaultAction
+        
+        # Create timeout timer
+        $timer = New-Object System.Windows.Threading.DispatcherTimer
+        $timer.Interval = [System.TimeSpan]::FromSeconds($TimeoutSeconds)
+        
+        $timer.Add_Tick({
+            Write-Log -Message "Direct dialog timeout reached - using default action: $DefaultAction" | Out-Null
+            $script:dialogResult = $DefaultAction
+            $timer.Stop()
+            $window.Close()
+        })
+        
+        # Button event handlers
+        $okButton.Add_Click({
+            Write-Log -Message "OK button clicked in direct dialog" | Out-Null
+            $timer.Stop()
+            $script:dialogResult = "OK"
+            $window.Close()
+        })
+        
+        $cancelButton.Add_Click({
+            Write-Log -Message "Cancel button clicked in direct dialog" | Out-Null
+            $timer.Stop()
+            $script:dialogResult = "Cancel"
+            $window.Close()
+        })
+        
+        # Handle window closing without button click
+        $window.Add_Closing({
+            $timer.Stop()
+            if ($script:dialogResult -eq $null) {
+                Write-Log -Message "Direct dialog closed without button click - treating as Cancel" | Out-Null
+                $script:dialogResult = "Cancel"
+            }
+        })
+        
+        # Start timeout timer and show dialog
+        $timer.Start()
+        $result = $window.ShowDialog()
+        $timer.Stop()
+        
+        Write-Log -Message "Direct dialog completed with result: $($script:dialogResult)" | Out-Null
+        return $script:dialogResult
+        
+    } catch {
+        Write-Log -Message "Error in direct user dialog: $($_.Exception.Message)" | Out-Null
+        return $DefaultAction
+    }
+}
+
+function Show-UserDialog {
+    <#
+    .SYNOPSIS
+        Context-aware dialog function that chooses appropriate dialog method
+    #>
+    param(
+        [string]$Question,
+        [string]$Title = "System Notification",
+        [int]$TimeoutSeconds = 60,
+        [string]$DefaultAction = "Cancel"
+    )
+    
+    if (Test-RunningAsSystem) {
+        # Complex scheduled task system for SYSTEM → User context (existing - keep as-is)
+        return Invoke-SystemUserPrompt -Question $Question -Title $Title -TimeoutSeconds $TimeoutSeconds -DefaultAction $DefaultAction
+    } else {
+        # Simple direct WPF dialog for user context
+        return Show-DirectUserDialog -Question $Question -Title $Title -TimeoutSeconds $TimeoutSeconds -DefaultAction $DefaultAction
+    }
+}
+
+function Schedule-UserContextRemediation {
+    <#
+    .SYNOPSIS
+        Schedules user context remediation execution from SYSTEM context
+    #>
+    
+    try {
+        Write-Log "Scheduling user context remediation" | Out-Null
+        
+        $userInfo = Get-InteractiveUser
+        if (-not $userInfo) {
+            Write-Log "No interactive user found - skipping user context remediation" | Out-Null
+            return $false
+        }
+        
+        # Create scheduled task for user remediation
+        $taskName = "UserRemediation_$(Get-Random -Minimum 1000 -Maximum 9999)"
+        # Copy script to user-accessible temp location
+        $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
+        if (-not (Test-Path $userTempPath)) {
+            $userTempPath = $env:TEMP
+        }
+        
+        $tempScriptName = "availableUpgrades-remediate_$(Get-Random -Minimum 1000 -Maximum 9999).ps1"
+        $tempScriptPath = Join-Path $userTempPath $tempScriptName
+        
+        Write-Log "Copying script to user-accessible location: $tempScriptPath" | Out-Null
+        Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force
+        
+        $scriptPath = $tempScriptPath
+        $arguments = "-ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly"
+        
+        Write-Log "Creating user remediation task: $taskName" | Out-Null
+        Write-Log "Script path: $scriptPath" | Out-Null
+        Write-Log "Arguments: $arguments" | Out-Null
+        
+        try {
+            # Create task action
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
+            
+            # Create task principal (run as interactive user)
+            $principal = $null
+            $userFormats = @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")
+            $logonTypes = @("Interactive", "S4U")
+            
+            foreach ($userFormat in $userFormats) {
+                foreach ($logonType in $logonTypes) {
+                    try {
+                        $principal = New-ScheduledTaskPrincipal -UserId $userFormat -LogonType $logonType -RunLevel Limited
+                        Write-Log "Successfully created principal with: $userFormat ($logonType)" | Out-Null
+                        break
+                    } catch {
+                        Write-Log "Failed with format '$userFormat' ($logonType): $($_.Exception.Message)" | Out-Null
+                    }
+                }
+                if ($principal) { break }
+            }
+            
+            if (-not $principal) {
+                Write-Log "Could not create task principal with any method" | Out-Null
+                return $false
+            }
+            
+            # Create task settings - run immediately and cleanup after 1 hour
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd -DeleteExpiredTaskAfter "PT1H"
+            
+            # Create trigger to run immediately
+            $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5)
+            
+            # Create and register the task
+            $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings -Trigger $trigger -Description "User context winget remediation"
+            Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+            
+            Write-Log "User remediation task scheduled successfully: $taskName" | Out-Null
+            Write-Log "Temporary script copy at: $tempScriptPath" | Out-Null
+            return $true
+            
+        } catch {
+            Write-Log "Error creating/scheduling user remediation task: $($_.Exception.Message)" | Out-Null
+            # Clean up temporary script copy on error
+            if (Test-Path $tempScriptPath) {
+                Remove-Item $tempScriptPath -Force -ErrorAction SilentlyContinue
+            }
+            return $false
+        }
+        
+    } catch {
+        Write-Log "Error in user context remediation scheduling: $($_.Exception.Message)" | Out-Null
+        return $false
+    } finally {
+        # Clean up old temporary script copies (older than 1 hour)
+        try {
+            $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
+            if (Test-Path $userTempPath) {
+                $oldTempScripts = Get-ChildItem -Path $userTempPath -Filter "availableUpgrades-remediate_*.ps1" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-1) }
+                foreach ($oldScript in $oldTempScripts) {
+                    Remove-Item $oldScript.FullName -Force -ErrorAction SilentlyContinue
+                    Write-Log "Cleaned up old temporary script: $($oldScript.Name)" | Out-Null
+                }
+            }
+        } catch {
+            # Ignore cleanup errors
+        }
+    }
+}
+
 function Stop-BlockingProcesses {
     param(
         [string]$ProcessNames
@@ -1209,29 +1498,134 @@ function Stop-BlockingProcesses {
     
     $processesToStop = $ProcessNames -split ','
     $stoppedAny = $false
+    $allProcesses = @()
     
+    # Collect all processes to stop
     foreach ($processName in $processesToStop) {
         $processName = $processName.Trim()
         $processes = Get-Process -Name $processName -ErrorAction SilentlyContinue
         
         if ($processes) {
-            try {
-                foreach ($process in $processes) {
-                    Write-Log -Message "Stopping process: $processName (PID: $($process.Id))"
-                    $process.CloseMainWindow()
-                    
-                    # Wait up to 10 seconds for graceful shutdown
-                    if (!$process.WaitForExit(10000)) {
-                        Write-Log -Message "Process $processName did not exit gracefully, forcing termination"
-                        $process.Kill()
-                    }
-                    $stoppedAny = $true
+            foreach ($process in $processes) {
+                $allProcesses += @{
+                    Process = $process
+                    Name = $processName
+                    PID = $process.Id
                 }
-                Write-Log -Message "Successfully stopped process: $processName"
-            } catch {
-                Write-Log -Message "Error stopping process $processName : $($_.Exception.Message)"
             }
         }
+    }
+    
+    if ($allProcesses.Count -eq 0) {
+        Write-Log -Message "No processes found to stop"
+        return $false
+    }
+    
+    $processCount = $allProcesses.Count
+    Write-Log -Message "Found $processCount processes to close: $($allProcesses.Name -join ', ')"
+    
+    try {
+        if ($processCount -gt 1) {
+            Write-Log -Message "Multiple processes detected ($processCount), using parallel termination strategy"
+            
+            # Step 1: Attempt graceful close on all processes simultaneously
+            Write-Log -Message "Attempting graceful close on all processes simultaneously..."
+            foreach ($procInfo in $allProcesses) {
+                try {
+                    Write-Log -Message "Sending close signal to: $($procInfo.Name) (PID: $($procInfo.PID))"
+                    $procInfo.Process.CloseMainWindow()
+                } catch {
+                    Write-Log -Message "Error sending close signal to $($procInfo.Name): $($_.Exception.Message)"
+                }
+            }
+            
+            # Step 2: Wait 5 seconds total (not per process)
+            Write-Log -Message "Waiting 5 seconds for graceful shutdown..."
+            Start-Sleep -Seconds 5
+            
+            # Step 3: Check which processes are still running and force-kill them all at once
+            $remainingProcesses = @()
+            foreach ($procInfo in $allProcesses) {
+                try {
+                    # Refresh process state
+                    $stillRunning = Get-Process -Id $procInfo.PID -ErrorAction SilentlyContinue
+                    if ($stillRunning) {
+                        $remainingProcesses += $procInfo
+                    } else {
+                        Write-Log -Message "Process $($procInfo.Name) (PID: $($procInfo.PID)) closed gracefully"
+                        $stoppedAny = $true
+                    }
+                } catch {
+                    # Process no longer exists (good)
+                    Write-Log -Message "Process $($procInfo.Name) (PID: $($procInfo.PID)) no longer exists"
+                    $stoppedAny = $true
+                }
+            }
+            
+            # Step 4: Force terminate remaining processes in parallel
+            if ($remainingProcesses.Count -gt 0) {
+                Write-Log -Message "Force-terminating $($remainingProcesses.Count) remaining processes..."
+                foreach ($procInfo in $remainingProcesses) {
+                    try {
+                        Write-Log -Message "Force-killing: $($procInfo.Name) (PID: $($procInfo.PID))"
+                        $procInfo.Process.Kill()
+                        $stoppedAny = $true
+                    } catch {
+                        Write-Log -Message "Error force-killing $($procInfo.Name): $($_.Exception.Message)"
+                    }
+                }
+                
+                # Brief verification wait
+                Start-Sleep -Seconds 1
+                
+                # Final verification
+                $finalCheck = 0
+                foreach ($procInfo in $remainingProcesses) {
+                    try {
+                        $stillExists = Get-Process -Id $procInfo.PID -ErrorAction SilentlyContinue
+                        if ($stillExists) {
+                            $finalCheck++
+                            Write-Log -Message "WARNING: Process $($procInfo.Name) (PID: $($procInfo.PID)) still exists after force termination"
+                        }
+                    } catch {
+                        # Process successfully terminated
+                    }
+                }
+                
+                if ($finalCheck -eq 0) {
+                    Write-Log -Message "All processes successfully terminated using parallel approach"
+                } else {
+                    Write-Log -Message "Some processes may still be running ($finalCheck remaining)"
+                }
+            } else {
+                Write-Log -Message "All processes closed gracefully - no force termination needed"
+            }
+            
+            Write-Log -Message "Parallel process termination completed in ~6 seconds"
+            
+        } else {
+            # Single process - use traditional approach
+            Write-Log -Message "Single process detected, using traditional termination"
+            $procInfo = $allProcesses[0]
+            
+            try {
+                Write-Log -Message "Stopping process: $($procInfo.Name) (PID: $($procInfo.PID))"
+                $procInfo.Process.CloseMainWindow()
+                
+                # Wait up to 10 seconds for graceful shutdown
+                if (!$procInfo.Process.WaitForExit(10000)) {
+                    Write-Log -Message "Process $($procInfo.Name) did not exit gracefully, forcing termination"
+                    $procInfo.Process.Kill()
+                }
+                $stoppedAny = $true
+                Write-Log -Message "Successfully stopped process: $($procInfo.Name)"
+            } catch {
+                Write-Log -Message "Error stopping process $($procInfo.Name): $($_.Exception.Message)"
+            }
+        }
+        
+    } catch {
+        Write-Log -Message "Error in Stop-BlockingProcesses: $($_.Exception.Message)"
     }
     
     return $stoppedAny
@@ -1255,10 +1649,21 @@ function Remove-OldLogs {
 }
 
 <# Script variables #>
-$ScriptTag = "9T" # Update this tag for each script version
+$ScriptTag = "8U" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
+
+# Capture script path at global scope for use in scheduled tasks
+$Global:CurrentScriptPath = $MyInvocation.MyCommand.Path
+if ([string]::IsNullOrEmpty($Global:CurrentScriptPath)) {
+    # Fallback method for cases where MyInvocation doesn't work
+    $Global:CurrentScriptPath = $PSCommandPath
+}
+if ([string]::IsNullOrEmpty($Global:CurrentScriptPath)) {
+    # Last resort fallback
+    $Global:CurrentScriptPath = (Get-PSCallStack)[1].ScriptName
+}
 
 # Dynamic log path selection based on execution context
 $isSystemContext = Test-RunningAsSystem
@@ -1469,15 +1874,79 @@ try {
     exit 1
 }
 
-$ras = $true
-If (-Not (Test-RunningAsSystem)) {
-    $ras = $false
-    Write-Log -Message "User context mode detected"
-
-    #if (-not ($userIsAdmin)) {
-    #    $whitelistConfig = $whitelistConfig | Where-Object { $_.UserContext -eq $true }
-    #}
-
+# Main remediation logic - dual-context architecture
+if (Test-RunningAsSystem) {
+    if ($UserRemediationOnly) {
+        # This is a scheduled user remediation task - process user apps only
+        Write-Log -Message "Running user remediation task"
+        
+        try {
+            $OUTPUT = $(winget upgrade --accept-source-agreements)
+            Write-Log -Message "Successfully executed winget upgrade in user context (scheduled task)"
+        } catch {
+            Write-Log -Message "Error executing winget in user context: $($_.Exception.Message)"
+            Write-Log -Message "Winget may not be available or properly configured"
+            exit 1
+        }
+        
+        # Check if first output is valid (contains actual app data)
+        $hasValidOutput = $false
+        foreach ($line in $OUTPUT) {
+            if ($line -like "Name*Id*Version*Available*Source*") {
+                $hasValidOutput = $true
+                break
+            }
+        }
+        
+        # If first output is nonsense, run again
+        if (-not $hasValidOutput) {
+            Write-Log -Message "First winget run produced invalid output, retrying..."
+            $OUTPUT = $(winget upgrade --accept-source-agreements)
+        }
+        
+        Write-Log -Message "User context remediation - processing user-scoped apps only"
+        
+    } else {
+        # SYSTEM context main execution - process system apps and schedule user remediation
+        Write-Log -Message "SYSTEM context - processing system apps and scheduling user remediation"
+        
+        if ($WingetPath) {
+            Write-Log -Message "Using winget path: $WingetPath"
+            Set-Location $WingetPath
+            
+            try {
+                # System context winget - only sees system-wide apps
+                $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
+                Write-Log -Message "Successfully executed winget upgrade in system context"
+            } catch {
+                Write-Log -Message "Error executing winget in system context: $($_.Exception.Message)"
+                Write-Log -Message "Winget execution failed, exiting"
+                exit 1
+            }
+            
+            # Check if first output is valid (contains actual app data)
+            $hasValidOutput = $false
+            foreach ($line in $OUTPUT) {
+                if ($line -like "Name*Id*Version*Available*Source*") {
+                    $hasValidOutput = $true
+                    break
+                }
+            }
+            
+            # If first output is nonsense, run again
+            if (-not $hasValidOutput) {
+                Write-Log -Message "First winget run produced invalid output, retrying..."
+                $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
+            }
+        } else {
+            Write-Log -Message "Winget not detected in SYSTEM context"
+            exit 0
+        }
+    }
+} else {
+    # User context execution - process user apps only
+    Write-Log -Message "USER context - processing user-scoped apps"
+    
     try {
         $OUTPUT = $(winget upgrade --accept-source-agreements)
         Write-Log -Message "Successfully executed winget upgrade in user context"
@@ -1501,52 +1970,10 @@ If (-Not (Test-RunningAsSystem)) {
         Write-Log -Message "First winget run produced invalid output, retrying..."
         $OUTPUT = $(winget upgrade --accept-source-agreements)
     }
-    
-    Write-Log -Message "Local user mode"
-}
-elseif ($WingetPath) {
-    Write-Log -Message "System context mode detected, using winget at: $WingetPath"
-    Set-Location $WingetPath
-
-    # In system context, we can upgrade both system and user context apps
-    # Include apps if: no context properties defined, OR SystemContext is true, OR UserContext is true
-    $whitelistConfig = $whitelistConfig | Where-Object {
-        # If neither property exists, include the app
-        ((-not $_.PSObject.Properties['SystemContext']) -and (-not $_.PSObject.Properties['UserContext'])) -or
-        # Or if SystemContext is explicitly true
-        ($_.SystemContext -eq $true) -or
-        # Or if UserContext is explicitly true
-        ($_.UserContext -eq $true)
-    }
-
-    try {
-        # call winget and check if we need to retry
-        $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
-        Write-Log -Message "Successfully executed winget upgrade in system context"
-    } catch {
-        Write-Log -Message "Error executing winget in system context: $($_.Exception.Message)"
-        Write-Log -Message "Winget execution failed, exiting"
-        exit 1
-    }
-    
-    # Check if first output is valid (contains actual app data)
-    $hasValidOutput = $false
-    foreach ($line in $OUTPUT) {
-        if ($line -like "Name*Id*Version*Available*Source*") {
-            $hasValidOutput = $true
-            break
-        }
-    }
-    
-    # If first output is nonsense, run again
-    if (-not $hasValidOutput) {
-        Write-Log -Message "First winget run produced invalid output, retrying..."
-        $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
-    }
-#    $OUTPUT = $OUTPUT.replace("Γ","").replace("Ç","").replace("ª","")
 }
 
-if ( (-Not ($ras)) -or $WingetPath) {
+# Parse winget output and process apps
+if ($OUTPUT) {
     $headerLine = -1
     $lineCount = 0
 
@@ -1561,6 +1988,7 @@ if ( (-Not ($ras)) -or $WingetPath) {
         $str = $OUTPUT[$headerLine]
         $idPos = $str.indexOf("Id")
         $versionPos = $str.indexOf("Version")-1
+        $availablePos = $str.indexOf("Available")-1
 
         $LIST= [System.Collections.ArrayList]::new()
         for ($i = $headerLine+2; $i -lt $OUTPUT.count; $i++ ) {
@@ -1569,20 +1997,57 @@ if ( (-Not ($ras)) -or $WingetPath) {
             if ($lineData -like "*upgrade available, but require*" -or $lineData.Trim() -eq "" -or $lineData -like "*following packages*") {
                 break
             }
+            
+            # Extract AppID, current version, and available version
             $appId = ($lineData[$idPos..$versionPos] -Join "").trim()
             if ($appId -ne "") {
-                $null = $LIST.Add($appId)
+                # Extract current version (between Version and Available columns)
+                $currentVersion = ""
+                $availableVersion = ""
+                
+                if ($availablePos -gt $versionPos) {
+                    $currentVersionEnd = $availablePos
+                    # Find the start of Version column content
+                    $versionStart = $versionPos + 1
+                    while ($versionStart -lt $lineData.Length -and $lineData[$versionStart] -eq ' ') {
+                        $versionStart++
+                    }
+                    if ($versionStart -lt $currentVersionEnd) {
+                        $currentVersion = ($lineData[$versionStart..$currentVersionEnd] -Join "").trim()
+                    }
+                    
+                    # Extract available version (from Available column to end)
+                    $availableStart = $availablePos + 1
+                    while ($availableStart -lt $lineData.Length -and $lineData[$availableStart] -eq ' ') {
+                        $availableStart++
+                    }
+                    # Find end of available version (next column or end of line)
+                    $sourcePos = $str.indexOf("Source")
+                    $availableEnd = if ($sourcePos -gt $availablePos) { $sourcePos - 1 } else { $lineData.Length - 1 }
+                    
+                    if ($availableStart -lt $lineData.Length -and $availableStart -le $availableEnd) {
+                        $availableVersion = ($lineData[$availableStart..$availableEnd] -Join "").trim()
+                    }
+                }
+                
+                # Create enhanced app object with version information
+                $appInfo = @{
+                    AppID = $appId
+                    CurrentVersion = $currentVersion
+                    AvailableVersion = $availableVersion
+                }
+                $null = $LIST.Add($appInfo)
             }
         }
 
         $count = 0
         $message = ""
 
-        foreach ($app in $LIST) {
-            if ($app -ne "") {
+        foreach ($appInfo in $LIST) {
+            if ($appInfo.AppID -ne "") {
                 $doUpgrade = $false
                 foreach ($okapp in $whitelistConfig) {
-                    if ($app -eq $okapp.AppID) {
+                    if ($appInfo.AppID -eq $okapp.AppID) {
                         $blockingProcessNames = $okapp.BlockingProcess
                         if (-not [string]::IsNullOrEmpty($blockingProcessNames)) {
                             $processesToCheck = $blockingProcessNames -split ','
@@ -1655,7 +2120,7 @@ if ( (-Not ($ras)) -or $WingetPath) {
                                     $customTimeout = if ($okapp.TimeoutSeconds -and $okapp.TimeoutSeconds -gt 0) { $okapp.TimeoutSeconds } else { 60 }
                                     
                                     Write-Log -Message "Using timeout: ${customTimeout}s, default action: $defaultTimeoutAction" | Out-Null
-                                    $userChoice = Show-ProcessCloseDialog -AppName $okapp.AppID -ProcessName $runningProcessName -TimeoutSeconds $customTimeout -DefaultTimeoutAction $defaultTimeoutAction -FriendlyName $okapp.FriendlyName
+                                    $userChoice = Show-ProcessCloseDialog -AppName $okapp.AppID -ProcessName $runningProcessName -TimeoutSeconds $customTimeout -DefaultTimeoutAction $defaultTimeoutAction -FriendlyName $okapp.FriendlyName -CurrentVersion $appInfo.CurrentVersion -AvailableVersion $appInfo.AvailableVersion
                                     
                                     Write-Log -Message "Show-ProcessCloseDialog returned: $userChoice (type: $($userChoice.GetType().Name))"
                                 }
@@ -1700,8 +2165,14 @@ if ( (-Not ($ras)) -or $WingetPath) {
                             }
                         }
                         
-                        if ($ras -or $userIsAdmin) {
-                            Write-Log -Message "Upgrade $($okapp.AppID) in system context"
+                        # Determine if we can perform the upgrade based on context
+                        if ((Test-RunningAsSystem) -or $userIsAdmin) {
+                            Write-Log -Message "Upgrade $($okapp.AppID) in system/admin context"
+                            $doUpgrade = $true
+                            break  # Break out of whitelist loop to proceed with upgrade
+                        } elseif (-not (Test-RunningAsSystem)) {
+                            # User context without admin - allow user-scope upgrades only
+                            Write-Log -Message "Upgrade $($okapp.AppID) in user context (user-scope only)"
                             $doUpgrade = $true
                             break  # Break out of whitelist loop to proceed with upgrade
                         }
@@ -1710,17 +2181,20 @@ if ( (-Not ($ras)) -or $WingetPath) {
 
                 if ($doUpgrade) {
                     $count++
-                    Write-Log -Message "Starting upgrade for: $app"
+                    Write-Log -Message "Starting upgrade for: $($appInfo.AppID)"
                     
                     try {
-                        Write-Log -Message "Executing winget upgrade for: $app"
+                        Write-Log -Message "Executing winget upgrade for: $($appInfo.AppID)"
                         
-                        # First attempt: Standard upgrade
-                        if ($ras) {
-                            $upgradeResult = & .\winget.exe upgrade --silent --accept-source-agreements --id $app 2>&1
-                        }
-                        else {
-                            $upgradeResult = & winget upgrade --silent --accept-source-agreements --id $app 2>&1
+                        # First attempt: Standard upgrade - use appropriate winget path and scope based on context
+                        if ((Test-RunningAsSystem) -and $WingetPath) {
+                            $upgradeResult = & .\winget.exe upgrade --silent --accept-source-agreements --id $appInfo.AppID 2>&1
+                        } elseif ($userIsAdmin) {
+                            $upgradeResult = & winget upgrade --silent --accept-source-agreements --id $appInfo.AppID 2>&1
+                        } else {
+                            # User context without admin - use user scope
+                            Write-Log -Message "Using --scope user for non-admin user context upgrade"
+                            $upgradeResult = & winget upgrade --silent --accept-source-agreements --scope user --id $appInfo.AppID 2>&1
                         }
                         
                         $upgradeOutput = $upgradeResult -join "`n"
@@ -1738,72 +2212,92 @@ if ( (-Not ($ras)) -or $WingetPath) {
                         
                         if ($meaningfulLines.Count -gt 0) {
                             $logMessage = ($meaningfulLines | Select-Object -First 2) -join ' | '
-                            Write-Log -Message "Winget result for $app : $logMessage"
+                            Write-Log -Message "Winget result for $($appInfo.AppID) : $logMessage"
                         } else {
-                            Write-Log -Message "Winget result for $app : Processing completed"
+                            Write-Log -Message "Winget result for $($appInfo.AppID) : Processing completed"
                         }
                         
                         # Handle specific failure cases
                         if ($upgradeOutput -like "*install technology is different*") {
-                            Write-Log -Message "Install technology mismatch detected for $app. Attempting uninstall and reinstall."
+                            Write-Log -Message "Install technology mismatch detected for $($appInfo.AppID). Attempting uninstall and reinstall."
                             
-                            # First uninstall
-                            if ($ras) {
-                                $uninstallResult = & .\winget.exe uninstall --silent --id $app 2>&1
+                            # First uninstall - use appropriate winget path and scope based on context
+                            if ((Test-RunningAsSystem) -and $WingetPath) {
+                                $uninstallResult = & .\winget.exe uninstall --silent --id $appInfo.AppID 2>&1
+                            } elseif ($userIsAdmin) {
+                                $uninstallResult = & winget uninstall --silent --id $appInfo.AppID 2>&1
                             } else {
-                                $uninstallResult = & winget uninstall --silent --id $app 2>&1
+                                # User context without admin - use user scope
+                                $uninstallResult = & winget uninstall --silent --scope user --id $appInfo.AppID 2>&1
                             }
                             
                             $uninstallOutput = $uninstallResult -join "`n"
                             if ($uninstallOutput -like "*Successfully uninstalled*") {
-                                Write-Log -Message "Successfully uninstalled $app"
+                                Write-Log -Message "Successfully uninstalled $($appInfo.AppID)"
                             } else {
-                                Write-Log -Message "Uninstall issue for $app"
+                                Write-Log -Message "Uninstall issue for $($appInfo.AppID)"
                             }
                             
                             # Wait a moment for cleanup
                             Start-Sleep -Seconds 2
                             
-                            # Then install fresh
-                            if ($ras) {
-                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements --id $app 2>&1
+                            # Then install fresh - use appropriate winget path and scope based on context
+                            if ((Test-RunningAsSystem) -and $WingetPath) {
+                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements --id $appInfo.AppID 2>&1
+                            } elseif ($userIsAdmin) {
+                                $upgradeResult = & winget install --silent --accept-source-agreements --id $appInfo.AppID 2>&1
                             } else {
-                                $upgradeResult = & winget install --silent --accept-source-agreements --id $app 2>&1
+                                # User context without admin - use user scope
+                                $upgradeResult = & winget install --silent --accept-source-agreements --scope user --id $appInfo.AppID 2>&1
                             }
                             
                             $upgradeOutput = $upgradeResult -join "`n"
-                            Write-Log -Message "Fresh install completed for $app"
+                            Write-Log -Message "Fresh install completed for $($appInfo.AppID)"
                             
                         } elseif ($upgradeOutput -like "*Uninstall failed*") {
-                            Write-Log -Message "Uninstall failure detected for $app. Trying alternative approaches."
+                            Write-Log -Message "Uninstall failure detected for $($appInfo.AppID). Trying alternative approaches."
                             
-                            # Try install with --force to override
-                            if ($ras) {
-                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements --force --id $app 2>&1
+                            # Try install with --force to override - use appropriate winget path and scope based on context
+                            if ((Test-RunningAsSystem) -and $WingetPath) {
+                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements --force --id $appInfo.AppID 2>&1
+                            } elseif ($userIsAdmin) {
+                                $upgradeResult = & winget install --silent --accept-source-agreements --force --id $appInfo.AppID 2>&1
                             } else {
-                                $upgradeResult = & winget install --silent --accept-source-agreements --force --id $app 2>&1
+                                # User context without admin - use user scope
+                                $upgradeResult = & winget install --silent --accept-source-agreements --scope user --force --id $appInfo.AppID 2>&1
                             }
                             
                             $upgradeOutput = $upgradeResult -join "`n"
-                            Write-Log -Message "Force install completed for $app"
+                            Write-Log -Message "Force install completed for $($appInfo.AppID)"
                         }
                         
                         # Evaluate success
                         if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*") {
-                            Write-Log -Message "Upgrade completed successfully for: $app"
-                            $message += $app + "|"
+                            Write-Log -Message "Upgrade completed successfully for: $($appInfo.AppID)"
+                            $message += $appInfo.AppID + "|"
                         } else {
-                            Write-Log -Message "Upgrade failed for $app - Exit code: $LASTEXITCODE"
-                            $message += $app + " (FAILED)|"
+                            Write-Log -Message "Upgrade failed for $($appInfo.AppID) - Exit code: $LASTEXITCODE"
+                            $message += $appInfo.AppID + " (FAILED)|"
                         }
                     } catch {
-                        Write-Log -Message "Error upgrading $app : $($_.Exception.Message)"
-                        $message += $app + " (ERROR)|"
+                        Write-Log -Message "Error upgrading $($appInfo.AppID) : $($_.Exception.Message)"
+                        $message += $appInfo.AppID + " (ERROR)|"
                     }
                 }
             }
         }
 
+        # If we're in SYSTEM context and processed system apps, now schedule user context remediation
+        if ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
+            Write-Log -Message "SYSTEM context processing complete - scheduling user context remediation"
+            $userScheduled = Schedule-UserContextRemediation
+            if ($userScheduled) {
+                Write-Log -Message "User context remediation scheduled successfully"
+            } else {
+                Write-Log -Message "User context remediation scheduling failed or no user logged in"
+            }
+        }
+        
         Write-Log -Message "[$ScriptTag] Remediation completed: $count apps processed"
         if ($message -ne "") {
             Write-Log -Message "[$ScriptTag] Apps upgraded: $message"
