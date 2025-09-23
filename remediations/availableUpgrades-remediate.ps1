@@ -58,10 +58,12 @@
 #>
 
 param(
-    [switch]$UserRemediationOnly
+    [switch]$UserRemediationOnly,
+    [string]$RemediationResultFile
 )
 
-#Requires -RunAsAdministrator
+# Note: Admin requirement is conditional - not needed for user context execution (UserRemediationOnly mode)
+# #Requires -RunAsAdministrator
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 function Test-RunningAsSystem {
@@ -167,78 +169,158 @@ function Get-InteractiveUser {
     <#
     .SYNOPSIS
         Gets the currently logged-in interactive user and their SID (Azure AD compatible)
+    .DESCRIPTION
+        Uses improved detection method that properly handles Azure AD users
     #>
     
     try {
-        Write-Log "Detecting interactive user using Win32_ComputerSystem..." | Out-Null
+        Write-Log "Detecting interactive user using improved Azure AD compatible method..." | Out-Null
+        $userDetectionStart = Get-Date
         
-        # Primary method - proven to work with Azure AD
+        # Improved user detection method that handles Azure AD properly
         try {
-            $loggedInUser = Get-WmiObject -Class Win32_ComputerSystem | Select-Object username -ExpandProperty username
-            if (-not $loggedInUser) {
-                $Message = "User is not logged on to the primary session: No username returned from Win32_ComputerSystem"
-                Throw $Message
+            # Try CIM instance first, fallback to WMI
+            $loggedInUser = $null
+            $LoggedSID = $null
+            $CurrentAzureADUser = $null
+            
+            try {
+                Write-Log "Attempting user detection via CIM..." | Out-Null
+                $cimStart = Get-Date
+                
+                # Add timeout protection for CIM call
+                $cimJob = Start-Job -ScriptBlock {
+                    Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object -ExpandProperty Username
+                }
+                
+                if (Wait-Job $cimJob -Timeout 15) {
+                    $loggedInUser = Receive-Job $cimJob
+                    $cimDuration = (Get-Date) - $cimStart
+                    Write-Log "CIM call completed in $($cimDuration.TotalSeconds) seconds" | Out-Null
+                    
+                    if ($loggedInUser) {
+                        $LoggedSID = (([System.Security.Principal.NTAccount]$loggedInUser).Translate([System.Security.Principal.SecurityIdentifier]).Value)
+                        Write-Log "CIM method successful - User: $loggedInUser, SID: $LoggedSID" | Out-Null
+                    }
+                } else {
+                    $cimDuration = (Get-Date) - $cimStart
+                    Write-Log "CIM call timed out after $($cimDuration.TotalSeconds) seconds" | Out-Null
+                    Remove-Job $cimJob -Force
+                    throw "CIM timeout"
+                }
+                Remove-Job $cimJob -Force
+                
+            } catch {
+                Write-Log "CIM method failed: $($_.Exception.Message). Trying WMI fallback..." | Out-Null
+                try {
+                    Write-Log "Attempting user detection via WMI..." | Out-Null
+                    $wmiStart = Get-Date
+                    
+                    # Add timeout protection for WMI call
+                    $wmiJob = Start-Job -ScriptBlock {
+                        Get-WmiObject -Class Win32_ComputerSystem | Select-Object -ExpandProperty Username
+                    }
+                    
+                    if (Wait-Job $wmiJob -Timeout 15) {
+                        $loggedInUser = Receive-Job $wmiJob
+                        $wmiDuration = (Get-Date) - $wmiStart
+                        Write-Log "WMI call completed in $($wmiDuration.TotalSeconds) seconds" | Out-Null
+                        
+                        if ($loggedInUser) {
+                            $LoggedSID = (([System.Security.Principal.NTAccount]$loggedInUser).Translate([System.Security.Principal.SecurityIdentifier]).Value)
+                            Write-Log "WMI fallback successful - User: $loggedInUser, SID: $LoggedSID" | Out-Null
+                        }
+                    } else {
+                        $wmiDuration = (Get-Date) - $wmiStart
+                        Write-Log "WMI call timed out after $($wmiDuration.TotalSeconds) seconds" | Out-Null
+                        Remove-Job $wmiJob -Force
+                        throw "WMI timeout"
+                    }
+                    Remove-Job $wmiJob -Force
+                    
+                } catch {
+                    Write-Log "Both CIM and WMI methods failed: $($_.Exception.Message)" | Out-Null
+                    throw "No logged in user detected via CIM or WMI"
+                }
             }
             
-            $username = ($loggedInUser -split '\\')[1]
+            if (-not $loggedInUser -or -not $LoggedSID) {
+                throw "User detection failed - no logged in user found"
+            }
+            
+            # Try to get Azure AD username from registry with timeout protection
+            try {
+                $azureAdPath = "HKLM:\SOFTWARE\Microsoft\IdentityStore\Cache\$LoggedSID\IdentityCache\$LoggedSID"
+                Write-Log "Checking for Azure AD user info at: $azureAdPath" | Out-Null
+                $registryStart = Get-Date
+                
+                # Registry access should be fast, but add timeout protection just in case
+                $registryJob = Start-Job -ScriptBlock {
+                    param($Path)
+                    (Get-ItemProperty -ErrorAction Stop -Path $Path -Name UserName).UserName
+                } -ArgumentList $azureAdPath
+                
+                if (Wait-Job $registryJob -Timeout 5) {
+                    $CurrentAzureADUser = Receive-Job $registryJob
+                    $registryDuration = (Get-Date) - $registryStart
+                    Write-Log "Found Azure AD username: $CurrentAzureADUser (retrieved in $($registryDuration.TotalSeconds)s)" | Out-Null
+                } else {
+                    $registryDuration = (Get-Date) - $registryStart
+                    Write-Log "Registry call timed out after $($registryDuration.TotalSeconds) seconds" | Out-Null
+                    $CurrentAzureADUser = $null
+                }
+                Remove-Job $registryJob -Force
+                
+            } catch {
+                Write-Log "No Azure AD user info found (user may be local): $($_.Exception.Message)" | Out-Null
+                $CurrentAzureADUser = $null
+            }
+            
+            # Parse domain and username from Windows logon
+            $windowsUsername = ($loggedInUser -split '\\')[1]
             $domain = ($loggedInUser -split '\\')[0]
             
-            Write-Log "Found logged in user: $loggedInUser" | Out-Null
-            Write-Log "Extracted username: $username" | Out-Null
-            Write-Log "Extracted domain: $domain" | Out-Null
+            # Important distinction for Azure AD environments:
+            # - Windows Username: Used for profile paths (e.g., HenrikSkovgaard-clou)
+            # - Azure AD UPN: Used for Azure AD operations (e.g., henrik@cloudonly.dk)
+            # - For scheduled tasks and file paths, we typically need the Windows username
+            
+            Write-Log "User detection results:" | Out-Null
+            Write-Log "  - Full Name: $loggedInUser" | Out-Null
+            Write-Log "  - Domain: $domain" | Out-Null
+            Write-Log "  - Windows Username (profile): $windowsUsername" | Out-Null
+            Write-Log "  - Azure AD UPN: $(if ($CurrentAzureADUser) { $CurrentAzureADUser } else { 'N/A' })" | Out-Null
+            Write-Log "  - SID: $LoggedSID" | Out-Null
+            
+            # Verify profile path exists for Windows username
+            $profilePath = "C:\Users\$windowsUsername"
+            $profileExists = Test-Path $profilePath
+            Write-Log "  - Profile Path: $profilePath (Exists: $profileExists)" | Out-Null
+            
+            return @{
+                Username = $windowsUsername              # Windows username for file operations
+                FullName = $loggedInUser                # Full domain\username format
+                Domain = $domain                        # Domain name
+                SID = $LoggedSID                       # User SID
+                AzureADUser = $CurrentAzureADUser      # Azure AD UPN (if available)
+                ProfilePath = $profilePath             # User profile directory
+                ProfileExists = $profileExists        # Whether profile directory exists
+                SessionId = $null                      # Not available with this method
+            }
             
         } catch [Exception] {
-            $Message = "User is not logged on to the primary session: $_"
+            $userDetectionDuration = (Get-Date) - $userDetectionStart
+            $Message = "User detection failed after $($userDetectionDuration.TotalSeconds) seconds: $_"
             Write-Log $Message | Out-Null
             Throw $Message
         }
         
-        # Get user SID for reliable task creation
-        $userSid = $null
-        
-        # Method 1: Try with full domain\username format
-        try {
-            $userSid = (New-Object System.Security.Principal.NTAccount($loggedInUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-            Write-Log "Successfully got SID using full name ($loggedInUser): $userSid" | Out-Null
-        } catch {
-            Write-Log "Could not get SID using full name: $($_.Exception.Message)" | Out-Null
-        }
-        
-        # Method 2: Try with just username if full name failed
-        if (-not $userSid) {
-            try {
-                $userSid = (New-Object System.Security.Principal.NTAccount($username)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-                Write-Log "Successfully got SID using username ($username): $userSid" | Out-Null
-            } catch {
-                Write-Log "Could not get SID using username: $($_.Exception.Message)" | Out-Null
-            }
-        }
-        
-        # Method 3: Try with domain prefix if available
-        if (-not $userSid -and $domain -ne $env:COMPUTERNAME) {
-            try {
-                $domainUser = "$domain\$username"
-                $userSid = (New-Object System.Security.Principal.NTAccount($domainUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-                Write-Log "Successfully got SID using domain format ($domainUser): $userSid" | Out-Null
-            } catch {
-                Write-Log "Could not get SID using domain format: $($_.Exception.Message)" | Out-Null
-            }
-        }
-        
-        if (-not $userSid) {
-            Write-Log "Warning: Could not obtain user SID, task creation may fail" | Out-Null
-        }
-        
-        return @{
-            Username = $username
-            FullName = $loggedInUser
-            Domain = $domain
-            SID = $userSid
-            SessionId = $null  # Not available with this method
-        }
+        $userDetectionDuration = (Get-Date) - $userDetectionStart
+        Write-Log "User detection completed successfully in $($userDetectionDuration.TotalSeconds) seconds" | Out-Null
         
     } catch {
-        Write-Log "Error getting interactive user: $($_.Exception.Message)" | Out-Null
+        $userDetectionDuration = (Get-Date) - $userDetectionStart
+        Write-Log "Error getting interactive user after $($userDetectionDuration.TotalSeconds) seconds: $($_.Exception.Message)" | Out-Null
         return $null
     }
 }
@@ -254,7 +336,8 @@ function New-UserPromptTask {
         [string]$ScriptPath,
         [string]$ResponseFile,
         [string]$QuestionText,
-        [string]$TitleText
+        [string]$TitleText,
+        [int]$TimeoutSeconds = 60
     )
     
     try {
@@ -1083,7 +1166,7 @@ try {
         Write-Log "User script path: $userPromptScriptPath" | Out-Null
         
         # Create scheduled task using the working PowerShell Task Scheduler approach
-        $createdTaskName = New-UserPromptTask -UserInfo $userInfo -ScriptPath $userPromptScriptPath -ResponseFile $responseFile -QuestionText $Question -TitleText $Title
+        $createdTaskName = New-UserPromptTask -UserInfo $userInfo -ScriptPath $userPromptScriptPath -ResponseFile $responseFile -QuestionText $Question -TitleText $Title -TimeoutSeconds $TimeoutSeconds
         
         if (-not $createdTaskName) {
             Write-Log "Failed to create scheduled task" | Out-Null
@@ -1148,9 +1231,10 @@ function Show-ProcessCloseDialog {
     <#
     .SYNOPSIS
         Shows a user dialog asking whether to close a blocking process for application update
+        Now integrated with deferral system for enhanced user experience
     .DESCRIPTION
-        Uses the modern WPF-based notification system to prompt the user from SYSTEM context
-        Preserves all whitelist configuration features with enhanced reliability
+        Uses the modern WPF-based notification system with deferral capabilities
+        Checks deferral status and shows appropriate dialog (simple close or deferral options)
     .PARAMETER AppName
         Application ID for the update
     .PARAMETER ProcessName
@@ -1165,8 +1249,10 @@ function Show-ProcessCloseDialog {
         Current version of the application
     .PARAMETER AvailableVersion
         Available version for update
+    .PARAMETER WhitelistConfig
+        Whitelist configuration object for the app
     .OUTPUTS
-        Boolean indicating user choice (true = close app, false = keep open)
+        Hashtable with user choice: @{ CloseProcess = [bool]; DeferralDays = [int]; Action = "Update|Defer" }
     #>
     param(
         [string]$AppName,
@@ -1175,7 +1261,8 @@ function Show-ProcessCloseDialog {
         [bool]$DefaultTimeoutAction = $false,
         [string]$FriendlyName = "",
         [string]$CurrentVersion = "",
-        [string]$AvailableVersion = ""
+        [string]$AvailableVersion = "",
+        [object]$WhitelistConfig = $null
     )
 
     Write-Log -Message "Show-ProcessCloseDialog called for $AppName" | Out-Null
@@ -1186,46 +1273,98 @@ function Show-ProcessCloseDialog {
     Write-Log -Message "Friendly name resolved to: $friendlyName" | Out-Null
 
     try {
-        # Create the question text with version information
-        $versionText = ""
-        if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
-            $versionText = "$friendlyName $CurrentVersion -> $AvailableVersion update available`n`n"
-        } else {
-            $versionText = "An update is available for $friendlyName`n`n"
+        # Check deferral status if whitelist config is provided
+        $deferralStatus = $null
+        $hasDeferralSupport = $false
+        
+        if ($WhitelistConfig -and $WhitelistConfig.DeferralEnabled -eq $true) {
+            Write-Log -Message "Checking deferral status for $AppName" | Out-Null
+            $deferralStatus = Get-DeferralStatus -AppID $AppName -WhitelistConfig $WhitelistConfig -AvailableVersion $AvailableVersion
+            $hasDeferralSupport = $true
         }
         
-        $question = "${versionText}The application cannot be updated while it is running.`n`nWould you like to close $friendlyName now to allow the update to proceed?"
-        $title = if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
-            "Update ${friendlyName}: ${CurrentVersion} -> ${AvailableVersion}"
+        # Determine dialog type based on deferral status
+        if ($hasDeferralSupport -and $deferralStatus) {
+            Write-Log -Message "Using deferral-enabled dialog for $AppName (CanDefer: $($deferralStatus.CanDefer), ForceUpdate: $($deferralStatus.ForceUpdate))" | Out-Null
+            
+            # Show enhanced deferral dialog with configured timeout
+            $deferralChoice = Show-DeferralDialog -AppName $AppName -DeferralStatus $deferralStatus -ProcessName $ProcessName -FriendlyName $friendlyName -CurrentVersion $CurrentVersion -AvailableVersion $AvailableVersion -TimeoutSeconds $TimeoutSeconds
+            
+            # Record deferral choice if user chose to defer
+            if ($deferralChoice.Action -eq "Defer" -and $deferralChoice.DeferralDays -gt 0) {
+                $deferralRecorded = Set-DeferralChoice -AppID $AppName -DeferralDays $deferralChoice.DeferralDays
+                if ($deferralRecorded) {
+                    Write-Log -Message "Recorded user deferral choice: $($deferralChoice.DeferralDays) days for $AppName" | Out-Null
+                } else {
+                    Write-Log -Message "Failed to record deferral choice - proceeding with update" | Out-Null
+                    $deferralChoice.Action = "Update"
+                    $deferralChoice.CloseProcess = $true
+                }
+            }
+            
+            # Return structured response
+            return @{
+                CloseProcess = $deferralChoice.CloseProcess
+                DeferralDays = $deferralChoice.DeferralDays
+                Action = $deferralChoice.Action
+                UserChoice = ($deferralChoice.Action -eq "Update")
+            }
+            
         } else {
-            "${friendlyName} Update Available"
+            # Use legacy simple dialog for apps without deferral support
+            Write-Log -Message "Using legacy dialog for $AppName (no deferral support)" | Out-Null
+            
+            # Create the question text with version information
+            $versionText = ""
+            if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
+                $versionText = "$friendlyName $CurrentVersion -> $AvailableVersion update available`n`n"
+            } else {
+                $versionText = "An update is available for $friendlyName`n`n"
+            }
+            
+            $question = "${versionText}The application cannot be updated while it is running.`n`nWould you like to close $friendlyName now to allow the update to proceed?"
+            $title = if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
+                "Update ${friendlyName}: ${CurrentVersion} -> ${AvailableVersion}"
+            } else {
+                "${friendlyName} Update Available"
+            }
+            
+            # Convert DefaultTimeoutAction boolean to string format
+            $defaultActionString = if ($DefaultTimeoutAction) { "OK" } else { "Cancel" }
+            
+            Write-Log -Message "Showing legacy WPF dialog for $friendlyName with ${TimeoutSeconds}s timeout, default action: $defaultActionString" | Out-Null
+            
+            # Call the context-aware dialog system
+            $response = Show-UserDialog -Question $question -Title $title -TimeoutSeconds $TimeoutSeconds -DefaultAction $defaultActionString
+            
+            Write-Log -Message "Legacy WPF dialog response: $response" | Out-Null
+            
+            # Convert response back to boolean and return structured response
+            $userChoice = ($response -eq "OK")
+            
+            if ($userChoice) {
+                Write-Log -Message "User chose to close $friendlyName for update" | Out-Null
+            } else {
+                Write-Log -Message "User chose to keep $friendlyName open" | Out-Null
+            }
+            
+            return @{
+                CloseProcess = $userChoice
+                DeferralDays = 0
+                Action = if ($userChoice) { "Update" } else { "Cancel" }
+                UserChoice = $userChoice
+            }
         }
-        
-        # Convert DefaultTimeoutAction boolean to string format
-        $defaultActionString = if ($DefaultTimeoutAction) { "OK" } else { "Cancel" }
-        
-        Write-Log -Message "Showing WPF dialog for $friendlyName with ${TimeoutSeconds}s timeout, default action: $defaultActionString" | Out-Null
-        
-        # Call the context-aware dialog system
-        $response = Show-UserDialog -Question $question -Title $title -TimeoutSeconds $TimeoutSeconds -DefaultAction $defaultActionString
-        
-        Write-Log -Message "WPF dialog response: $response" | Out-Null
-        
-        # Convert response back to boolean
-        $userChoice = ($response -eq "OK")
-        
-        if ($userChoice) {
-            Write-Log -Message "User chose to close $friendlyName for update" | Out-Null
-        } else {
-            Write-Log -Message "User chose to keep $friendlyName open" | Out-Null
-        }
-        
-        return $userChoice
         
     } catch {
         Write-Log -Message "Show-ProcessCloseDialog failed: $($_.Exception.Message)" | Out-Null
         Write-Log -Message "Using default timeout action: $DefaultTimeoutAction" | Out-Null
-        return $DefaultTimeoutAction
+        return @{
+            CloseProcess = $DefaultTimeoutAction
+            DeferralDays = 0
+            Action = if ($DefaultTimeoutAction) { "Update" } else { "Cancel" }
+            UserChoice = $DefaultTimeoutAction
+        }
     }
 }
 
@@ -1253,7 +1392,7 @@ function Show-DirectUserDialog {
         Add-Type -AssemblyName WindowsBase -ErrorAction Stop
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
         
-        # Create simple XAML dialog
+        # Create modern dark-themed XAML dialog
         $xaml = @"
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -1262,45 +1401,134 @@ function Show-DirectUserDialog {
     Width="420"
     MinHeight="140"
     SizeToContent="Height"
-    WindowStartupLocation="CenterScreen"
+    WindowStartupLocation="Manual"
     ResizeMode="NoResize"
-    WindowStyle="SingleBorderWindow"
+    WindowStyle="None"
+    AllowsTransparency="True"
+    Background="Transparent"
     Topmost="True"
-    ShowInTaskbar="True">
+    ShowInTaskbar="False">
     
-    <Grid Margin="16">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
+    <Window.Triggers>
+        <EventTrigger RoutedEvent="Window.Loaded">
+            <BeginStoryboard>
+                <Storyboard>
+                    <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                     From="0" To="1" Duration="0:0:0.3"/>
+                    <ThicknessAnimation Storyboard.TargetProperty="Margin"
+                                        From="0,50,0,0" To="0,0,0,0" Duration="0:0:0.3"/>
+                </Storyboard>
+            </BeginStoryboard>
+        </EventTrigger>
+    </Window.Triggers>
+    
+    <Border Name="MainBorder"
+            Background="#FF1F1F1F"
+            CornerRadius="8"
+            BorderBrush="#FF323232"
+            BorderThickness="1">
+        <Border.Effect>
+            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
+        </Border.Effect>
         
-        <!-- Question -->
-        <TextBlock Grid.Row="0"
-                   Text="$Question"
-                   TextWrapping="Wrap"
-                   Margin="0,0,0,16"
-                   FontSize="12"/>
-        
-        <!-- Buttons -->
-        <StackPanel Grid.Row="1"
-                    Orientation="Horizontal"
-                    HorizontalAlignment="Right">
+        <Grid Margin="16,12,16,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="32"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
             
-            <Button Name="CancelButton"
-                    Content="Cancel"
-                    Width="60"
-                    Height="24"
-                    Margin="0,0,8,0"
-                    IsDefault="false"/>
+            <!-- Icon -->
+            <Ellipse Grid.Column="0" Grid.RowSpan="2"
+                     Width="24" Height="24"
+                     Fill="#FF0078D4"
+                     VerticalAlignment="Top"
+                     Margin="0,2,0,0"/>
             
-            <Button Name="OKButton"
-                    Content="OK"
-                    Width="60"
-                    Height="24"
-                    IsDefault="true"/>
+            <TextBlock Grid.Column="0" Grid.RowSpan="2"
+                       Text="?"
+                       Foreground="White"
+                       FontSize="14"
+                       FontWeight="Bold"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Top"
+                       Margin="0,4,0,0"/>
             
-        </StackPanel>
-    </Grid>
+            <!-- Title -->
+            <TextBlock Grid.Column="1" Grid.Row="0"
+                       Text="$Title"
+                       Foreground="White"
+                       FontSize="14"
+                       FontWeight="SemiBold"
+                       Margin="12,0,0,2"
+                       TextWrapping="Wrap"/>
+            
+            <!-- Question -->
+            <TextBlock Grid.Column="1" Grid.Row="1"
+                       Text="$Question"
+                       Foreground="#FFCCCCCC"
+                       FontSize="12"
+                       Margin="12,0,0,8"
+                       TextWrapping="Wrap"/>
+            
+            <!-- Buttons -->
+            <StackPanel Grid.Column="1" Grid.Row="2"
+                        Orientation="Horizontal"
+                        HorizontalAlignment="Right"
+                        Margin="12,0,0,0">
+                
+                <Button Name="CancelButton"
+                        Content="Cancel"
+                        Width="60"
+                        Height="24"
+                        Margin="0,0,8,0"
+                        Background="Transparent"
+                        Foreground="#FFCCCCCC"
+                        BorderBrush="#FF484848"
+                        BorderThickness="1"
+                        FontSize="11"
+                        Cursor="Hand">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Style.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="#FF2A2A2A"/>
+                                    <Setter Property="Foreground" Value="White"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+                
+                <Button Name="OKButton"
+                        Content="OK"
+                        Width="60"
+                        Height="24"
+                        Background="#FF0078D4"
+                        Foreground="White"
+                        BorderBrush="Transparent"
+                        BorderThickness="0"
+                        FontSize="11"
+                        Cursor="Hand">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Style.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="#FF106EBE"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+                
+            </StackPanel>
+        </Grid>
+    </Border>
 </Window>
 "@
 
@@ -1315,7 +1543,36 @@ function Show-DirectUserDialog {
         # Set up result handling
         $script:dialogResult = $DefaultAction
         
-        # Create timeout timer
+        # Store original button text and determine which button gets countdown (SAME AS SYSTEM CONTEXT)
+        $originalOKText = $okButton.Content
+        $originalCancelText = $cancelButton.Content
+        $showCountdownOnOK = ($DefaultAction -eq "OK")
+        
+        Write-Log -Message "Countdown will be shown on: $(if ($showCountdownOnOK) { 'OK' } else { 'Cancel' }) button (DefaultAction: $DefaultAction)" | Out-Null
+        
+        # Create countdown timer (updates every second) - SAME AS SYSTEM CONTEXT
+        $script:timeRemaining = $TimeoutSeconds
+        $countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
+        
+        $countdownTimer.Add_Tick({
+            $script:timeRemaining--
+            Write-Log -Message "Countdown update: $($script:timeRemaining) seconds remaining" | Out-Null
+            
+            # Update the appropriate button with countdown
+            if ($showCountdownOnOK) {
+                $okButton.Content = "$originalOKText ($($script:timeRemaining))"
+            } else {
+                $cancelButton.Content = "$originalCancelText ($($script:timeRemaining))"
+            }
+            
+            # Stop countdown timer when we reach zero (main timeout timer will handle dialog close)
+            if ($script:timeRemaining -le 0) {
+                $countdownTimer.Stop()
+            }
+        })
+        
+        # Create main timeout timer - SAME AS SYSTEM CONTEXT
         $timer = New-Object System.Windows.Threading.DispatcherTimer
         $timer.Interval = [System.TimeSpan]::FromSeconds($TimeoutSeconds)
         
@@ -1323,13 +1580,15 @@ function Show-DirectUserDialog {
             Write-Log -Message "Direct dialog timeout reached - using default action: $DefaultAction" | Out-Null
             $script:dialogResult = $DefaultAction
             $timer.Stop()
+            $countdownTimer.Stop()
             $window.Close()
         })
         
-        # Button event handlers
+        # Button event handlers - SAME AS SYSTEM CONTEXT
         $okButton.Add_Click({
             Write-Log -Message "OK button clicked in direct dialog" | Out-Null
             $timer.Stop()
+            $countdownTimer.Stop()
             $script:dialogResult = "OK"
             $window.Close()
         })
@@ -1337,23 +1596,39 @@ function Show-DirectUserDialog {
         $cancelButton.Add_Click({
             Write-Log -Message "Cancel button clicked in direct dialog" | Out-Null
             $timer.Stop()
+            $countdownTimer.Stop()
             $script:dialogResult = "Cancel"
             $window.Close()
         })
         
-        # Handle window closing without button click
+        # Handle window closing without button click - SAME AS SYSTEM CONTEXT
         $window.Add_Closing({
             $timer.Stop()
+            $countdownTimer.Stop()
             if ($script:dialogResult -eq $null) {
                 Write-Log -Message "Direct dialog closed without button click - treating as Cancel" | Out-Null
                 $script:dialogResult = "Cancel"
             }
         })
         
-        # Start timeout timer and show dialog
+        # Position window like a native Windows toast notification
+        $window.Add_Loaded({
+            $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+            $taskbarHeight = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height - $workArea.Height
+            
+            # Position at bottom-right (near notification area)
+            $window.Left = $workArea.Width - $window.Width - 16
+            $window.Top = $workArea.Height - $window.Height - 16
+            Write-Log -Message "Direct dialog positioned at bottom-right (near notification area)" | Out-Null
+        })
+        
+        # Start both timers and show dialog - SAME AS SYSTEM CONTEXT
         $timer.Start()
+        $countdownTimer.Start()
+        Write-Log -Message "Direct dialog: Timeout and countdown timers started" | Out-Null
         $result = $window.ShowDialog()
         $timer.Stop()
+        $countdownTimer.Stop()
         
         Write-Log -Message "Direct dialog completed with result: $($script:dialogResult)" | Out-Null
         return $script:dialogResult
@@ -1361,6 +1636,570 @@ function Show-DirectUserDialog {
     } catch {
         Write-Log -Message "Error in direct user dialog: $($_.Exception.Message)" | Out-Null
         return $DefaultAction
+    }
+}
+
+function Show-MandatoryUpdateDialog {
+    <#
+    .SYNOPSIS
+        Shows a mandatory update dialog with only a Continue button
+    .DESCRIPTION
+        Used when updates are required and cannot be deferred - no Cancel option
+    #>
+    param(
+        [string]$Question,
+        [string]$Title = "Required Update",
+        [int]$TimeoutSeconds = 60,
+        [bool]$HasBlockingProcess = $false
+    )
+    
+    try {
+        if (Test-RunningAsSystem) {
+            # System context - use scheduled task approach
+            return Invoke-SystemMandatoryUpdatePrompt -Question $Question -Title $Title -TimeoutSeconds $TimeoutSeconds
+        } else {
+            # Direct user context
+            return Show-DirectMandatoryUpdateDialog -Question $Question -Title $Title -TimeoutSeconds $TimeoutSeconds
+        }
+    } catch {
+        Write-Log "Error in Show-MandatoryUpdateDialog: $($_.Exception.Message)" | Out-Null
+        return "Continue"  # Default to continuing with update
+    }
+}
+
+function Show-DirectMandatoryUpdateDialog {
+    <#
+    .SYNOPSIS
+        Direct user context mandatory update dialog with only Continue button
+    #>
+    param(
+        [string]$Question,
+        [string]$Title,
+        [int]$TimeoutSeconds = 60
+    )
+    
+    try {
+        Write-Log "Showing direct mandatory update dialog: '$Question'" | Out-Null
+        
+        # Load WPF assemblies
+        Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+        Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+        Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        
+        # Create modern dark-themed XAML dialog with only Continue button
+        $xaml = @"
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="$Title"
+    Width="420"
+    MinHeight="140"
+    SizeToContent="Height"
+    WindowStartupLocation="Manual"
+    ResizeMode="NoResize"
+    WindowStyle="None"
+    AllowsTransparency="True"
+    Background="Transparent"
+    Topmost="True"
+    ShowInTaskbar="False">
+    
+    <Window.Triggers>
+        <EventTrigger RoutedEvent="Window.Loaded">
+            <BeginStoryboard>
+                <Storyboard>
+                    <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                     From="0" To="1" Duration="0:0:0.3"/>
+                    <ThicknessAnimation Storyboard.TargetProperty="Margin"
+                                        From="0,50,0,0" To="0,0,0,0" Duration="0:0:0.3"/>
+                </Storyboard>
+            </BeginStoryboard>
+        </EventTrigger>
+    </Window.Triggers>
+    
+    <Border Name="MainBorder"
+            Background="#FF1F1F1F"
+            CornerRadius="8"
+            BorderBrush="#FF323232"
+            BorderThickness="1">
+        <Border.Effect>
+            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
+        </Border.Effect>
+        
+        <Grid Margin="16,12,16,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="32"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            
+            <!-- Icon -->
+            <Ellipse Grid.Column="0" Grid.RowSpan="2"
+                     Width="24" Height="24"
+                     Fill="#FFFF6B00"
+                     VerticalAlignment="Top"
+                     Margin="0,2,0,0"/>
+            
+            <TextBlock Grid.Column="0" Grid.RowSpan="2"
+                       Text="!"
+                       Foreground="White"
+                       FontSize="14"
+                       FontWeight="Bold"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Top"
+                       Margin="0,4,0,0"/>
+            
+            <!-- Title -->
+            <TextBlock Grid.Column="1" Grid.Row="0"
+                       Text="$Title"
+                       Foreground="White"
+                       FontSize="14"
+                       FontWeight="SemiBold"
+                       Margin="12,0,0,2"
+                       TextWrapping="Wrap"/>
+            
+            <!-- Question -->
+            <TextBlock Grid.Column="1" Grid.Row="1"
+                       Text="$Question"
+                       Foreground="#FFCCCCCC"
+                       FontSize="12"
+                       Margin="12,0,0,8"
+                       TextWrapping="Wrap"/>
+            
+            <!-- Button -->
+            <StackPanel Grid.Column="1" Grid.Row="2"
+                        Orientation="Horizontal"
+                        HorizontalAlignment="Right"
+                        Margin="12,0,0,0">
+                
+                <Button Name="ContinueButton"
+                        Content="Continue"
+                        Width="80"
+                        Height="24"
+                        Background="#FFFF6B00"
+                        Foreground="White"
+                        BorderBrush="Transparent"
+                        BorderThickness="0"
+                        FontSize="11"
+                        Cursor="Hand"
+                        IsDefault="true">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Style.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="#FFE55A00"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+                
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+        # Create window from XAML
+        $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+        $window = [Windows.Markup.XamlReader]::Load($reader)
+        
+        # Get button reference
+        $continueButton = $window.FindName("ContinueButton")
+        
+        # Set up result handling
+        $script:dialogResult = "Continue"
+        
+        # Store original button text for countdown
+        $originalButtonText = $continueButton.Content
+        
+        # Create countdown timer (updates every second)
+        $script:timeRemaining = $TimeoutSeconds
+        $countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
+        
+        $countdownTimer.Add_Tick({
+            $script:timeRemaining--
+            Write-Log "Mandatory dialog countdown: $($script:timeRemaining) seconds remaining" | Out-Null
+            
+            # Update button with countdown
+            $continueButton.Content = "$originalButtonText ($($script:timeRemaining))"
+            
+            # Stop countdown timer when we reach zero
+            if ($script:timeRemaining -le 0) {
+                $countdownTimer.Stop()
+            }
+        })
+        
+        # Create main timeout timer
+        $timer = New-Object System.Windows.Threading.DispatcherTimer
+        $timer.Interval = [System.TimeSpan]::FromSeconds($TimeoutSeconds)
+        
+        $timer.Add_Tick({
+            Write-Log "Mandatory dialog timeout reached - auto-continuing" | Out-Null
+            $script:dialogResult = "Continue"
+            $timer.Stop()
+            $countdownTimer.Stop()
+            $window.Close()
+        })
+        
+        # Button event handler
+        $continueButton.Add_Click({
+            Write-Log "Continue button clicked in mandatory dialog" | Out-Null
+            $timer.Stop()
+            $countdownTimer.Stop()
+            $script:dialogResult = "Continue"
+            $window.Close()
+        })
+        
+        # Handle window closing
+        $window.Add_Closing({
+            $timer.Stop()
+            $countdownTimer.Stop()
+            if ($script:dialogResult -eq $null) {
+                Write-Log "Mandatory dialog closed without button click - continuing anyway" | Out-Null
+                $script:dialogResult = "Continue"
+            }
+        })
+        
+        # Position window like a native Windows toast notification
+        $window.Add_Loaded({
+            $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+            
+            # Position at bottom-right (near notification area)
+            $window.Left = $workArea.Width - $window.Width - 16
+            $window.Top = $workArea.Height - $window.Height - 16
+            Write-Log "Mandatory dialog positioned at bottom-right" | Out-Null
+        })
+        
+        # Start both timers and show dialog
+        $timer.Start()
+        $countdownTimer.Start()
+        Write-Log "Mandatory dialog: Timeout and countdown timers started" | Out-Null
+        $result = $window.ShowDialog()
+        $timer.Stop()
+        $countdownTimer.Stop()
+        
+        Write-Log "Mandatory dialog completed with result: $($script:dialogResult)" | Out-Null
+        return $script:dialogResult
+        
+    } catch {
+        Write-Log "Error in direct mandatory dialog: $($_.Exception.Message)" | Out-Null
+        return "Continue"
+    }
+}
+
+function Invoke-SystemMandatoryUpdatePrompt {
+    <#
+    .SYNOPSIS
+        System context mandatory update dialog using scheduled tasks
+    #>
+    param(
+        [string]$Question,
+        [string]$Title,
+        [int]$TimeoutSeconds = 60
+    )
+    
+    try {
+        Write-Log "Invoking system mandatory update prompt" | Out-Null
+        
+        # Get interactive user
+        $userInfo = Get-InteractiveUser
+        if (-not $userInfo) {
+            Write-Log "No interactive user found - cannot show mandatory dialog" | Out-Null
+            return "Continue"
+        }
+        
+        # Create unique identifiers
+        $promptId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
+        
+        # Setup response file path
+        $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
+        $responseFile = if (Test-Path $userTempPath) {
+            Join-Path $userTempPath "MandatoryPrompt_$promptId`_Response.json"
+        } else {
+            Join-Path "C:\ProgramData\Temp" "MandatoryPrompt_$promptId`_Response.json"
+        }
+        
+        # Create mandatory prompt script
+        $mandatoryScriptPath = "$env:TEMP\Show-MandatoryPrompt_$promptId.ps1"
+        
+        $mandatoryScriptContent = @'
+param(
+    [string]$ResponseFilePath,
+    [string]$EncodedQuestion,
+    [string]$EncodedTitle,
+    [int]$TimeoutSeconds = 60
+)
+
+# Decode parameters
+$actualQuestion = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedQuestion))
+$actualTitle = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedTitle))
+
+# Load WPF assemblies
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName System.Windows.Forms
+
+# Use the decoded text and split on pipe separator for separate display
+$parts = $actualQuestion -split '\|'
+$versionInfo = if ($parts.Length -gt 0) { $parts[0].Trim() } else { $actualQuestion }
+$actionMessage = if ($parts.Length -gt 1) { $parts[1].Trim() } else { "" }
+
+$escapedTitle = [System.Security.SecurityElement]::Escape($actualTitle)
+$escapedVersionInfo = [System.Security.SecurityElement]::Escape($versionInfo)
+$escapedActionMessage = [System.Security.SecurityElement]::Escape($actionMessage)
+
+$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="$escapedTitle" Width="420" MinHeight="140" SizeToContent="Height" WindowStartupLocation="Manual"
+        ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
+        
+    <Window.Triggers>
+        <EventTrigger RoutedEvent="Window.Loaded">
+            <BeginStoryboard>
+                <Storyboard>
+                    <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                     From="0" To="1" Duration="0:0:0.3"/>
+                    <ThicknessAnimation Storyboard.TargetProperty="Margin"
+                                        From="0,50,0,0" To="0,0,0,0" Duration="0:0:0.3"/>
+                </Storyboard>
+            </BeginStoryboard>
+        </EventTrigger>
+    </Window.Triggers>
+        
+    <Border Background="#FF1F1F1F" CornerRadius="8" BorderBrush="#FF323232" BorderThickness="1">
+        <Border.Effect>
+            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
+        </Border.Effect>
+        <Grid Margin="16,12,16,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="32"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            
+            <!-- Icon -->
+            <Ellipse Grid.Column="0" Grid.RowSpan="3"
+                     Width="24" Height="24"
+                     Fill="#FFFF6B00"
+                     VerticalAlignment="Top"
+                     Margin="0,2,0,0"/>
+            
+            <TextBlock Grid.Column="0" Grid.RowSpan="3"
+                       Text="!"
+                       Foreground="White"
+                       FontSize="14"
+                       FontWeight="Bold"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Top"
+                       Margin="0,4,0,0"/>
+            
+            <!-- Title -->
+            <TextBlock Grid.Column="1" Grid.Row="0"
+                       Text="$escapedTitle"
+                       Foreground="White"
+                       FontSize="14"
+                       FontWeight="SemiBold"
+                       Margin="12,0,0,2"
+                       TextWrapping="Wrap"/>
+            
+            <!-- Version Info -->
+            <TextBlock Grid.Column="1" Grid.Row="1"
+                       Text="$escapedVersionInfo"
+                       Foreground="#FFCCCCCC"
+                       FontSize="12"
+                       Margin="12,0,0,8"
+                       TextWrapping="Wrap"/>
+            
+            <!-- Action Message -->
+            <TextBlock Grid.Column="1" Grid.Row="2"
+                       Text="$escapedActionMessage"
+                       Foreground="#FFCCCCCC"
+                       FontSize="12"
+                       Margin="12,0,0,8"
+                       TextWrapping="Wrap"/>
+            
+            <!-- Button -->
+            <StackPanel Grid.Column="1" Grid.Row="3"
+                        Orientation="Horizontal"
+                        HorizontalAlignment="Right"
+                        Margin="12,0,0,0">
+                        
+                <Button Name="UpgradeButton" Content="Upgrade" Width="80" Height="24" Background="#FF0078D4" Foreground="White" IsDefault="true">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Style.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="#FF106EBE"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+                
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+$window = [Windows.Markup.XamlReader]::Load($reader)
+
+$script:result = "Continue"
+
+# Get button reference and store original text
+$upgradeButton = $window.FindName("UpgradeButton")
+$originalButtonText = if ($upgradeButton) { $upgradeButton.Content } else { "Upgrade" }
+
+# Create countdown timer (updates every second)
+$script:timeRemaining = $TimeoutSeconds
+$countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
+$countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
+
+$countdownTimer.Add_Tick({
+    $script:timeRemaining--
+    
+    # Update button with countdown
+    if ($upgradeButton) {
+        $upgradeButton.Content = "$originalButtonText ($($script:timeRemaining))"
+    }
+    
+    # Stop countdown timer when we reach zero (main timeout timer will handle dialog close)
+    if ($script:timeRemaining -le 0) {
+        $countdownTimer.Stop()
+    }
+})
+
+# Create main timeout timer
+$timer = New-Object System.Windows.Threading.DispatcherTimer
+$timer.Interval = [System.TimeSpan]::FromSeconds($TimeoutSeconds)
+
+$timer.Add_Tick({
+    $script:result = "Continue"
+    $timer.Stop()
+    $countdownTimer.Stop()
+    $window.Close()
+})
+
+# Position window like other dialogs (bottom-right)
+$window.Add_Loaded({
+    $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    
+    # Position at bottom-right (near notification area)
+    $window.Left = $workArea.Width - $window.Width - 16
+    $window.Top = $workArea.Height - $window.Height - 16
+})
+
+# Add upgrade button handler
+if ($upgradeButton) {
+    $upgradeButton.Add_Click({
+        $timer.Stop()
+        $countdownTimer.Stop()
+        $script:result = "Continue"
+        $window.Close()
+    })
+}
+
+# Handle window closing
+$window.Add_Closing({
+    $timer.Stop()
+    $countdownTimer.Stop()
+    if ($script:result -eq $null) {
+        $script:result = "Continue"
+    }
+})
+
+# Start both timers
+$timer.Start()
+$countdownTimer.Start()
+
+$window.ShowDialog() | Out-Null
+
+# Ensure timers are stopped
+$timer.Stop()
+$countdownTimer.Stop()
+
+# Write response
+@{ response = $script:result; timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ") } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+'@
+
+        Write-Log -Message "Creating mandatory prompt script: $mandatoryScriptPath" | Out-Null
+        $mandatoryScriptContent | Set-Content -Path $mandatoryScriptPath -Encoding UTF8
+        
+        # Create scheduled task
+        $guid = [System.Guid]::NewGuid().ToString()
+        $taskName = "MandatoryPrompt_$guid"
+        
+        # Create task arguments with encoded parameters
+        $encodedQuestion = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Question))
+        $encodedTitle = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Title))
+        $arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$mandatoryScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -TimeoutSeconds $TimeoutSeconds"
+        
+        # Create and register task
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
+        
+        # Create task principal
+        $principal = $null
+        $userFormats = @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")
+        $logonTypes = @("Interactive", "S4U")
+        
+        foreach ($userFormat in $userFormats) {
+            foreach ($logonType in $logonTypes) {
+                try {
+                    $principal = New-ScheduledTaskPrincipal -UserId $userFormat -LogonType $logonType -RunLevel Limited
+                    Write-Log "Created mandatory task principal with: $userFormat ($logonType)" | Out-Null
+                    break
+                } catch {
+                    Write-Log "Failed mandatory task principal: $userFormat ($logonType)" | Out-Null
+                }
+            }
+            if ($principal) { break }
+        }
+        
+        if (-not $principal) {
+            Write-Log "Could not create mandatory task principal" | Out-Null
+            return "Continue"
+        }
+        
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd
+        $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings -Description "Mandatory update prompt"
+        
+        try {
+            Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+            Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+            Write-Log "Mandatory scheduled task started successfully" | Out-Null
+        } catch {
+            Write-Log "Failed to start mandatory scheduled task: $($_.Exception.Message)" | Out-Null
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            return "Continue"
+        }
+        
+        # Wait for response
+        $taskTimeout = $TimeoutSeconds + 30
+        $response = Wait-ForUserResponse -ResponseFilePath $responseFile -TimeoutSeconds $taskTimeout
+        
+        # Cleanup
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-Item $mandatoryScriptPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
+        
+        return "Continue"  # Always continue for mandatory updates
+        
+    } catch {
+        Write-Log "Error in system mandatory prompt: $($_.Exception.Message)" | Out-Null
+        return "Continue"
     }
 }
 
@@ -1385,47 +2224,1223 @@ function Show-UserDialog {
     }
 }
 
-function Schedule-UserContextRemediation {
+# ============================================================================
+# DEFERRAL MANAGEMENT SYSTEM
+# Time-based deferral system with admin-controlled hard deadlines
+# ============================================================================
+
+function Initialize-DeferralRegistry {
     <#
     .SYNOPSIS
-        Schedules user context remediation execution from SYSTEM context
+        Ensures the deferral registry structure exists
+    .DESCRIPTION
+        Creates the necessary registry keys for storing deferral and release cache data
     #>
     
     try {
-        Write-Log "Scheduling user context remediation" | Out-Null
+        $deferralPath = "HKLM:\SOFTWARE\WingetUpgradeManager\Deferrals"
+        $cachePath = "HKLM:\SOFTWARE\WingetUpgradeManager\ReleaseCache"
         
+        if (-not (Test-Path $deferralPath)) {
+            Write-Log "Creating deferral registry path: $deferralPath" | Out-Null
+            New-Item -Path $deferralPath -Force | Out-Null
+        }
+        
+        if (-not (Test-Path $cachePath)) {
+            Write-Log "Creating release cache registry path: $cachePath" | Out-Null
+            New-Item -Path $cachePath -Force | Out-Null
+        }
+        
+        return $true
+        
+    } catch {
+        Write-Log "Error initializing deferral registry: $($_.Exception.Message)" | Out-Null
+        return $false
+    }
+}
+
+function Get-AppReleaseDate {
+    <#
+    .SYNOPSIS
+        Gets the release date of an app version from winget, with caching
+    .DESCRIPTION
+        Retrieves app release date from winget show command with performance-optimized caching
+        Caches results to avoid repeated winget queries
+    .PARAMETER AppID
+        Application ID to query
+    .PARAMETER Version
+        Specific version to query (optional)
+    .OUTPUTS
+        DateTime object of release date, or $null if not found
+    #>
+    
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$AppID,
+        
+        [string]$Version = ""
+    )
+    
+    try {
+        Initialize-DeferralRegistry | Out-Null
+        
+        # Create cache key - include version in key if specified
+        $cacheKey = if ($Version) { "$AppID-$Version" } else { $AppID }
+        $cachePath = "HKLM:\SOFTWARE\WingetUpgradeManager\ReleaseCache"
+        
+        # Check cache first
+        try {
+            $cachedDate = Get-ItemProperty -Path $cachePath -Name $cacheKey -ErrorAction SilentlyContinue
+            if ($cachedDate) {
+                $releaseDate = [DateTime]::Parse($cachedDate.$cacheKey)
+                Write-Log "Found cached release date for $cacheKey : $releaseDate" | Out-Null
+                return $releaseDate
+            }
+        } catch {
+            Write-Log "Cache read error for $cacheKey : $($_.Exception.Message)" | Out-Null
+        }
+        
+        Write-Log "Querying winget for release date: $AppID $(if ($Version) { "version $Version" })" | Out-Null
+        
+        # Query winget show command
+        $showCommand = if ($Version) {
+            "winget show --id `"$AppID`" --version `"$Version`" --accept-source-agreements"
+        } else {
+            "winget show --id `"$AppID`" --accept-source-agreements"
+        }
+        
+        # Execute winget show with appropriate context
+        $showOutput = if ((Test-RunningAsSystem) -and $WingetPath) {
+            & "$WingetPath\winget.exe" show --id $AppID $(if ($Version) { "--version"; $Version }) --accept-source-agreements 2>&1
+        } else {
+            & winget show --id $AppID $(if ($Version) { "--version"; $Version }) --accept-source-agreements 2>&1
+        }
+        
+        if ($showOutput) {
+            # Parse output for release date - look for various date patterns
+            $releaseDate = $null
+            $datePatterns = @(
+                "Published:\s+([^`r`n]+)",
+                "Release Date:\s+([^`r`n]+)",
+                "Date:\s+([^`r`n]+)",
+                "Updated:\s+([^`r`n]+)"
+            )
+            
+            foreach ($pattern in $datePatterns) {
+                foreach ($line in $showOutput) {
+                    if ($line -match $pattern) {
+                        $dateString = $matches[1].Trim()
+                        Write-Log "Found potential date string: '$dateString'" | Out-Null
+                        
+                        # Try to parse the date string
+                        try {
+                            $releaseDate = [DateTime]::Parse($dateString)
+                            Write-Log "Successfully parsed release date: $releaseDate" | Out-Null
+                            break
+                        } catch {
+                            Write-Log "Failed to parse date '$dateString': $($_.Exception.Message)" | Out-Null
+                        }
+                    }
+                }
+                if ($releaseDate) { break }
+            }
+            
+            # If we found a valid date, cache it
+            if ($releaseDate) {
+                try {
+                    Set-ItemProperty -Path $cachePath -Name $cacheKey -Value $releaseDate.ToString("yyyy-MM-dd HH:mm:ss") -Force
+                    Write-Log "Cached release date for $cacheKey : $releaseDate" | Out-Null
+                } catch {
+                    Write-Log "Failed to cache release date: $($_.Exception.Message)" | Out-Null
+                }
+                return $releaseDate
+            } else {
+                Write-Log "No release date found in winget output for $AppID" | Out-Null
+            }
+        } else {
+            Write-Log "No output from winget show for $AppID" | Out-Null
+        }
+        
+        return $null
+        
+    } catch {
+        Write-Log "Error getting app release date for ${AppID}: $($_.Exception.Message)" | Out-Null
+        return $null
+    }
+}
+
+function Get-DeferralStatus {
+    <#
+    .SYNOPSIS
+        Gets the current deferral status for an application
+    .DESCRIPTION
+        Retrieves deferral information from registry including count, dates, and deadline status
+    .PARAMETER AppID
+        Application ID to check
+    .PARAMETER WhitelistConfig
+        Whitelist configuration object for the app
+    .PARAMETER AvailableVersion
+        Available version to check against
+    .OUTPUTS
+        Hashtable with deferral status information
+    #>
+    
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$AppID,
+        
+        [Parameter(Mandatory=$true)]
+        [object]$WhitelistConfig,
+        
+        [string]$AvailableVersion = ""
+    )
+    
+    try {
+        Initialize-DeferralRegistry | Out-Null
+        
+        $deferralPath = "HKLM:\SOFTWARE\WingetUpgradeManager\Deferrals\$AppID"
+        $now = Get-Date
+        
+        # Default status - no deferrals
+        $status = @{
+            DeferralEnabled = $WhitelistConfig.DeferralEnabled -eq $true
+            MaxDeferralDays = if ($WhitelistConfig.MaxDeferralDays) { $WhitelistConfig.MaxDeferralDays } else { 0 }
+            DeferralsUsed = 0
+            LastDeferralDate = $null
+            UserDeadline = $null
+            AdminHardDeadline = $null
+            ReleaseDate = $null
+            CanDefer = $false
+            ForceUpdate = $false
+            DeferralOptions = if ($WhitelistConfig.DeferralOptions) { $WhitelistConfig.DeferralOptions } else { @() }
+            Message = ""
+        }
+        
+        # If deferrals not enabled for this app, return early
+        if (-not $status.DeferralEnabled) {
+            $status.Message = "Deferrals not enabled for this application"
+            $status.ForceUpdate = $true
+            return $status
+        }
+        
+        # Get release date for deadline calculations
+        $releaseDate = Get-AppReleaseDate -AppID $AppID -Version $AvailableVersion
+        if ($releaseDate) {
+            $status.ReleaseDate = $releaseDate
+            
+            # Calculate admin hard deadline (release date + MaxDeferralDays)
+            $status.AdminHardDeadline = $releaseDate.AddDays($status.MaxDeferralDays)
+        }
+        
+        # Check if deferral data exists
+        if (Test-Path $deferralPath) {
+            try {
+                $deferralData = Get-ItemProperty -Path $deferralPath -ErrorAction SilentlyContinue
+                if ($deferralData) {
+                    # Parse existing deferral data
+                    if ($deferralData.DeferralsUsed) {
+                        $status.DeferralsUsed = [int]$deferralData.DeferralsUsed
+                    }
+                    
+                    if ($deferralData.LastDeferralDate) {
+                        $status.LastDeferralDate = [DateTime]::Parse($deferralData.LastDeferralDate)
+                    }
+                    
+                    if ($deferralData.UserDeadline) {
+                        $status.UserDeadline = [DateTime]::Parse($deferralData.UserDeadline)
+                    }
+                }
+            } catch {
+                Write-Log "Error reading deferral data for ${AppID}: $($_.Exception.Message)" | Out-Null
+            }
+        }
+        
+        # Determine if update should be forced
+        $forceReasons = @()
+        
+        # Check admin hard deadline (takes precedence)
+        if ($status.AdminHardDeadline -and $now -gt $status.AdminHardDeadline) {
+            $daysOverdue = ($now - $status.AdminHardDeadline).Days
+            $forceReasons += "Admin hard deadline exceeded ($($daysOverdue) days overdue)"
+            $status.ForceUpdate = $true
+        }
+        
+        # Check user deadline
+        if (-not $status.ForceUpdate -and $status.UserDeadline -and $now -gt $status.UserDeadline) {
+            $forceReasons += "User deadline exceeded"
+            $status.ForceUpdate = $true
+        }
+        
+        # Determine if user can still defer
+        if (-not $status.ForceUpdate) {
+            $daysUntilAdminDeadline = if ($status.AdminHardDeadline) {
+                [Math]::Max(0, ($status.AdminHardDeadline - $now).Days)
+            } else {
+                999  # No admin deadline
+            }
+            
+            # User can defer if:
+            # 1. We haven't reached admin hard deadline
+            # 2. There are available deferral options within the remaining time
+            if ($daysUntilAdminDeadline -gt 0 -and $status.DeferralOptions.Count -gt 0) {
+                # Find available deferral options that fit within remaining time
+                $availableOptions = @()
+                foreach ($option in $status.DeferralOptions) {
+                    if ($option -le $daysUntilAdminDeadline) {
+                        $availableOptions += $option
+                    }
+                }
+                
+                if ($availableOptions.Count -gt 0) {
+                    $status.CanDefer = $true
+                    $status.DeferralOptions = $availableOptions
+                }
+            }
+        }
+        
+        # Build status message
+        if ($status.ForceUpdate) {
+            if ($WhitelistConfig.ForcedUpgradeMessage) {
+                $status.Message = $WhitelistConfig.ForcedUpgradeMessage
+            } else {
+                $status.Message = "Update required: $($forceReasons -join '; ')"
+            }
+        } elseif ($status.CanDefer) {
+            $daysLeft = if ($status.AdminHardDeadline) {
+                ($status.AdminHardDeadline - $now).Days
+            } else {
+                $status.MaxDeferralDays
+            }
+            $status.Message = "Update available. You can defer this update for up to $daysLeft more days."
+        } else {
+            $status.Message = "Update available. No deferral options remaining."
+            $status.ForceUpdate = $true
+        }
+        
+        Write-Log "Deferral status for ${AppID}: CanDefer=$($status.CanDefer), ForceUpdate=$($status.ForceUpdate), Message=$($status.Message)" | Out-Null
+        
+        return $status
+        
+    } catch {
+        Write-Log "Error getting deferral status for ${AppID}: $($_.Exception.Message)" | Out-Null
+        # Return safe default - force update on error
+        return @{
+            DeferralEnabled = $false
+            ForceUpdate = $true
+            CanDefer = $false
+            Message = "Error checking deferral status - update required"
+        }
+    }
+}
+
+function Set-DeferralChoice {
+    <#
+    .SYNOPSIS
+        Records a user's deferral choice in the registry
+    .DESCRIPTION
+        Saves deferral information including selected timeframe and calculated deadlines
+    .PARAMETER AppID
+        Application ID
+    .PARAMETER DeferralDays
+        Number of days to defer
+    .OUTPUTS
+        Boolean indicating success
+    #>
+    
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$AppID,
+        
+        [Parameter(Mandatory=$true)]
+        [int]$DeferralDays
+    )
+    
+    try {
+        Initialize-DeferralRegistry | Out-Null
+        
+        $deferralPath = "HKLM:\SOFTWARE\WingetUpgradeManager\Deferrals\$AppID"
+        $now = Get-Date
+        
+        # Ensure the app-specific path exists
+        if (-not (Test-Path $deferralPath)) {
+            New-Item -Path $deferralPath -Force | Out-Null
+        }
+        
+        # Get current deferral count
+        $currentDeferrals = 0
+        try {
+            $existing = Get-ItemProperty -Path $deferralPath -Name "DeferralsUsed" -ErrorAction SilentlyContinue
+            if ($existing) {
+                $currentDeferrals = [int]$existing.DeferralsUsed
+            }
+        } catch {
+            # Use default of 0
+        }
+        
+        # Calculate new user deadline
+        $userDeadline = $now.AddDays($DeferralDays)
+        
+        # Update deferral data
+        Set-ItemProperty -Path $deferralPath -Name "DeferralsUsed" -Value ($currentDeferrals + 1) -Force
+        Set-ItemProperty -Path $deferralPath -Name "LastDeferralDate" -Value $now.ToString("yyyy-MM-dd HH:mm:ss") -Force
+        Set-ItemProperty -Path $deferralPath -Name "UserDeadline" -Value $userDeadline.ToString("yyyy-MM-dd HH:mm:ss") -Force
+        Set-ItemProperty -Path $deferralPath -Name "DeferralDays" -Value $DeferralDays -Force
+        
+        Write-Log "Recorded deferral choice for ${AppID}: ${DeferralDays} days, deadline: $userDeadline" | Out-Null
+        
+        return $true
+        
+    } catch {
+        Write-Log "Error setting deferral choice for ${AppID}: $($_.Exception.Message)" | Out-Null
+        return $false
+    }
+}
+
+function Show-DeferralDialog {
+    <#
+    .SYNOPSIS
+        Shows an enhanced dialog with deferral options
+    .DESCRIPTION
+        Displays a sophisticated WPF dialog offering deferral choices or immediate update
+    .PARAMETER AppName
+        Application ID for the update
+    .PARAMETER DeferralStatus
+        Deferral status hashtable from Get-DeferralStatus
+    .PARAMETER ProcessName
+        Name of the blocking process (if any)
+    .PARAMETER FriendlyName
+        User-friendly name of the application
+    .PARAMETER CurrentVersion
+        Current version of the application
+    .PARAMETER AvailableVersion
+        Available version for update
+    .PARAMETER TimeoutSeconds
+        Timeout in seconds before using default action
+    .OUTPUTS
+        Hashtable with user choice: @{ Action = "Update|Defer"; DeferralDays = [int] }
+    #>
+    
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$AppName,
+        
+        [Parameter(Mandatory=$true)]
+        [hashtable]$DeferralStatus,
+        
+        [string]$ProcessName = "",
+        [string]$FriendlyName = "",
+        [string]$CurrentVersion = "",
+        [string]$AvailableVersion = "",
+        [int]$TimeoutSeconds = 60
+    )
+    
+    try {
+        Write-Log "Show-DeferralDialog called for $AppName" | Out-Null
+        
+        # Use provided FriendlyName or fallback to AppName
+        $displayName = if (-not [string]::IsNullOrEmpty($FriendlyName)) { $FriendlyName } else { $AppName }
+        
+        # Determine if process needs to be closed
+        $hasBlockingProcess = -not [string]::IsNullOrEmpty($ProcessName)
+        
+        # Build dialog content
+        $versionText = ""
+        if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
+            $versionText = "$displayName $CurrentVersion -> $AvailableVersion update available`n`n"
+        } else {
+            $versionText = "Update available for $displayName`n`n"
+        }
+        
+        $processText = if ($hasBlockingProcess) {
+            "$displayName is currently running and must be closed to proceed with the update.`n`n"
+        } else {
+            ""
+        }
+        
+        $deferralText = if ($DeferralStatus.ForceUpdate) {
+            $DeferralStatus.Message
+        } else {
+            "$($DeferralStatus.Message)`n`nYou can choose to:"
+        }
+        
+        $question = $versionText + $processText + $deferralText
+        
+        # Create enhanced WPF dialog with deferral options
+        if ($DeferralStatus.ForceUpdate) {
+            # Force update - show mandatory update dialog with only Continue button
+            $title = "Required Update: $displayName"
+            
+            # Create clean, user-friendly message components
+            $versionInfo = ""
+            $actionMessage = ""
+            
+            if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
+                $versionInfo = "$displayName $CurrentVersion -> $AvailableVersion"
+            } else {
+                $versionInfo = "$displayName update available"
+            }
+            
+            if ($hasBlockingProcess) {
+                $actionMessage = "$displayName must be closed to install this update."
+            } else {
+                $actionMessage = "This security/compatibility update cannot be postponed."
+            }
+            
+            # Pass separate components instead of combined question
+            $response = Show-MandatoryUpdateDialog -Question "$versionInfo|$actionMessage" -Title $title -TimeoutSeconds $TimeoutSeconds -HasBlockingProcess $hasBlockingProcess
+            
+            return @{
+                Action = "Update"
+                DeferralDays = 0
+                CloseProcess = $true
+            }
+        } else {
+            # Show deferral options
+            $title = "Update Available: $displayName"
+            
+            # Create complex dialog with deferral buttons
+            $deferralChoice = Show-EnhancedDeferralDialog -Question $question -Title $title -DeferralOptions $DeferralStatus.DeferralOptions -HasBlockingProcess $hasBlockingProcess -TimeoutSeconds $TimeoutSeconds
+            
+            return $deferralChoice
+        }
+        
+    } catch {
+        Write-Log "Error in Show-DeferralDialog: $($_.Exception.Message)" | Out-Null
+        # Return safe default
+        return @{
+            Action = "Update"
+            DeferralDays = 0
+            CloseProcess = $true
+        }
+    }
+}
+
+function Show-EnhancedDeferralDialog {
+    <#
+    .SYNOPSIS
+        Shows a complex WPF dialog with multiple deferral options
+    .DESCRIPTION
+        Creates a sophisticated dialog allowing users to choose from available deferral timeframes
+    .PARAMETER TimeoutSeconds
+        Timeout in seconds before using default action
+    #>
+    
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Question,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$Title,
+        
+        [Parameter(Mandatory=$true)]
+        [array]$DeferralOptions,
+        
+        [bool]$HasBlockingProcess = $false,
+        [int]$TimeoutSeconds = 60
+    )
+    
+    try {
+        # For system context, use the enhanced scheduled task approach
+        if (Test-RunningAsSystem) {
+            return Invoke-SystemDeferralPrompt -Question $Question -Title $Title -DeferralOptions $DeferralOptions -HasBlockingProcess $HasBlockingProcess -TimeoutSeconds $TimeoutSeconds
+        } else {
+            # Direct user context - simplified approach
+            return Show-DirectDeferralDialog -Question $Question -Title $Title -DeferralOptions $DeferralOptions -HasBlockingProcess $HasBlockingProcess -TimeoutSeconds $TimeoutSeconds
+        }
+        
+    } catch {
+        Write-Log "Error in Show-EnhancedDeferralDialog: $($_.Exception.Message)" | Out-Null
+        return @{
+            Action = "Update"
+            DeferralDays = 0
+            CloseProcess = $true
+        }
+    }
+}
+
+function Show-DirectDeferralDialog {
+    <#
+    .SYNOPSIS
+        Direct user context deferral dialog
+    .PARAMETER TimeoutSeconds
+        Timeout in seconds before using default action
+    #>
+    
+    param(
+        [string]$Question,
+        [string]$Title,
+        [array]$DeferralOptions,
+        [bool]$HasBlockingProcess,
+        [int]$TimeoutSeconds = 60
+    )
+    
+    try {
+        Write-Log "Showing direct deferral dialog with options: $($DeferralOptions -join ', ')" | Out-Null
+        
+        # Load WPF assemblies
+        Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+        Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+        Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        
+        # Build dynamic button XML based on deferral options
+        $buttonXml = ""
+        $buttonCount = 0
+        
+        # Add deferral option buttons
+        foreach ($days in ($DeferralOptions | Sort-Object)) {
+            $buttonText = if ($days -eq 1) { "Defer 1 day" } else { "Defer $days days" }
+            $buttonName = "DeferButton$days"
+            $buttonXml += @"
+                <Button Name="$buttonName"
+                        Content="$buttonText"
+                        Width="100"
+                        Height="28"
+                        Margin="0,0,8,0"
+                        Background="Transparent"
+                        Foreground="#FFCCCCCC"
+                        BorderBrush="#FF484848"
+                        BorderThickness="1"
+                        FontSize="11"
+                        Cursor="Hand"
+                        Tag="$days">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Style.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="#FF2A2A2A"/>
+                                    <Setter Property="Foreground" Value="White"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+"@
+            $buttonCount++
+        }
+        
+        # Add Update Now button
+        $buttonXml += @"
+                <Button Name="UpdateButton"
+                        Content="Update Now"
+                        Width="100"
+                        Height="28"
+                        Background="#FF0078D4"
+                        Foreground="White"
+                        BorderBrush="Transparent"
+                        BorderThickness="0"
+                        FontSize="11"
+                        Cursor="Hand"
+                        IsDefault="true"
+                        Tag="0">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Style.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="#FF106EBE"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+"@
+        
+        # Calculate dialog width based on button count
+        $dialogWidth = [Math]::Max(500, ($buttonCount + 1) * 110 + 100)
+        
+        # Create modern dark-themed XAML
+        $xaml = @"
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="$Title"
+    Width="$dialogWidth"
+    MinHeight="200"
+    SizeToContent="Height"
+    WindowStartupLocation="Manual"
+    ResizeMode="NoResize"
+    WindowStyle="None"
+    AllowsTransparency="True"
+    Background="Transparent"
+    Topmost="True"
+    ShowInTaskbar="False">
+    
+    <Window.Triggers>
+        <EventTrigger RoutedEvent="Window.Loaded">
+            <BeginStoryboard>
+                <Storyboard>
+                    <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                     From="0" To="1" Duration="0:0:0.3"/>
+                    <ThicknessAnimation Storyboard.TargetProperty="Margin"
+                                        From="0,50,0,0" To="0,0,0,0" Duration="0:0:0.3"/>
+                </Storyboard>
+            </BeginStoryboard>
+        </EventTrigger>
+    </Window.Triggers>
+    
+    <Border Name="MainBorder"
+            Background="#FF1F1F1F"
+            CornerRadius="8"
+            BorderBrush="#FF323232"
+            BorderThickness="1">
+        <Border.Effect>
+            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
+        </Border.Effect>
+        
+        <Grid Margin="20">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            
+            <!-- Question -->
+            <TextBlock Grid.Row="0"
+                       Text="$Question"
+                       Foreground="#FFCCCCCC"
+                       TextWrapping="Wrap"
+                       Margin="0,0,0,20"
+                       FontSize="12"/>
+            
+            <!-- Buttons -->
+            <StackPanel Grid.Row="1"
+                        Orientation="Horizontal"
+                        HorizontalAlignment="Center">
+                $buttonXml
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+        # Create window
+        $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+        $window = [Windows.Markup.XamlReader]::Load($reader)
+        
+        # Set up result handling
+        $script:deferralResult = @{
+            Action = "Update"
+            DeferralDays = 0
+            CloseProcess = $true
+        }
+        
+        # Add timeout functionality with countdown timer - same as other dialogs
+        $script:timeRemaining = $TimeoutSeconds
+        $countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
+        
+        # Get the Update button for countdown display
+        $updateButton = $window.FindName("UpdateButton")
+        $originalUpdateText = if ($updateButton) { $updateButton.Content } else { "Update Now" }
+        
+        $countdownTimer.Add_Tick({
+            $script:timeRemaining--
+            Write-Log "Deferral dialog countdown: $($script:timeRemaining) seconds remaining" | Out-Null
+            
+            # Update the Update button with countdown (default action)
+            if ($updateButton) {
+                $updateButton.Content = "$originalUpdateText ($($script:timeRemaining))"
+            }
+            
+            # Stop countdown timer when we reach zero (main timeout timer will handle dialog close)
+            if ($script:timeRemaining -le 0) {
+                $countdownTimer.Stop()
+            }
+        })
+        
+        # Create main timeout timer
+        $timer = New-Object System.Windows.Threading.DispatcherTimer
+        $timer.Interval = [System.TimeSpan]::FromSeconds($TimeoutSeconds)
+        
+        $timer.Add_Tick({
+            Write-Log "Deferral dialog timeout reached after $TimeoutSeconds seconds - defaulting to Update" | Out-Null
+            $script:deferralResult = @{
+                Action = "Update"
+                DeferralDays = 0
+                CloseProcess = $true
+            }
+            $timer.Stop()
+            $countdownTimer.Stop()
+            $window.Close()
+        })
+        
+        # Add event handlers for deferral buttons
+        foreach ($days in $DeferralOptions) {
+            $buttonName = "DeferButton$days"
+            $button = $window.FindName($buttonName)
+            if ($button) {
+                $button.Add_Click({
+                    $selectedDays = [int]$this.Tag
+                    Write-Log "User selected deferral: $selectedDays days" | Out-Null
+                    $timer.Stop()
+                    $countdownTimer.Stop()
+                    $script:deferralResult = @{
+                        Action = "Defer"
+                        DeferralDays = $selectedDays
+                        CloseProcess = $false
+                    }
+                    $window.Close()
+                }.GetNewClosure())
+            }
+        }
+        
+        # Add event handler for Update button
+        if ($updateButton) {
+            $updateButton.Add_Click({
+                Write-Log "User selected immediate update" | Out-Null
+                $timer.Stop()
+                $countdownTimer.Stop()
+                $script:deferralResult = @{
+                    Action = "Update"
+                    DeferralDays = 0
+                    CloseProcess = $true
+                }
+                $window.Close()
+            })
+        }
+        
+        # Handle window closing without button click
+        $window.Add_Closing({
+            $timer.Stop()
+            $countdownTimer.Stop()
+            if ($script:deferralResult.Action -eq $null) {
+                Write-Log "Deferral dialog closed without selection - defaulting to update" | Out-Null
+                $script:deferralResult = @{
+                    Action = "Update"
+                    DeferralDays = 0
+                    CloseProcess = $true
+                }
+            }
+        })
+        
+        # Position window like a native Windows toast notification
+        $window.Add_Loaded({
+            $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+            $taskbarHeight = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height - $workArea.Height
+            
+            # Position at bottom-right (near notification area)
+            $window.Left = $workArea.Width - $window.Width - 16
+            $window.Top = $workArea.Height - $window.Height - 16
+            Write-Log "Deferral dialog positioned at bottom-right (near notification area)" | Out-Null
+        })
+        
+        # Start both timers and show dialog
+        Write-Log "Starting deferral dialog with $TimeoutSeconds second timeout" | Out-Null
+        $timer.Start()
+        $countdownTimer.Start()
+        
+        # Show dialog
+        $result = $window.ShowDialog()
+        
+        # Ensure timers are stopped
+        $timer.Stop()
+        $countdownTimer.Stop()
+        
+        Write-Log "Direct deferral dialog completed with choice: $($script:deferralResult.Action), Days: $($script:deferralResult.DeferralDays)" | Out-Null
+        return $script:deferralResult
+        
+    } catch {
+        Write-Log "Error in direct deferral dialog: $($_.Exception.Message)" | Out-Null
+        return @{
+            Action = "Update"
+            DeferralDays = 0
+            CloseProcess = $true
+        }
+    }
+}
+
+function Invoke-SystemDeferralPrompt {
+    <#
+    .SYNOPSIS
+        System context deferral dialog using scheduled tasks
+    .PARAMETER TimeoutSeconds
+        Timeout in seconds before using default action
+    #>
+    
+    param(
+        [string]$Question,
+        [string]$Title,
+        [array]$DeferralOptions,
+        [bool]$HasBlockingProcess,
+        [int]$TimeoutSeconds = 60
+    )
+    
+    try {
+        Write-Log "Invoking system deferral prompt with options: $($DeferralOptions -join ', ')" | Out-Null
+        
+        # Get interactive user
         $userInfo = Get-InteractiveUser
         if (-not $userInfo) {
+            Write-Log "No interactive user found - cannot show deferral dialog" | Out-Null
+            return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
+        }
+        
+        # Create unique identifiers
+        $promptId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
+        
+        # Setup response file path
+        $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
+        $responseFile = if (Test-Path $userTempPath) {
+            Join-Path $userTempPath "DeferralPrompt_$promptId`_Response.json"
+        } else {
+            Join-Path "C:\ProgramData\Temp" "DeferralPrompt_$promptId`_Response.json"
+        }
+        
+        # Create enhanced user prompt script for deferrals
+        $deferralScriptPath = "$env:TEMP\Show-DeferralPrompt_$promptId.ps1"
+        
+        # Build the script content dynamically
+        $deferralOptionsJson = ($DeferralOptions | ConvertTo-Json -Compress)
+        
+        $deferralScriptContent = @'
+param(
+    [string]$ResponseFilePath,
+    [string]$EncodedQuestion,
+    [string]$EncodedTitle,
+    [string]$DeferralOptionsJson,
+    [bool]$HasBlockingProcess = $false,
+    [int]$TimeoutSeconds = 60,
+    # Legacy parameters for backward compatibility
+    [string]$Question = "",
+    [string]$Title = ""
+)
+
+# Decode the text parameters if they're base64 encoded, otherwise use legacy parameters
+$actualQuestion = if ($EncodedQuestion) {
+    [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedQuestion))
+} else {
+    $Question
+}
+
+$actualTitle = if ($EncodedTitle) {
+    [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedTitle))
+} else {
+    $Title
+}
+
+# Parse deferral options
+$deferralOptions = $DeferralOptionsJson | ConvertFrom-Json
+
+# Load WPF assemblies
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName System.Windows.Forms
+
+# Build dynamic buttons XML
+$buttonXml = ""
+foreach ($days in ($deferralOptions | Sort-Object)) {
+    $buttonText = if ($days -eq 1) { "Defer 1 day" } else { "Defer $days days" }
+    $buttonName = "DeferButton$days"
+    $buttonXml += "<Button Name=`"$buttonName`" Content=`"$buttonText`" Width=`"100`" Height=`"28`" Margin=`"0,0,8,0`" Tag=`"$days`"/>"
+}
+$buttonXml += '<Button Name="UpdateButton" Content="Update Now" Width="100" Height="28" Background="#FF0078D4" Foreground="White" IsDefault="true" Tag="0"/>'
+
+$dialogWidth = [Math]::Max(500, ($deferralOptions.Count + 1) * 110 + 100)
+
+# Use the decoded text in XAML with proper XML escaping
+$escapedQuestion = [System.Security.SecurityElement]::Escape($actualQuestion)
+$escapedTitle = [System.Security.SecurityElement]::Escape($actualTitle)
+
+$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="$escapedTitle" Width="$dialogWidth" MinHeight="200" SizeToContent="Height" WindowStartupLocation="Manual"
+        ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
+    <Border Background="#FF1F1F1F" CornerRadius="8" BorderBrush="#FF323232" BorderThickness="1">
+        <Border.Effect>
+            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
+        </Border.Effect>
+        <Grid Margin="20">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock Grid.Row="0" Text="$escapedQuestion" Foreground="#FFCCCCCC" TextWrapping="Wrap" Margin="0,0,0,20" FontSize="12"/>
+            <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Center">$buttonXml</StackPanel>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+$window = [Windows.Markup.XamlReader]::Load($reader)
+
+$script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
+
+# Add deferral button handlers
+foreach ($days in $deferralOptions) {
+    $button = $window.FindName("DeferButton$days")
+    if ($button) {
+        $button.Add_Click({
+            $selectedDays = [int]$this.Tag
+            $script:result = @{ Action = "Defer"; DeferralDays = $selectedDays; CloseProcess = $false }
+            $window.Close()
+        }.GetNewClosure())
+    }
+}
+
+# Add update button handler
+$updateButton = $window.FindName("UpdateButton")
+if ($updateButton) {
+    $updateButton.Add_Click({
+        $script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
+        $window.Close()
+    })
+}
+
+$window.ShowDialog() | Out-Null
+
+# Write response
+$script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+'@
+
+        Write-Log "Creating deferral prompt script: $deferralScriptPath" | Out-Null
+        $deferralScriptContent | Set-Content -Path $deferralScriptPath -Encoding UTF8
+        
+        # Create scheduled task with timeout parameter
+        Write-Log "Creating scheduled task with timeout: $TimeoutSeconds seconds" | Out-Null
+        
+        # Generate unique task name
+        $guid = [System.Guid]::NewGuid().ToString()
+        $taskName = "DeferralPrompt_$guid"
+        
+        # Create task arguments with timeout parameter - ensure proper encoding for text parameters
+        $encodedQuestion = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Question))
+        $encodedTitle = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Title))
+        $arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -DeferralOptionsJson `"$deferralOptionsJson`" -HasBlockingProcess $$HasBlockingProcess -TimeoutSeconds $TimeoutSeconds"
+        
+        # Create task using existing approach but with custom arguments
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
+        
+        # Create task principal using existing user info
+        $principal = $null
+        $userFormats = @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")
+        $logonTypes = @("Interactive", "S4U")
+        
+        foreach ($userFormat in $userFormats) {
+            foreach ($logonType in $logonTypes) {
+                try {
+                    $principal = New-ScheduledTaskPrincipal -UserId $userFormat -LogonType $logonType -RunLevel Limited
+                    Write-Log "Successfully created deferral task principal with: $userFormat ($logonType)" | Out-Null
+                    break
+                } catch {
+                    Write-Log "Failed deferral task principal with format '$userFormat' ($logonType): $($_.Exception.Message)" | Out-Null
+                }
+            }
+            if ($principal) { break }
+        }
+        
+        if (-not $principal) {
+            Write-Log "Could not create deferral task principal" | Out-Null
+            return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
+        }
+        
+        # Create and register task
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd
+        $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings -Description "Interactive deferral prompt for system operations"
+        
+        try {
+            $registeredTask = Register-ScheduledTask -TaskName $taskName -InputObject $task -Force
+            Write-Log "Deferral scheduled task created successfully: $taskName" | Out-Null
+        } catch {
+            Write-Log "Failed to register deferral scheduled task: $($_.Exception.Message)" | Out-Null
+            return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
+        }
+        
+        # Start the task
+        try {
+            Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+            Write-Log "Deferral scheduled task started successfully" | Out-Null
+        } catch {
+            Write-Log "Failed to start deferral scheduled task: $($_.Exception.Message)" | Out-Null
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
+        }
+        
+        # Wait for response - use configured timeout plus buffer for task overhead
+        $taskTimeout = $TimeoutSeconds + 30  # Add 30 seconds buffer for task creation/cleanup
+        $response = Wait-ForUserResponse -ResponseFilePath $responseFile -TimeoutSeconds $taskTimeout
+        
+        # Parse response
+        $deferralChoice = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
+        
+        if ($response -ne "TIMEOUT" -and (Test-Path $responseFile)) {
+            try {
+                $responseData = Get-Content -Path $responseFile -Raw | ConvertFrom-Json
+                $deferralChoice = @{
+                    Action = $responseData.Action
+                    DeferralDays = [int]$responseData.DeferralDays
+                    CloseProcess = [bool]$responseData.CloseProcess
+                }
+                Write-Log "Parsed deferral response: $($deferralChoice.Action), $($deferralChoice.DeferralDays) days" | Out-Null
+            } catch {
+                Write-Log "Error parsing deferral response: $($_.Exception.Message)" | Out-Null
+            }
+        }
+        
+        # Cleanup
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-Item $deferralScriptPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
+        
+        return $deferralChoice
+        
+    } catch {
+        Write-Log "Error in system deferral prompt: $($_.Exception.Message)" | Out-Null
+        return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
+    }
+}
+
+function Clear-ExpiredDeferralData {
+    <#
+    .SYNOPSIS
+        Cleans up old deferral and cache data
+    .DESCRIPTION
+        Removes deferral data for completed updates and old cached release dates
+    #>
+    
+    try {
+        Write-Log "Starting deferral data cleanup" | Out-Null
+        
+        $deferralBasePath = "HKLM:\SOFTWARE\WingetUpgradeManager\Deferrals"
+        $cacheBasePath = "HKLM:\SOFTWARE\WingetUpgradeManager\ReleaseCache"
+        $now = Get-Date
+        $cleanupCount = 0
+        
+        # Clean up expired deferral data (older than 90 days)
+        if (Test-Path $deferralBasePath) {
+            $appKeys = Get-ChildItem -Path $deferralBasePath -ErrorAction SilentlyContinue
+            foreach ($appKey in $appKeys) {
+                try {
+                    $deferralData = Get-ItemProperty -Path $appKey.PSPath -ErrorAction SilentlyContinue
+                    if ($deferralData -and $deferralData.LastDeferralDate) {
+                        $lastDeferral = [DateTime]::Parse($deferralData.LastDeferralDate)
+                        if (($now - $lastDeferral).Days -gt 90) {
+                            Remove-Item -Path $appKey.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+                            Write-Log "Removed expired deferral data for: $($appKey.PSChildName)" | Out-Null
+                            $cleanupCount++
+                        }
+                    }
+                } catch {
+                    Write-Log "Error processing deferral cleanup for $($appKey.PSChildName): $($_.Exception.Message)" | Out-Null
+                }
+            }
+        }
+        
+        # Clean up old release cache entries (older than 30 days)
+        if (Test-Path $cacheBasePath) {
+            try {
+                $cacheData = Get-ItemProperty -Path $cacheBasePath -ErrorAction SilentlyContinue
+                if ($cacheData) {
+                    $propertiesToRemove = @()
+                    foreach ($property in $cacheData.PSObject.Properties) {
+                        if ($property.Name -notlike "PS*") {  # Skip PowerShell built-in properties
+                            try {
+                                # Try to parse as date to see if it's old
+                                $cacheDate = [DateTime]::Parse($property.Value)
+                                if (($now - $cacheDate).Days -gt 30) {
+                                    $propertiesToRemove += $property.Name
+                                }
+                            } catch {
+                                # If we can't parse the date, it might be malformed - remove it
+                                $propertiesToRemove += $property.Name
+                            }
+                        }
+                    }
+                    
+                    foreach ($propName in $propertiesToRemove) {
+                        Remove-ItemProperty -Path $cacheBasePath -Name $propName -ErrorAction SilentlyContinue
+                        $cleanupCount++
+                    }
+                }
+            } catch {
+                Write-Log "Error during cache cleanup: $($_.Exception.Message)" | Out-Null
+            }
+        }
+        
+        Write-Log "Deferral cleanup completed: $cleanupCount items removed" | Out-Null
+        
+    } catch {
+        Write-Log "Error during deferral cleanup: $($_.Exception.Message)" | Out-Null
+    }
+}
+
+# ============================================================================
+# END DEFERRAL MANAGEMENT SYSTEM
+# ============================================================================
+
+function Schedule-UserContextRemediation {
+    <#
+    .SYNOPSIS
+        Schedules user context remediation execution - EXACT SAME APPROACH AS WORKING DETECTION SCRIPT
+    .DESCRIPTION
+        Uses the proven method from Invoke-UserContextDetection function
+    #>
+    
+    try {
+        Write-Log "Starting user context remediation scheduling" | Out-Null
+        $startTime = Get-Date
+        
+        # Use SAME Get-InteractiveUser function as detection script (simple WMI-based)
+        Write-Log "Calling Get-InteractiveUser function..." | Out-Null
+        $userDetectionStart = Get-Date
+        $userInfo = Get-InteractiveUser
+        $userDetectionTime = (Get-Date) - $userDetectionStart
+        Write-Log "Get-InteractiveUser completed in $($userDetectionTime.TotalSeconds) seconds" | Out-Null
+        
+        if (-not $userInfo) {
             Write-Log "No interactive user found - skipping user context remediation" | Out-Null
+            Write-Log "Total time spent in user detection: $($userDetectionTime.TotalSeconds) seconds" | Out-Null
             return $false
         }
+        Write-Log "Interactive user found: $($userInfo.Username)" | Out-Null
+        Write-Log "User detection successful in $($userDetectionTime.TotalSeconds) seconds" | Out-Null
         
-        # Create scheduled task for user remediation
-        $taskName = "UserRemediation_$(Get-Random -Minimum 1000 -Maximum 9999)"
-        # Copy script to user-accessible temp location
-        $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
-        if (-not (Test-Path $userTempPath)) {
-            $userTempPath = $env:TEMP
+        # Create remediation result file - use shared path accessible to both SYSTEM and USER contexts (SAME AS DETECTION)
+        $sharedTempPath = "C:\ProgramData\Temp"
+        if (-not (Test-Path $sharedTempPath)) {
+            New-Item -Path $sharedTempPath -ItemType Directory -Force | Out-Null
         }
+        $randomId = Get-Random -Minimum 1000 -Maximum 9999
+        $resultFile = Join-Path $sharedTempPath "UserRemediation_$randomId.json"
+        Write-Log "User remediation result file: $resultFile" | Out-Null
+        Write-Log "Using shared temp path accessible to both SYSTEM and USER contexts: $sharedTempPath" | Out-Null
         
+        # Create scheduled task for user remediation (SAME APPROACH AS DETECTION)
+        $taskName = "UserRemediation_$(Get-Random -Minimum 1000 -Maximum 9999)"
         $tempScriptName = "availableUpgrades-remediate_$(Get-Random -Minimum 1000 -Maximum 9999).ps1"
-        $tempScriptPath = Join-Path $userTempPath $tempScriptName
+        $tempScriptPath = Join-Path $sharedTempPath $tempScriptName
         
         Write-Log "Copying script to user-accessible location: $tempScriptPath" | Out-Null
         Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force
         
         $scriptPath = $tempScriptPath
-        $arguments = "-ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly"
+        $arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`""
         
         Write-Log "Creating user remediation task: $taskName" | Out-Null
         Write-Log "Script path: $scriptPath" | Out-Null
         Write-Log "Arguments: $arguments" | Out-Null
+        Write-Log "Result file: $resultFile" | Out-Null
+        
+        # Verify script copy exists and is readable
+        if (Test-Path $tempScriptPath) {
+            $scriptSize = (Get-Item $tempScriptPath).Length
+            Write-Log "Temp script exists, size: $scriptSize bytes" | Out-Null
+        } else {
+            Write-Log "ERROR: Temp script copy does not exist: $tempScriptPath" | Out-Null
+            return $false
+        }
         
         try {
+            Write-Log "Creating scheduled task action..." | Out-Null
+            $taskCreationStart = Get-Date
+            
             # Create task action
             $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
+            Write-Log "Task action created successfully" | Out-Null
             
-            # Create task principal (run as interactive user)
+            # Create task principal (run as interactive user) - SAME AS DETECTION
+            Write-Log "Creating task principal for user: $($userInfo.FullName)" | Out-Null
+            $principalStart = Get-Date
             $principal = $null
             $userFormats = @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")
             $logonTypes = @("Interactive", "S4U")
@@ -1444,50 +3459,242 @@ function Schedule-UserContextRemediation {
             }
             
             if (-not $principal) {
-                Write-Log "Could not create task principal with any method" | Out-Null
+                $principalTime = (Get-Date) - $principalStart
+                Write-Log "Could not create task principal with any method after $($principalTime.TotalSeconds) seconds" | Out-Null
                 return $false
             }
             
-            # Create task settings - run immediately and cleanup after 1 hour
-            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd -DeleteExpiredTaskAfter "PT1H"
+            $principalTime = (Get-Date) - $principalStart
+            Write-Log "Task principal created successfully in $($principalTime.TotalSeconds) seconds" | Out-Null
             
-            # Create trigger to run immediately
-            $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5)
+            # Create task settings - SAME AS DETECTION
+            Write-Log "Creating task settings..." | Out-Null
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd
             
-            # Create and register the task
-            $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings -Trigger $trigger -Description "User context winget remediation"
+            # Create and register the task WITHOUT triggers (SAME AS DETECTION)
+            Write-Log "Creating and registering scheduled task..." | Out-Null
+            $registrationStart = Get-Date
+            $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings -Description "User context winget remediation"
             Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+            $registrationTime = (Get-Date) - $registrationStart
+            Write-Log "Task created successfully: $taskName in $($registrationTime.TotalSeconds) seconds" | Out-Null
             
-            Write-Log "User remediation task scheduled successfully: $taskName" | Out-Null
-            Write-Log "Temporary script copy at: $tempScriptPath" | Out-Null
-            return $true
+            # Verify task was created successfully before starting (SAME AS DETECTION)
+            $createdTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            if (-not $createdTask) {
+                Write-Log "ERROR: Task creation failed - task not found: $taskName" | Out-Null
+                return $false
+            }
+            Write-Log "Task verified to exist: $taskName, State: $($createdTask.State)" | Out-Null
+            
+            # Start the task (SAME AS DETECTION)
+            Write-Log "Starting user remediation task: $taskName" | Out-Null
+            $taskStartTime = Get-Date
+            try {
+                Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                $taskStartDuration = (Get-Date) - $taskStartTime
+                Write-Log "Start-ScheduledTask completed successfully in $($taskStartDuration.TotalSeconds) seconds" | Out-Null
+                
+                # Brief verification that task started
+                Write-Log "Verifying task started..." | Out-Null
+                Start-Sleep -Seconds 2
+                $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+                if ($taskInfo) {
+                    Write-Log "Task started successfully - LastResult: $($taskInfo.LastTaskResult), LastRunTime: $($taskInfo.LastRunTime)" | Out-Null
+                } else {
+                    Write-Log "Could not get task info after start" | Out-Null
+                }
+                
+            } catch {
+                $taskStartDuration = (Get-Date) - $taskStartTime
+                Write-Log "ERROR: Failed to start scheduled task after $($taskStartDuration.TotalSeconds) seconds: $($_.Exception.Message)" | Out-Null
+                return $false
+            }
+            
+            # Enhanced wait system with marker file synchronization
+            # Create status/heartbeat file paths
+            $statusFile = Join-Path $sharedTempPath "UserRemediation_$randomId.status"
+            $heartbeatFile = Join-Path $sharedTempPath "UserRemediation_$randomId.heartbeat"
+            
+            # Much longer timeout but with progress monitoring
+            $maxTimeout = 600  # 10 minutes maximum
+            $heartbeatTimeout = 120  # 2 minutes without heartbeat timeout
+            $startTime = Get-Date
+            $success = $false
+            
+            Write-Log "Waiting for user remediation results with marker file synchronization" | Out-Null
+            Write-Log "Result file expected at: $resultFile" | Out-Null
+            Write-Log "Status file: $statusFile" | Out-Null
+            Write-Log "Heartbeat file: $heartbeatFile" | Out-Null
+            Write-Log "Maximum timeout: $maxTimeout seconds, Heartbeat timeout: $heartbeatTimeout seconds" | Out-Null
+            
+            $waitStartTime = Get-Date
+            $lastStatusLog = Get-Date
+            $lastHeartbeatCheck = Get-Date
+            $checkCount = 0
+            
+            while ((Get-Date) -lt $waitStartTime.AddSeconds($maxTimeout)) {
+                $checkCount++
+                $currentTime = Get-Date
+                $elapsedTotal = ($currentTime - $waitStartTime).TotalSeconds
+                
+                # Check for completion first (result file exists)
+                if (Test-Path $resultFile) {
+                    try {
+                        Write-Log "Result file found after $elapsedTotal seconds" | Out-Null
+                        Start-Sleep -Milliseconds 500  # Brief pause to ensure file is fully written
+                        $fileContent = Get-Content $resultFile -Raw
+                        $results = $fileContent | ConvertFrom-Json
+                        
+                        Write-Log "User remediation completed: $($results.ProcessedApps) apps processed" | Out-Null
+                        if ($results.UpgradeResults) {
+                            Write-Log "User remediation results: $($results.UpgradeResults -join ', ')" | Out-Null
+                        }
+                        $success = $true
+                        break
+                    } catch {
+                        Write-Log "Error reading/parsing remediation results: $($_.Exception.Message)" | Out-Null
+                        Start-Sleep -Seconds 2
+                        continue
+                    }
+                }
+                
+                # Check heartbeat file to see if user context is still active
+                $isUserContextActive = $false
+                $heartbeatAge = 999
+                if (Test-Path $heartbeatFile) {
+                    try {
+                        $heartbeatTime = (Get-Item $heartbeatFile).LastWriteTime
+                        $heartbeatAge = ($currentTime - $heartbeatTime).TotalSeconds
+                        $isUserContextActive = ($heartbeatAge -lt $heartbeatTimeout)
+                        
+                        if (-not $isUserContextActive) {
+                            Write-Log "WARNING: Heartbeat file is $([int]$heartbeatAge) seconds old (timeout: $heartbeatTimeout)" | Out-Null
+                        }
+                    } catch {
+                        Write-Log "Error reading heartbeat file: $($_.Exception.Message)" | Out-Null
+                    }
+                } else {
+                    # If no heartbeat file yet, check if task just started (give it some time)
+                    if ($elapsedTotal -gt 30) {  # Give 30 seconds for initial heartbeat
+                        Write-Log "No heartbeat file found after $([int]$elapsedTotal) seconds" | Out-Null
+                    } else {
+                        $isUserContextActive = $true  # Still within startup grace period
+                    }
+                }
+                
+                # Check status file for progress updates
+                $statusMessage = ""
+                if (Test-Path $statusFile) {
+                    try {
+                        $statusContent = Get-Content $statusFile -Raw
+                        $statusInfo = $statusContent | ConvertFrom-Json
+                        $statusMessage = "Status: $($statusInfo.Status), Progress: $($statusInfo.Progress)"
+                    } catch {
+                        $statusMessage = "Status file exists but unreadable"
+                    }
+                }
+                
+                # Log status every 15 seconds
+                if (($currentTime - $lastStatusLog).TotalSeconds -gt 15) {
+                    Write-Log "Waiting... elapsed: $([int]$elapsedTotal)s, checks: $checkCount" | Out-Null
+                    if ($statusMessage) {
+                        Write-Log $statusMessage | Out-Null
+                    }
+                    if (Test-Path $heartbeatFile) {
+                        Write-Log "Heartbeat: $([int]$heartbeatAge)s ago, Active: $isUserContextActive" | Out-Null
+                    }
+                    
+                    # Check if task is still running
+                    try {
+                        $currentTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                        if ($currentTask) {
+                            $currentTaskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+                            if ($currentTaskInfo) {
+                                Write-Log "Task status: State=$($currentTask.State), LastResult=$($currentTaskInfo.LastTaskResult)" | Out-Null
+                            }
+                        } else {
+                            Write-Log "Scheduled task no longer exists" | Out-Null
+                        }
+                    } catch {
+                        Write-Log "Could not check task status: $($_.Exception.Message)" | Out-Null
+                    }
+                    
+                    $lastStatusLog = $currentTime
+                }
+                
+                # If user context appears to be inactive/hung and we've waited long enough, timeout
+                if (-not $isUserContextActive -and $elapsedTotal -gt 60) {
+                    Write-Log "User context appears inactive (no recent heartbeat) - timing out" | Out-Null
+                    Write-Log "Last heartbeat age: $([int]$heartbeatAge) seconds (max: $heartbeatTimeout)" | Out-Null
+                    break
+                }
+                
+                Start-Sleep -Seconds 3  # Slightly longer sleep since we're monitoring more files
+            }
+            
+            $totalWaitTime = (Get-Date) - $waitStartTime
+            if ((Get-Date) -ge $waitStartTime.AddSeconds($maxTimeout)) {
+                Write-Log "User remediation timed out after $($totalWaitTime.TotalSeconds) seconds (limit: $maxTimeout)" | Out-Null
+                Write-Log "Total file existence checks performed: $checkCount" | Out-Null
+                
+                # Final check on task status
+                try {
+                    $finalTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                    if ($finalTask) {
+                        $finalTaskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+                        Write-Log "Final task status: State=$($finalTask.State), LastResult=$($finalTaskInfo.LastTaskResult)" | Out-Null
+                    }
+                } catch {
+                    Write-Log "Could not get final task status" | Out-Null
+                }
+            } else {
+                Write-Log "User remediation completed successfully in $($totalWaitTime.TotalSeconds) seconds" | Out-Null
+            }
+            
+            # Clean up marker files
+            try {
+                if (Test-Path $statusFile) { Remove-Item $statusFile -Force -ErrorAction SilentlyContinue }
+                if (Test-Path $heartbeatFile) { Remove-Item $heartbeatFile -Force -ErrorAction SilentlyContinue }
+                Write-Log "Cleaned up marker files" | Out-Null
+            } catch {
+                Write-Log "Error cleaning up marker files: $($_.Exception.Message)" | Out-Null
+            }
             
         } catch {
-            Write-Log "Error creating/scheduling user remediation task: $($_.Exception.Message)" | Out-Null
-            # Clean up temporary script copy on error
-            if (Test-Path $tempScriptPath) {
-                Remove-Item $tempScriptPath -Force -ErrorAction SilentlyContinue
+            Write-Log "Exception in user remediation task: $($_.Exception.Message)" | Out-Null
+            $success = $false
+        } finally {
+            # Cleanup - SAME AS DETECTION
+            try {
+                Write-Log "Starting cleanup" | Out-Null
+                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                
+                if (Test-Path $resultFile) {
+                    Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
+                }
+                
+                # Clean up temporary script copy
+                if (Test-Path $tempScriptPath) {
+                    Remove-Item $tempScriptPath -Force -ErrorAction SilentlyContinue
+                    Write-Log "Removed temporary script copy: $tempScriptPath" | Out-Null
+                }
+                
+                Write-Log "User remediation cleanup completed" | Out-Null
+            } catch {
+                Write-Log "Error during cleanup: $($_.Exception.Message)" | Out-Null
             }
-            return $false
         }
         
+        $totalElapsed = (Get-Date) - $startTime
+        Write-Log "Schedule-UserContextRemediation completed in $($totalElapsed.TotalSeconds) seconds with result: $success" | Out-Null
+        return $success
+        
     } catch {
-        Write-Log "Error in user context remediation scheduling: $($_.Exception.Message)" | Out-Null
+        $totalElapsed = (Get-Date) - $startTime
+        Write-Log "Error in user context remediation scheduling after $($totalElapsed.TotalSeconds) seconds: $($_.Exception.Message)" | Out-Null
+        Write-Log "Exception details: $($_.Exception.ToString())" | Out-Null
         return $false
-    } finally {
-        # Clean up old temporary script copies (older than 1 hour)
-        try {
-            $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
-            if (Test-Path $userTempPath) {
-                $oldTempScripts = Get-ChildItem -Path $userTempPath -Filter "availableUpgrades-remediate_*.ps1" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-1) }
-                foreach ($oldScript in $oldTempScripts) {
-                    Remove-Item $oldScript.FullName -Force -ErrorAction SilentlyContinue
-                    Write-Log "Cleaned up old temporary script: $($oldScript.Name)" | Out-Null
-                }
-            }
-        } catch {
-            # Ignore cleanup errors
-        }
     }
 }
 
@@ -1539,9 +3746,9 @@ function Stop-BlockingProcesses {
                 }
             }
             
-            # Step 2: Wait 5 seconds total (not per process)
-            Write-Log -Message "Waiting 5 seconds for graceful shutdown..."
-            Start-Sleep -Seconds 5
+            # Step 2: Wait 2 seconds total (reduced from 5)
+            Write-Log -Message "Waiting 2 seconds for graceful shutdown..."
+            Start-Sleep -Seconds 2
             
             # Step 3: Check which processes are still running and force-kill them all at once
             $remainingProcesses = @()
@@ -1595,7 +3802,8 @@ function Stop-BlockingProcesses {
                 if ($finalCheck -eq 0) {
                     Write-Log -Message "All processes successfully terminated using parallel approach"
                 } else {
-                    Write-Log -Message "Some processes may still be running ($finalCheck remaining)"
+                    $remainingCount = $finalCheck
+                    Write-Log -Message "Some processes may still be running ($($remainingCount) remaining)"
                 }
             } else {
                 Write-Log -Message "All processes closed gracefully - no force termination needed"
@@ -1612,9 +3820,9 @@ function Stop-BlockingProcesses {
                 Write-Log -Message "Stopping process: $($procInfo.Name) (PID: $($procInfo.PID))"
                 $procInfo.Process.CloseMainWindow()
                 
-                # Wait up to 10 seconds for graceful shutdown
-                if (!$procInfo.Process.WaitForExit(10000)) {
-                    Write-Log -Message "Process $($procInfo.Name) did not exit gracefully, forcing termination"
+                # Wait up to 3 seconds for graceful shutdown (reduced from 10)
+                if (!$procInfo.Process.WaitForExit(3000)) {
+                    Write-Log -Message "Process $($procInfo.Name) did not exit gracefully after 3s, forcing termination"
                     $procInfo.Process.Kill()
                 }
                 $stoppedAny = $true
@@ -1688,6 +3896,16 @@ $useWhitelist = $true
 
 # Clean up old log files (older than 1 month)
 Remove-OldLogs -LogPath $LogPath
+
+# Initialize and clean up deferral system
+Write-Log -Message "Initializing deferral management system" | Out-Null
+try {
+    Initialize-DeferralRegistry | Out-Null
+    Clear-ExpiredDeferralData
+    Write-Log -Message "Deferral system initialization completed" | Out-Null
+} catch {
+    Write-Log -Message "Warning: Deferral system initialization failed: $($_.Exception.Message)" | Out-Null
+}
 
 # Log script start with full date
 Write-Log -Message "Script started on $(Get-Date -Format 'dd.MM.yyyy')"
@@ -1878,18 +4096,160 @@ try {
 if (Test-RunningAsSystem) {
     if ($UserRemediationOnly) {
         # This is a scheduled user remediation task - process user apps only
+        Write-Log -Message "*** RUNNING IN USER CONTEXT (SCHEDULED TASK) ***"
+        $userContextStart = Get-Date
+        Write-Log -Message "User context execution started at: $userContextStart"
+        Write-Log -Message "Current user: $env:USERNAME"
+        Write-Log -Message "User domain: $env:USERDOMAIN"
+        Write-Log -Message "Session ID: $((Get-Process -Id $PID).SessionId)"
+        Write-Log -Message "Process ID: $PID"
         Write-Log -Message "Running user remediation task"
+        Write-Log -Message "RemediationResultFile parameter: $RemediationResultFile"
+        
+        # Create heartbeat and status files for system context synchronization
+        $resultFileDir = if ($RemediationResultFile) { Split-Path $RemediationResultFile -Parent } else { "C:\ProgramData\Temp" }
+        $resultFileBaseName = if ($RemediationResultFile) { [System.IO.Path]::GetFileNameWithoutExtension($RemediationResultFile) } else { "UserRemediation" }
+        $heartbeatFile = Join-Path $resultFileDir "$resultFileBaseName.heartbeat"
+        $statusFile = Join-Path $resultFileDir "$resultFileBaseName.status"
+        
+        Write-Log -Message "Creating heartbeat file: $heartbeatFile" | Out-Null
+        Write-Log -Message "Creating status file: $statusFile" | Out-Null
+        
+        # Function to update heartbeat (call this regularly during processing)
+        function Update-Heartbeat {
+            try {
+                "heartbeat" | Out-File -FilePath $heartbeatFile -Force -ErrorAction SilentlyContinue
+            } catch {
+                # Ignore heartbeat errors - don't interrupt processing
+            }
+        }
+        
+        # Function to update status (call at major processing milestones)
+        function Update-Status {
+            param(
+                [string]$Status,
+                [string]$Progress = ""
+            )
+            try {
+                @{
+                    Status = $Status
+                    Progress = $Progress
+                    Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                    ProcessId = $PID
+                } | ConvertTo-Json -Compress | Out-File -FilePath $statusFile -Force -ErrorAction SilentlyContinue
+            } catch {
+                # Ignore status errors - don't interrupt processing
+            }
+        }
+        
+        # Initial heartbeat and status
+        Update-Heartbeat
+        Update-Status -Status "Starting" -Progress "User context remediation initialized"
+        
+        # Check if we're admin in user context - if not, use --scope user
+        Write-Log -Message "Checking user admin privileges..."
+        $privilegeCheckStart = Get-Date
+        $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+        $userIsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        $privilegeCheckTime = (Get-Date) - $privilegeCheckStart
+        Write-Log -Message "Privilege check completed in $($privilegeCheckTime.TotalSeconds) seconds"
+        
+        Write-Log -Message "User is admin: $userIsAdmin"
+        Write-Log -Message "Test-RunningAsSystem: $(Test-RunningAsSystem)"
+        
+        # Update status
+        Update-Status -Status "Privilege check complete" -Progress "Admin: $userIsAdmin"
+        Update-Heartbeat
+        
+        # Add timeout protection for winget execution to prevent hangs
+        Write-Log -Message "Starting winget execution with timeout protection..."
+        $wingetStart = Get-Date
+        $wingetTimeout = 180  # 3 minutes timeout for winget
         
         try {
-            $OUTPUT = $(winget upgrade --accept-source-agreements)
-            Write-Log -Message "Successfully executed winget upgrade in user context (scheduled task)"
+            # Use background job with timeout to prevent winget hanging
+            $wingetJob = Start-Job -ScriptBlock {
+                param($isAdmin)
+                if ($isAdmin) {
+                    winget upgrade --accept-source-agreements
+                } else {
+                    winget upgrade --accept-source-agreements --scope user
+                }
+            } -ArgumentList $userIsAdmin
+            
+            Write-Log -Message "Winget job started (Job ID: $($wingetJob.Id)), waiting up to $wingetTimeout seconds..."
+            Update-Status -Status "Running winget" -Progress "Executing winget upgrade command with timeout protection"
+            
+            # Update heartbeat every 30 seconds while waiting for winget
+            $wingetWaitStart = Get-Date
+            while ((Get-Date) -lt $wingetWaitStart.AddSeconds($wingetTimeout) -and $wingetJob.State -eq "Running") {
+                if (Wait-Job $wingetJob -Timeout 30) {
+                    break  # Job completed
+                }
+                Update-Heartbeat
+                Write-Log -Message "Winget still running... $([int]((Get-Date) - $wingetWaitStart).TotalSeconds)s elapsed" | Out-Null
+            }
+            
+            if ($wingetJob.State -eq "Completed") {
+                $OUTPUT = Receive-Job $wingetJob
+                $wingetTime = (Get-Date) - $wingetStart
+                Write-Log -Message "Winget completed successfully in $($wingetTime.TotalSeconds) seconds"
+                Write-Log -Message "Winget output lines: $($OUTPUT.Count)"
+                Update-Status -Status "Winget complete" -Progress "Output: $($OUTPUT.Count) lines, Time: $([int]$wingetTime.TotalSeconds)s"
+                
+                # Sample first few lines of output for debugging
+                if ($OUTPUT -and $OUTPUT.Count -gt 0) {
+                    $sampleLines = ($OUTPUT | Select-Object -First 3) -join " | "
+                    Write-Log -Message "Winget sample output: $sampleLines"
+                }
+            } else {
+                $wingetTime = (Get-Date) - $wingetStart
+                Write-Log -Message "ERROR: Winget timed out after $($wingetTime.TotalSeconds) seconds"
+                Remove-Job $wingetJob -Force
+                throw "Winget execution timed out after $wingetTimeout seconds"
+            }
+            Remove-Job $wingetJob -Force
+            
         } catch {
-            Write-Log -Message "Error executing winget in user context: $($_.Exception.Message)"
-            Write-Log -Message "Winget may not be available or properly configured"
+            $wingetTime = (Get-Date) - $wingetStart
+            Write-Log -Message "Error executing winget in user context after $($wingetTime.TotalSeconds) seconds: $($_.Exception.Message)"
+            Write-Log -Message "Winget may not be available, properly configured, or timed out"
+            
+            # Write error result file immediately
+            if ($RemediationResultFile) {
+                try {
+                    Write-Log -Message "Writing error result to: $RemediationResultFile"
+                    $errorResult = @{
+                        ProcessedApps = 0
+                        UpgradeResults = @("ERROR: Winget execution failed or timed out")
+                        Success = $false
+                        Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                        Username = $env:USERNAME
+                        Computer = $env:COMPUTERNAME
+                        Context = "USER"
+                        Error = $_.Exception.Message
+                        ExecutionTime = $wingetTime.TotalSeconds
+                    }
+                    $errorResult | ConvertTo-Json -Depth 3 -Compress | Out-File -FilePath $RemediationResultFile -Encoding UTF8 -Force
+                    Write-Log -Message "Error result file written successfully"
+                    
+                    # Verify file was written
+                    if (Test-Path $RemediationResultFile) {
+                        $fileSize = (Get-Item $RemediationResultFile).Length
+                        Write-Log -Message "Error result file verified: $fileSize bytes"
+                    } else {
+                        Write-Log -Message "ERROR: Error result file was not created"
+                    }
+                } catch {
+                    Write-Log -Message "Failed to write error result file: $($_.Exception.Message)"
+                }
+            }
             exit 1
         }
         
         # Check if first output is valid (contains actual app data)
+        Write-Log -Message "Validating winget output..."
+        $outputValidationStart = Get-Date
         $hasValidOutput = $false
         foreach ($line in $OUTPUT) {
             if ($line -like "Name*Id*Version*Available*Source*") {
@@ -1897,11 +4257,58 @@ if (Test-RunningAsSystem) {
                 break
             }
         }
+        $outputValidationTime = (Get-Date) - $outputValidationStart
+        Write-Log -Message "Output validation completed in $($outputValidationTime.TotalMilliseconds) ms - Valid: $hasValidOutput"
         
-        # If first output is nonsense, run again
+        # If first output is nonsense, run again with timeout protection
         if (-not $hasValidOutput) {
-            Write-Log -Message "First winget run produced invalid output, retrying..."
-            $OUTPUT = $(winget upgrade --accept-source-agreements)
+            Write-Log -Message "First winget run produced invalid output, retrying with timeout protection..."
+            $retryStart = Get-Date
+            
+            try {
+                $retryJob = Start-Job -ScriptBlock {
+                    param($isAdmin)
+                    if ($isAdmin) {
+                        winget upgrade --accept-source-agreements
+                    } else {
+                        winget upgrade --accept-source-agreements --scope user
+                    }
+                } -ArgumentList $userIsAdmin
+                
+                if (Wait-Job $retryJob -Timeout $wingetTimeout) {
+                    $OUTPUT = Receive-Job $retryJob
+                    $retryTime = (Get-Date) - $retryStart
+                    Write-Log -Message "Winget retry completed in $($retryTime.TotalSeconds) seconds"
+                } else {
+                    $retryTime = (Get-Date) - $retryStart
+                    Write-Log -Message "ERROR: Winget retry timed out after $($retryTime.TotalSeconds) seconds"
+                    Remove-Job $retryJob -Force
+                    throw "Winget retry timed out"
+                }
+                Remove-Job $retryJob -Force
+                
+            } catch {
+                $retryTime = (Get-Date) - $retryStart
+                Write-Log -Message "Error in winget retry after $($retryTime.TotalSeconds) seconds: $($_.Exception.Message)"
+                
+                # Write error result and exit
+                if ($RemediationResultFile) {
+                    Write-Log -Message "Writing retry error result to: $RemediationResultFile"
+                    $errorResult = @{
+                        ProcessedApps = 0
+                        UpgradeResults = @("ERROR: Winget retry failed or timed out")
+                        Success = $false
+                        Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                        Username = $env:USERNAME
+                        Computer = $env:COMPUTERNAME
+                        Context = "USER"
+                        Error = $_.Exception.Message
+                        ExecutionTime = ((Get-Date) - $userContextStart).TotalSeconds
+                    }
+                    $errorResult | ConvertTo-Json -Depth 3 -Compress | Out-File -FilePath $RemediationResultFile -Encoding UTF8 -Force
+                }
+                exit 1
+            }
         }
         
         Write-Log -Message "User context remediation - processing user-scoped apps only"
@@ -1973,7 +4380,11 @@ if (Test-RunningAsSystem) {
 }
 
 # Parse winget output and process apps
+Write-Log -Message "Starting winget output parsing..."
+$parsingStart = Get-Date
+
 if ($OUTPUT) {
+    Write-Log -Message "Winget output contains $($OUTPUT.Count) lines, parsing structure..."
     $headerLine = -1
     $lineCount = 0
 
@@ -1984,11 +4395,15 @@ if ($OUTPUT) {
         $lineCount++
     }
 
+    Write-Log -Message "Header found at line $headerLine, total lines: $lineCount"
+
     if ($OUTPUT -and $lineCount -gt $headerLine+2) {
         $str = $OUTPUT[$headerLine]
         $idPos = $str.indexOf("Id")
         $versionPos = $str.indexOf("Version")-1
         $availablePos = $str.indexOf("Available")-1
+
+        Write-Log -Message "Column positions - Id: $idPos, Version: $versionPos, Available: $availablePos"
 
         $LIST= [System.Collections.ArrayList]::new()
         for ($i = $headerLine+2; $i -lt $OUTPUT.count; $i++ ) {
@@ -2040,14 +4455,37 @@ if ($OUTPUT) {
             }
         }
 
+        $parsingTime = (Get-Date) - $parsingStart
+        Write-Log -Message "Parsing completed in $($parsingTime.TotalSeconds) seconds - Found $($LIST.Count) apps"
+
         $count = 0
         $message = ""
+        $processingStart = Get-Date
+        Write-Log -Message "Starting app processing loop..."
 
         foreach ($appInfo in $LIST) {
             if ($appInfo.AppID -ne "") {
                 $doUpgrade = $false
                 foreach ($okapp in $whitelistConfig) {
                     if ($appInfo.AppID -eq $okapp.AppID) {
+                        Write-Log -Message "Processing whitelisted app: $($okapp.AppID)" | Out-Null
+                        
+                        # First, check deferral status if deferrals are enabled
+                        if ($okapp.DeferralEnabled -eq $true) {
+                            Write-Log -Message "Deferral system enabled for $($okapp.AppID), checking status" | Out-Null
+                            
+                            $deferralStatus = Get-DeferralStatus -AppID $okapp.AppID -WhitelistConfig $okapp -AvailableVersion $appInfo.AvailableVersion
+                            
+                            if (-not $deferralStatus.ForceUpdate) {
+                                Write-Log -Message "Update for $($okapp.AppID) can be deferred - skipping this run" | Out-Null
+                                Write-Log -Message "Deferral message: $($deferralStatus.Message)" | Out-Null
+                                continue  # Skip this app - user can defer
+                            } else {
+                                Write-Log -Message "Update for $($okapp.AppID) is now mandatory: $($deferralStatus.Message)" | Out-Null
+                            }
+                        }
+                        
+                        # Process blocking processes
                         $blockingProcessNames = $okapp.BlockingProcess
                         if (-not [string]::IsNullOrEmpty($blockingProcessNames)) {
                             $processesToCheck = $blockingProcessNames -split ','
@@ -2075,7 +4513,7 @@ if ($OUTPUT) {
                                 # Check if we can auto-close only safe processes
                                 $autoCloseProcesses = $okapp.AutoCloseProcesses
                                 $canAutoClose = $false
-                                $userChoice = $false
+                                $dialogResult = $null
                                 
                                 if (-not [string]::IsNullOrEmpty($autoCloseProcesses)) {
                                     $autoCloseList = $autoCloseProcesses -split ','
@@ -2107,7 +4545,12 @@ if ($OUTPUT) {
                                     
                                     if ($canAutoClose) {
                                         Write-Log -Message "Only auto-closeable processes running for $($okapp.AppID): $($runningProcesses -join ', '). Auto-closing without user prompt."
-                                        $userChoice = $true
+                                        $dialogResult = @{
+                                            CloseProcess = $true
+                                            DeferralDays = 0
+                                            Action = "Update"
+                                            UserChoice = $true
+                                        }
                                     }
                                 }
                                 
@@ -2120,12 +4563,16 @@ if ($OUTPUT) {
                                     $customTimeout = if ($okapp.TimeoutSeconds -and $okapp.TimeoutSeconds -gt 0) { $okapp.TimeoutSeconds } else { 60 }
                                     
                                     Write-Log -Message "Using timeout: ${customTimeout}s, default action: $defaultTimeoutAction" | Out-Null
-                                    $userChoice = Show-ProcessCloseDialog -AppName $okapp.AppID -ProcessName $runningProcessName -TimeoutSeconds $customTimeout -DefaultTimeoutAction $defaultTimeoutAction -FriendlyName $okapp.FriendlyName -CurrentVersion $appInfo.CurrentVersion -AvailableVersion $appInfo.AvailableVersion
+                                    $dialogResult = Show-ProcessCloseDialog -AppName $okapp.AppID -ProcessName $runningProcessName -TimeoutSeconds $customTimeout -DefaultTimeoutAction $defaultTimeoutAction -FriendlyName $okapp.FriendlyName -CurrentVersion $appInfo.CurrentVersion -AvailableVersion $appInfo.AvailableVersion -WhitelistConfig $okapp
                                     
-                                    Write-Log -Message "Show-ProcessCloseDialog returned: $userChoice (type: $($userChoice.GetType().Name))"
+                                    Write-Log -Message "Show-ProcessCloseDialog returned: $($dialogResult | ConvertTo-Json -Compress)"
                                 }
                                 
-                                if ($userChoice) {
+                                # Handle dialog result
+                                if ($dialogResult.Action -eq "Defer") {
+                                    Write-Log -Message "User chose to defer $($okapp.AppID) for $($dialogResult.DeferralDays) days"
+                                    continue  # Skip this app - user deferred
+                                } elseif ($dialogResult.CloseProcess -or $dialogResult.UserChoice) {
                                     if ($canAutoClose) {
                                         Write-Log -Message "Auto-closing safe processes for $($okapp.AppID)"
                                     } else {
@@ -2274,14 +4721,14 @@ if ($OUTPUT) {
                         # Evaluate success
                         if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*") {
                             Write-Log -Message "Upgrade completed successfully for: $($appInfo.AppID)"
-                            $message += $appInfo.AppID + "|"
+                            $message += "$($appInfo.AppID)|"
                         } else {
                             Write-Log -Message "Upgrade failed for $($appInfo.AppID) - Exit code: $LASTEXITCODE"
-                            $message += $appInfo.AppID + " (FAILED)|"
+                            $message += "$($appInfo.AppID) (FAILED)|"
                         }
                     } catch {
                         Write-Log -Message "Error upgrading $($appInfo.AppID) : $($_.Exception.Message)"
-                        $message += $appInfo.AppID + " (ERROR)|"
+                        $message += "$($appInfo.AppID) (ERROR)|"
                     }
                 }
             }
@@ -2302,6 +4749,81 @@ if ($OUTPUT) {
         if ($message -ne "") {
             Write-Log -Message "[$ScriptTag] Apps upgraded: $message"
         }
+        
+        $processingTime = (Get-Date) - $processingStart
+        Write-Log -Message "App processing completed in $($processingTime.TotalSeconds) seconds"
+
+        # If this is a UserRemediationOnly task, write result file for SYSTEM context to read
+        if ($UserRemediationOnly) {
+            Write-Log -Message "*** USER CONTEXT REMEDIATION COMPLETE - WRITING RESULTS ***"
+            Write-Log -Message "RemediationResultFile parameter: $RemediationResultFile"
+            $resultWritingStart = Get-Date
+            
+            if ($RemediationResultFile) {
+                try {
+                    Write-Log -Message "Parsing upgrade results from message: '$message'"
+                    # Parse message to extract upgrade results
+                    $upgradeResults = @()
+                    if ($message -ne "") {
+                        # Split by pipe and clean up each result
+                        $results = $message -split '\|' | Where-Object { $_ -ne "" }
+                        $upgradeResults = $results | ForEach-Object { $_.Trim() }
+                    }
+                    
+                    $totalExecutionTime = if ($userContextStart) { (Get-Date) - $userContextStart } else { New-TimeSpan }
+                    $results = @{
+                        ProcessedApps = $count
+                        UpgradeResults = $upgradeResults
+                        Success = $true
+                        Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                        Username = $env:USERNAME
+                        Computer = $env:COMPUTERNAME
+                        Context = "USER"
+                        PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+                        ProcessId = $PID
+                        SessionId = (Get-Process -Id $PID).SessionId
+                        ExecutionTime = $totalExecutionTime.TotalSeconds
+                        TimingDetails = @{
+                            WingetExecution = if ($wingetTime) { $wingetTime.TotalSeconds } else { 0 }
+                            OutputParsing = if ($parsingTime) { $parsingTime.TotalSeconds } else { 0 }
+                            AppProcessing = if ($processingTime) { $processingTime.TotalSeconds } else { 0 }
+                        }
+                    }
+                    
+                    Write-Log -Message "Writing user remediation results to file: $RemediationResultFile"
+                    Write-Log -Message "Results: ProcessedApps=$count, UpgradeResults=$($upgradeResults.Count) items, ExecutionTime=$($totalExecutionTime.TotalSeconds)s"
+                    
+                    # Ensure the directory exists
+                    $resultDir = Split-Path $RemediationResultFile -Parent
+                    if (-not (Test-Path $resultDir)) {
+                        New-Item -Path $resultDir -ItemType Directory -Force | Out-Null
+                        Write-Log -Message "Created result directory: $resultDir"
+                    }
+                    
+                    $results | ConvertTo-Json -Depth 4 -Compress | Out-File -FilePath $RemediationResultFile -Encoding UTF8 -Force
+                    
+                    # Verify file was written
+                    if (Test-Path $RemediationResultFile) {
+                        $fileSize = (Get-Item $RemediationResultFile).Length
+                        $resultWritingTime = (Get-Date) - $resultWritingStart
+                        Write-Log -Message "Result file written successfully in $($resultWritingTime.TotalSeconds) seconds, size: $fileSize bytes"
+                    } else {
+                        Write-Log -Message "ERROR: Result file was not created at: $RemediationResultFile"
+                    }
+                    
+                } catch {
+                    $resultWritingTime = (Get-Date) - $resultWritingStart
+                    Write-Log -Message "ERROR: Failed to write user remediation results after $($resultWritingTime.TotalSeconds) seconds: $($_.Exception.Message)"
+                    Write-Log -Message "Exception details: $($_.Exception.ToString())"
+                }
+            } else {
+                Write-Log -Message "WARNING: No result file path found - SYSTEM context may not receive results"
+            }
+            
+            $totalUserContextTime = if ($userContextStart) { (Get-Date) - $userContextStart } else { New-TimeSpan }
+            Write-Log -Message "*** USER CONTEXT TASK EXITING after $($totalUserContextTime.TotalSeconds) seconds ***"
+        }
+        
         exit 0
     }
     Write-Log -Message "[$ScriptTag] No upgrades (0x0000002)"

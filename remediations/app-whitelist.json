@@ -101,8 +101,9 @@
         "AppID": "Notepad++.Notepad++",
         "FriendlyName": "Notepad++",
         "BlockingProcess": "notepad++",
-        "DefaultTimeoutAction": true,
-        "TimeoutSeconds": 60,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 180,
+        "PromptWhenBlocked": true,
         "DeferralEnabled": true,
         "MaxDeferralDays": 14,
         "DeferralOptions": [
@@ -110,8 +111,7 @@
             {"Days": 3, "Label": "3 days"},
             {"Days": 7, "Label": "1 week"},
             {"Days": 14, "Label": "2 weeks"}
-        ],
-        "ForcedUpgradeMessage": "Notepad++ updates are now required for compatibility."
+        ]
     },
     {
         "AppID": "7zip.7zip",
