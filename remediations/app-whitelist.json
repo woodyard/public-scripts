@@ -9,7 +9,15 @@
         "BlockingProcess": "firefox",
         "PromptWhenBlocked": true,
         "DefaultTimeoutAction": false,
-        "TimeoutSeconds": 60
+        "TimeoutSeconds": 60,
+        "DeferralEnabled": true,
+        "MaxDeferralDays": 5,
+        "DeferralOptions": [
+            {"Days": 1, "Label": "1 day"},
+            {"Days": 3, "Label": "3 days"},
+            {"Days": 5, "Label": "5 days"}
+        ],
+        "ForcedUpgradeMessage": "Firefox security updates can no longer be deferred."
     },
     {
         "AppID": "Google.Chrome",
@@ -20,7 +28,15 @@
         "BlockingProcess": "chrome",
         "PromptWhenBlocked": true,
         "DefaultTimeoutAction": false,
-        "TimeoutSeconds": 60
+        "TimeoutSeconds": 60,
+        "DeferralEnabled": true,
+        "MaxDeferralDays": 5,
+        "DeferralOptions": [
+            {"Days": 1, "Label": "1 day"},
+            {"Days": 3, "Label": "3 days"},
+            {"Days": 5, "Label": "5 days"}
+        ],
+        "ForcedUpgradeMessage": "Chrome security updates can no longer be deferred."
     },
     {
         "AppID": "Microsoft.VisualStudioCode",
@@ -31,7 +47,16 @@
         "BlockingProcess": "Code",
         "PromptWhenBlocked": true,
         "DefaultTimeoutAction": false,
-        "TimeoutSeconds": 60
+        "TimeoutSeconds": 60,
+        "DeferralEnabled": true,
+        "MaxDeferralDays": 14,
+        "DeferralOptions": [
+            {"Days": 1, "Label": "1 day"},
+            {"Days": 3, "Label": "3 days"},
+            {"Days": 7, "Label": "1 week"},
+            {"Days": 14, "Label": "2 weeks"}
+        ],
+        "ForcedUpgradeMessage": "VS Code updates are now required for compatibility."
     },
     {
         "AppID": "Salesforce.sfdx-cli",
@@ -104,7 +129,15 @@
         "BlockingProcess": "1Password",
         "PromptWhenBlocked": true,
         "DefaultTimeoutAction": false,
-        "TimeoutSeconds": 90
+        "TimeoutSeconds": 180,
+        "DeferralEnabled": true,
+        "MaxDeferralDays": 5,
+        "DeferralOptions": [
+            {"Days": 1, "Label": "1 day"},
+            {"Days": 3, "Label": "3 days"},
+            {"Days": 5, "Label": "5 days"}
+        ],
+        "ForcedUpgradeMessage": "1Password updates can no longer be deferred."
     },
     {
         "AppID": "Logitech.SetPoint"
@@ -230,7 +263,14 @@
         "BlockingProcess": "i_view64"
     },
     {
-        "AppID": "OpenJS.NodeJS"
+        "AppID": "OpenJS.NodeJS",
+        "FriendlyName": "Node.js",
+        "SystemContext": true,
+        "UserContext": true,
+        "BlockingProcess": "",
+        "PromptWhenBlocked": false,
+        "DefaultTimeoutAction": true,
+        "TimeoutSeconds": 60
     },
     {
         "AppID": "OpenJS.NodeJS.LTS"
@@ -290,7 +330,14 @@
         "AutoCloseProcesses": "AdobeCollabSync",
         "PromptWhenBlocked": true,
         "DefaultTimeoutAction": false,
-        "TimeoutSeconds": 60
+        "TimeoutSeconds": 60,
+        "DeferralEnabled": true,
+        "MaxDeferralDays": 3,
+        "DeferralOptions": [
+            {"Days": 1, "Label": "1 day"},
+            {"Days": 3, "Label": "3 days"}
+        ],
+        "ForcedUpgradeMessage": "Adobe Reader security updates cannot be postponed due to security requirements."
     },
     {
         "AppID": "RazerInc.RazerInstaller"
@@ -343,7 +390,10 @@
         "PromptWhenBlocked": true,
         "DefaultTimeoutAction": false,
         "TimeoutSeconds": 60,
-        "Disabled": true
+        "Disabled": true,
+        "DeferralEnabled": false,
+        "MaxDeferralDays": 0,
+        "ForcedUpgradeMessage": "VPN client updates are mandatory for security compliance."
     },
     {
         "AppID": "Foxit.FoxitReader.Inno",
