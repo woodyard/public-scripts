@@ -15,8 +15,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.18
-    Tag: 5V
+    Version: 5.19
+    Tag: 5W
     
     Version History:
     1.0 - Initial version
@@ -62,6 +62,7 @@
     5.16 - NODE.JS DEBUGGING: Added specific Node.js (OpenJS.NodeJS) detection debugging to verify dual-context architecture handles user-scoped applications correctly
     5.17 - FUNCTION HANG DEBUG: Enhanced Invoke-UserContextDetection function debugging to identify where execution hangs by removing Out-Null suppressions
     5.18 - CRITICAL FIX: Resolved logging contamination bug - restored Out-Null suppressions in Invoke-UserContextDetection to prevent debug messages from being returned as app names (function was working but returning log messages instead of real apps)
+    5.19 - PERFORMANCE OPTIMIZATION: Detection script now exits immediately with code 1 when system apps are found, skipping expensive user context detection for faster execution
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -603,7 +604,7 @@ function Invoke-UserContextDetection {
 }
 
 <# Script variables #>
-$ScriptTag = "5V" # Update this tag for each script version
+$ScriptTag = "5W" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -1064,29 +1065,28 @@ if ($OUTPUT) {
             
         } elseif ((Test-RunningAsSystem) -and (-not $UserDetectionOnly)) {
             Write-Log -Message "DEBUG: *** TAKING SYSTEM CONTEXT MAIN EXECUTION PATH ***" -IsDebug
-            # SYSTEM context main execution - combine with user detection
+            # SYSTEM context main execution - check system apps first, only run user detection if none found
             $systemApps = $contextApps
             Write-Log -Message "System detection found $($systemApps.Count) apps: $($systemApps -join ', ')"
             
-            # Schedule user context detection
+            # PERFORMANCE OPTIMIZATION: Exit immediately if system apps are found
+            if ($systemApps.Count -gt 0) {
+                Write-Log -Message "[$ScriptTag] System apps found - skipping user detection for faster execution"
+                Write-Log -Message "[$ScriptTag] System apps: $($systemApps -join '|')"
+                Write-Log -Message "[$ScriptTag] Total apps found: $($systemApps.Count) (system only, user detection skipped)"
+                exit 1  # Trigger remediation immediately
+            }
+            
+            # Only run user detection if no system apps were found
+            Write-Log -Message "No system apps found - checking user context applications"
             Write-Log -Message "DEBUG: About to call Invoke-UserContextDetection function" -IsDebug
             $userApps = Invoke-UserContextDetection
             Write-Log -Message "DEBUG: Invoke-UserContextDetection returned $($userApps.Count) apps" -IsDebug
             Write-Log -Message "User detection found $($userApps.Count) apps: $($userApps -join ', ')"
             
-            $totalApps = $systemApps.Count + $userApps.Count
-            if ($totalApps -gt 0) {
-                Write-Log -Message "[$ScriptTag] Total apps found: $totalApps ($($systemApps.Count) system, $($userApps.Count) user)"
-                if ($systemApps.Count -gt 0) {
-                    Write-Log -Message "[$ScriptTag] System apps: $($systemApps -join '|')"
-                } else {
-                    Write-Log -Message "[$ScriptTag] System apps: (none)"
-                }
-                if ($userApps.Count -gt 0) {
-                    Write-Log -Message "[$ScriptTag] User apps: $($userApps -join '|')"
-                } else {
-                    Write-Log -Message "[$ScriptTag] User apps: (none)"
-                }
+            if ($userApps.Count -gt 0) {
+                Write-Log -Message "[$ScriptTag] User apps found: $($userApps -join '|')"
+                Write-Log -Message "[$ScriptTag] Total apps found: $($userApps.Count) (user only, no system apps)"
                 exit 1  # Trigger remediation
             } else {
                 Write-Log -Message "[$ScriptTag] No upgrades available in any context"
