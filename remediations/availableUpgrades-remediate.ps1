@@ -4095,6 +4095,32 @@ try {
 # Main remediation logic - dual-context architecture
 if (Test-RunningAsSystem) {
     if ($UserRemediationOnly) {
+        # DIAGNOSTIC: Log immediate execution proof before any other operations
+        try {
+            $debugInfo = @(
+                "USER_CONTEXT_STARTED_$(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff')",
+                "PowerShell_Version: $($PSVersionTable.PSVersion)",
+                "PowerShell_Edition: $($PSVersionTable.PSEdition)",
+                "Execution_Policy: $(Get-ExecutionPolicy)",
+                "Current_User: $env:USERNAME",
+                "User_Domain: $env:USERDOMAIN",
+                "Process_ID: $PID",
+                "Session_ID: $((Get-Process -Id $PID).SessionId)",
+                "Script_Path: $($MyInvocation.MyCommand.Path)",
+                "Working_Directory: $(Get-Location)",
+                "Parameters: UserRemediationOnly=$UserRemediationOnly, RemediationResultFile=$RemediationResultFile",
+                "--- END DIAGNOSTIC INFO ---"
+            )
+            $debugInfo | Out-File -FilePath "C:\ProgramData\Temp\UserContext_Debug.log" -Append -Force -Encoding UTF8
+        } catch {
+            # If even this basic logging fails, try alternative location
+            try {
+                "USER_CONTEXT_DIAGNOSTIC_FAILED: $($_.Exception.Message)" | Out-File -FilePath "$env:TEMP\UserContext_Debug_Fallback.log" -Append -Force
+            } catch {
+                # Complete failure - script execution may be blocked entirely
+            }
+        }
+        
         # This is a scheduled user remediation task - process user apps only
         Write-Log -Message "*** RUNNING IN USER CONTEXT (SCHEDULED TASK) ***"
         $userContextStart = Get-Date
@@ -4117,10 +4143,53 @@ if (Test-RunningAsSystem) {
         
         # Function to update heartbeat (call this regularly during processing)
         function Update-Heartbeat {
+            param(
+                [string]$Stage = "Unknown",
+                [hashtable]$AdditionalData = @{}
+            )
+            
             try {
-                "heartbeat" | Out-File -FilePath $heartbeatFile -Force -ErrorAction SilentlyContinue
+                # Ensure directory exists before writing
+                $heartbeatDir = Split-Path $heartbeatFile -Parent
+                if (-not (Test-Path $heartbeatDir)) {
+                    New-Item -Path $heartbeatDir -ItemType Directory -Force | Out-Null
+                }
+                
+                $heartbeatData = @{
+                    Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
+                    Stage = $Stage
+                    ProcessId = $PID
+                    Username = $env:USERNAME
+                    SessionId = (Get-Process -Id $PID).SessionId
+                }
+                
+                # Add any additional context data
+                foreach ($key in $AdditionalData.Keys) {
+                    $heartbeatData[$key] = $AdditionalData[$key]
+                }
+                
+                $heartbeatJson = $heartbeatData | ConvertTo-Json -Compress
+                $heartbeatJson | Out-File -FilePath $heartbeatFile -Force -Encoding UTF8
+                
+                # Also create a simple timestamp file for basic monitoring
+                (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff") | Out-File -FilePath "$heartbeatFile.timestamp" -Force
+                
+                return $true
             } catch {
-                # Ignore heartbeat errors - don't interrupt processing
+                # Log heartbeat failures to a separate error file instead of silencing them
+                $errorMsg = "Heartbeat failed at stage '$Stage': $($_.Exception.Message)"
+                try {
+                    $errorMsg | Out-File -FilePath "$heartbeatFile.error" -Append -Force -ErrorAction Stop
+                } catch {
+                    # Final fallback - try Windows Event Log
+                    try {
+                        Write-EventLog -LogName Application -Source "WingetRemediation" -EntryType Error -EventId 1002 -Message $errorMsg -ErrorAction SilentlyContinue
+                    } catch {
+                        # Complete failure - at least try user temp
+                        $errorMsg | Out-File -FilePath "$env:TEMP\UserContext_Heartbeat_Error.log" -Append -Force -ErrorAction SilentlyContinue
+                    }
+                }
+                return $false
             }
         }
         
@@ -4143,7 +4212,11 @@ if (Test-RunningAsSystem) {
         }
         
         # Initial heartbeat and status
-        Update-Heartbeat
+        Update-Heartbeat -Stage "ScriptStart" -AdditionalData @{
+            ScriptPath = $MyInvocation.MyCommand.Path
+            Arguments = $MyInvocation.Line
+            PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+        }
         Update-Status -Status "Starting" -Progress "User context remediation initialized"
         
         # Check if we're admin in user context - if not, use --scope user
@@ -4159,7 +4232,10 @@ if (Test-RunningAsSystem) {
         
         # Update status
         Update-Status -Status "Privilege check complete" -Progress "Admin: $userIsAdmin"
-        Update-Heartbeat
+        Update-Heartbeat -Stage "PrivilegeCheck" -AdditionalData @{
+            UserIsAdmin = $userIsAdmin
+            TestRunningAsSystem = (Test-RunningAsSystem)
+        }
         
         # Add timeout protection for winget execution to prevent hangs
         Write-Log -Message "Starting winget execution with timeout protection..."
@@ -4186,8 +4262,12 @@ if (Test-RunningAsSystem) {
                 if (Wait-Job $wingetJob -Timeout 30) {
                     break  # Job completed
                 }
-                Update-Heartbeat
-                Write-Log -Message "Winget still running... $([int]((Get-Date) - $wingetWaitStart).TotalSeconds)s elapsed" | Out-Null
+                $elapsedWinget = [int]((Get-Date) - $wingetWaitStart).TotalSeconds
+                Update-Heartbeat -Stage "WingetExecution" -AdditionalData @{
+                    ElapsedSeconds = $elapsedWinget
+                    JobState = $wingetJob.State
+                }
+                Write-Log -Message "Winget still running... ${elapsedWinget}s elapsed" | Out-Null
             }
             
             if ($wingetJob.State -eq "Completed") {
