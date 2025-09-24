@@ -149,6 +149,57 @@ function Remove-OldLogs {
     }
 }
 
+function Test-InteractiveSession {
+    <#
+    .SYNOPSIS
+        Tests if there is an active interactive user session suitable for user context operations
+    .DESCRIPTION
+        Verifies that an interactive user session exists with desktop access before
+        attempting to create scheduled tasks that require user interaction
+    .OUTPUTS
+        Boolean - True if interactive session available, False otherwise
+    #>
+    
+    try {
+        Write-Log "Checking for interactive session..." -IsDebug
+        
+        # Use existing Get-InteractiveUser function
+        $userInfo = Get-InteractiveUser
+        if (-not $userInfo) {
+            Write-Log "No interactive user detected - skipping user context operations"
+            return $false
+        }
+        
+        # Additional check: Verify explorer.exe is running (indicates active desktop)
+        $explorerProcesses = Get-Process -Name "explorer" -ErrorAction SilentlyContinue
+        if (-not $explorerProcesses) {
+            Write-Log "No explorer.exe processes found - no active desktop session"
+            return $false
+        }
+        
+        # Verify session is interactive (session ID > 0)
+        $hasInteractiveSession = $false
+        foreach ($process in $explorerProcesses) {
+            if ($process.SessionId -gt 0) {  # Session 0 is services, >0 are user sessions
+                $hasInteractiveSession = $true
+                Write-Log "Interactive session confirmed - Session ID: $($process.SessionId), User: $($userInfo.Username)" -IsDebug
+                break
+            }
+        }
+        
+        if (-not $hasInteractiveSession) {
+            Write-Log "Explorer processes found but no interactive user sessions detected"
+            return $false
+        }
+        
+        return $true
+        
+    } catch {
+        Write-Log "Error checking interactive session: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Get-InteractiveUser {
     <#
     .SYNOPSIS
@@ -1077,8 +1128,15 @@ if ($OUTPUT) {
                 exit 1  # Trigger remediation immediately
             }
             
-            # Only run user detection if no system apps were found
-            Write-Log -Message "No system apps found - checking user context applications"
+            # Only run user detection if no system apps were found AND interactive session exists
+            Write-Log -Message "No system apps found - checking for interactive session before user context detection"
+            if (-not (Test-InteractiveSession)) {
+                Write-Log -Message "[$ScriptTag] No interactive session detected - skipping user context detection"
+                Write-Log -Message "[$ScriptTag] No upgrades available in any context (no system apps, no interactive session)"
+                exit 0
+            }
+
+            Write-Log -Message "Interactive session confirmed - proceeding with user context detection"
             Write-Log -Message "DEBUG: About to call Invoke-UserContextDetection function" -IsDebug
             $userApps = Invoke-UserContextDetection
             Write-Log -Message "DEBUG: Invoke-UserContextDetection returned $($userApps.Count) apps" -IsDebug

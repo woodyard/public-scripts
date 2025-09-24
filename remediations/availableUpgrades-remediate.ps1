@@ -12,8 +12,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 8.3
- Tag: 8U
+ Version: 8.4
+ Tag: 8V
     
     Version History:
     1.0 - Initial version
@@ -51,6 +51,7 @@
     8.1 - CRITICAL UPDATE: Added --scope user support for non-privileged user context upgrades, allowing users without admin rights to upgrade user-scoped applications
     8.2 - CRITICAL FIX: Fixed empty script path issue in scheduled tasks by capturing $MyInvocation.MyCommand.Path at global scope with multiple fallback methods; Fixed PowerShell syntax errors with Test-RunningAsSystem function calls
     8.3 - SECURITY IMPROVEMENT: Scripts now copy themselves to user-accessible temp locations before scheduling tasks, improving security and access control with automatic cleanup
+    8.4 - CRITICAL FIX: Fixed Azure AD identity cache registry errors in Intune by replacing Start-Job background registry access with direct Test-Path and SilentlyContinue error handling, eliminating "remediation error" messages on AAD-joined machines
     
     Exit Codes:
     0 - Script completed successfully
@@ -248,31 +249,27 @@ function Get-InteractiveUser {
                 throw "User detection failed - no logged in user found"
             }
             
-            # Try to get Azure AD username from registry with timeout protection
+            # Try to get Azure AD username from registry with enhanced error suppression
             try {
                 $azureAdPath = "HKLM:\SOFTWARE\Microsoft\IdentityStore\Cache\$LoggedSID\IdentityCache\$LoggedSID"
                 Write-Log "Checking for Azure AD user info at: $azureAdPath" | Out-Null
-                $registryStart = Get-Date
                 
-                # Registry access should be fast, but add timeout protection just in case
-                $registryJob = Start-Job -ScriptBlock {
-                    param($Path)
-                    (Get-ItemProperty -ErrorAction Stop -Path $Path -Name UserName).UserName
-                } -ArgumentList $azureAdPath
-                
-                if (Wait-Job $registryJob -Timeout 5) {
-                    $CurrentAzureADUser = Receive-Job $registryJob
-                    $registryDuration = (Get-Date) - $registryStart
-                    Write-Log "Found Azure AD username: $CurrentAzureADUser (retrieved in $($registryDuration.TotalSeconds)s)" | Out-Null
+                # First check if the path exists to avoid errors completely
+                if (Test-Path $azureAdPath) {
+                    $registryData = Get-ItemProperty -Path $azureAdPath -Name UserName -ErrorAction SilentlyContinue
+                    if ($registryData -and $registryData.UserName) {
+                        $CurrentAzureADUser = $registryData.UserName
+                        Write-Log "Found Azure AD username: $CurrentAzureADUser" | Out-Null
+                    } else {
+                        Write-Log "Azure AD path exists but UserName property not found" | Out-Null
+                        $CurrentAzureADUser = $null
+                    }
                 } else {
-                    $registryDuration = (Get-Date) - $registryStart
-                    Write-Log "Registry call timed out after $($registryDuration.TotalSeconds) seconds" | Out-Null
+                    Write-Log "Azure AD identity cache path does not exist (user may be local account)" | Out-Null
                     $CurrentAzureADUser = $null
                 }
-                Remove-Job $registryJob -Force
-                
             } catch {
-                Write-Log "No Azure AD user info found (user may be local): $($_.Exception.Message)" | Out-Null
+                Write-Log "No Azure AD user info available (user may be local): $($_.Exception.Message)" | Out-Null
                 $CurrentAzureADUser = $null
             }
             
@@ -322,6 +319,57 @@ function Get-InteractiveUser {
         $userDetectionDuration = (Get-Date) - $userDetectionStart
         Write-Log "Error getting interactive user after $($userDetectionDuration.TotalSeconds) seconds: $($_.Exception.Message)" | Out-Null
         return $null
+    }
+}
+
+function Test-InteractiveSession {
+    <#
+    .SYNOPSIS
+        Tests if there is an active interactive user session suitable for user context operations
+    .DESCRIPTION
+        Verifies that an interactive user session exists with desktop access before
+        attempting to create scheduled tasks that require user interaction
+    .OUTPUTS
+        Boolean - True if interactive session available, False otherwise
+    #>
+    
+    try {
+        Write-Log "Checking for interactive session..." | Out-Null
+        
+        # Use existing Get-InteractiveUser function
+        $userInfo = Get-InteractiveUser
+        if (-not $userInfo) {
+            Write-Log "No interactive user detected - skipping user context operations" | Out-Null
+            return $false
+        }
+        
+        # Additional check: Verify explorer.exe is running (indicates active desktop)
+        $explorerProcesses = Get-Process -Name "explorer" -ErrorAction SilentlyContinue
+        if (-not $explorerProcesses) {
+            Write-Log "No explorer.exe processes found - no active desktop session" | Out-Null
+            return $false
+        }
+        
+        # Verify session is interactive (session ID > 0)
+        $hasInteractiveSession = $false
+        foreach ($process in $explorerProcesses) {
+            if ($process.SessionId -gt 0) {  # Session 0 is services, >0 are user sessions
+                $hasInteractiveSession = $true
+                Write-Log "Interactive session confirmed - Session ID: $($process.SessionId), User: $($userInfo.Username)" | Out-Null
+                break
+            }
+        }
+        
+        if (-not $hasInteractiveSession) {
+            Write-Log "Explorer processes found but no interactive user sessions detected" | Out-Null
+            return $false
+        }
+        
+        return $true
+        
+    } catch {
+        Write-Log "Error checking interactive session: $($_.Exception.Message)" | Out-Null
+        return $false
     }
 }
 
@@ -619,10 +667,17 @@ function Invoke-SystemUserPrompt {
             return $DefaultAction
         }
         
+        # Check for interactive session before creating user tasks
+        if (-not (Test-InteractiveSession)) {
+            Write-Log -Message "No interactive session detected - cannot display user dialog" | Out-Null
+            Write-Log -Message "Using default action: $DefaultAction" | Out-Null
+            return $DefaultAction
+        }
+        
         # Get interactive user
         $userInfo = Get-InteractiveUser
         if (-not $userInfo) {
-            Write-Log "No interactive user found - cannot display prompt" | Out-Null
+            Write-Log "No interactive user found after session check - cannot display prompt" | Out-Null
             return $DefaultAction
         }
         
@@ -3857,7 +3912,7 @@ function Remove-OldLogs {
 }
 
 <# Script variables #>
-$ScriptTag = "8U" # Update this tag for each script version
+$ScriptTag = "8V" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -4814,14 +4869,21 @@ if ($OUTPUT) {
             }
         }
 
-        # If we're in SYSTEM context and processed system apps, now schedule user context remediation
+        # If we're in SYSTEM context and processed system apps, check for interactive session before scheduling user context
         if ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
-            Write-Log -Message "SYSTEM context processing complete - scheduling user context remediation"
-            $userScheduled = Schedule-UserContextRemediation
-            if ($userScheduled) {
-                Write-Log -Message "User context remediation scheduled successfully"
+            Write-Log -Message "SYSTEM context processing complete - checking for interactive session"
+            
+            if (-not (Test-InteractiveSession)) {
+                Write-Log -Message "No interactive session detected - skipping user context remediation"
+                Write-Log -Message "[$ScriptTag] Remediation completed: $count apps processed (system only, no interactive session)"
             } else {
-                Write-Log -Message "User context remediation scheduling failed or no user logged in"
+                Write-Log -Message "Interactive session confirmed - scheduling user context remediation"
+                $userScheduled = Schedule-UserContextRemediation
+                if ($userScheduled) {
+                    Write-Log -Message "User context remediation scheduled successfully"
+                } else {
+                    Write-Log -Message "User context remediation scheduling failed"
+                }
             }
         }
         
