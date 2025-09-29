@@ -18,7 +18,7 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.21
+    Version: 5.22
     Tag: 5Z
     
     Version History:
@@ -68,6 +68,9 @@
     5.19 - PERFORMANCE OPTIMIZATION: Detection script now exits immediately with code 1 when system apps are found, skipping expensive user context detection for faster execution
     5.20 - CRITICAL FIX: Fixed user context communication timeout - JSON result file now ALWAYS written regardless of app count, preventing 30-second timeout when no user apps found
     5.21 - CRITICAL FIX: Fixed parameter detection logic - moved UserDetectionOnly check outside Test-RunningAsSystem condition and changed switch parameters to int parameters for reliable scheduled task parameter passing, ensuring JSON file creation
+    5.22 - CRITICAL FIX: Implemented marker file workaround for scheduled task parameter passing issues - uses file-based communication to ensure user detection tasks always execute correct code path and create JSON result files
+    5.22 - CRITICAL FIX: Implemented marker file workaround for scheduled task parameter passing issues - uses file-based communication to ensure user detection tasks always execute correct code path and create JSON result files
+    5.22 - CRITICAL FIX: Implemented marker file workaround for scheduled task parameter passing issues - uses file-based communication to ensure user detection tasks always execute correct code path and create JSON result files
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -633,6 +636,16 @@ function Invoke-UserContextDetection {
                     Write-Log "DEBUG: Temp script not found during cleanup: $tempScriptPath" -IsDebug | Out-Null
                 }
                 
+                # Clean up marker file
+                $markerFileCleanup = "$tempScriptPath.userdetection"
+                if (Test-Path $markerFileCleanup) {
+                    Write-Log "DEBUG: *** DELETING MARKER FILE *** - $markerFileCleanup" -IsDebug
+                    Remove-Item $markerFileCleanup -Force -ErrorAction SilentlyContinue
+                    Write-Log "Removed marker file: $markerFileCleanup" | Out-Null
+                } else {
+                    Write-Log "DEBUG: Marker file not found during cleanup: $markerFileCleanup" -IsDebug | Out-Null
+                }
+                
                 Write-Log "DEBUG: *** CLEANUP COMPLETED ***" -IsDebug
                 Write-Log "User detection cleanup completed" | Out-Null
             } catch {
@@ -778,10 +791,6 @@ try {
 }
 
 # Main detection logic - dual-context architecture - FIXED PARAMETER DETECTION
-Write-Log -Message "DEBUG: Parameter detection - UserDetectionOnly: '$UserDetectionOnly', Type: $($UserDetectionOnly.GetType()), DetectionResultFile: '$DetectionResultFile'"
-Write-Log -Message "DEBUG: Command line arguments: $($MyInvocation.Line)"
-Write-Log -Message "DEBUG: All parameters: $($PSBoundParameters | ConvertTo-Json -Compress)"
-
 # Check for marker file (workaround for scheduled task parameter passing issues)
 $currentScriptPath = $MyInvocation.MyCommand.Path
 $markerFile = "$currentScriptPath.userdetection"
@@ -1164,13 +1173,6 @@ if ($OUTPUT) {
                 Write-Log -Message "DEBUG: Fallback write result: $writeSuccess" -IsDebug
             }
             Write-Log -Message "*** USER CONTEXT TASK EXITING ***"
-            Write-Host "Press any key to continue..." -ForegroundColor Yellow
-            Write-Host "UserDetectionOnly: '$UserDetectionOnly'" -ForegroundColor Cyan
-            Write-Host "DetectionResultFile: '$DetectionResultFile'" -ForegroundColor Cyan
-            Write-Host "EffectiveResultFile: '$effectiveResultFile'" -ForegroundColor Cyan
-            Write-Host "Apps found: $($contextApps.Count)" -ForegroundColor Cyan
-            Write-Host "Marker file used: $isUserDetectionTask" -ForegroundColor Cyan
-            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
             
             # Clean up marker file
             if (Test-Path $markerFile) {
@@ -1225,11 +1227,6 @@ if ($OUTPUT) {
                 exit 1  # Trigger remediation
             } else {
                 Write-Log -Message "[$ScriptTag] No user context upgrades available"
-                Write-Host "DIRECT USER CONTEXT - Press any key to continue..." -ForegroundColor Red
-                Write-Host "UserDetectionOnly: $UserDetectionOnly" -ForegroundColor Cyan
-                Write-Host "DetectionResultFile: $DetectionResultFile" -ForegroundColor Cyan
-                Write-Host "This should NOT be the path for scheduled tasks!" -ForegroundColor Red
-                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
                 exit 0
             }
         }
