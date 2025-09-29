@@ -8,10 +8,13 @@
     The script is designed to work as a detection script in Microsoft Intune remediation policies.
 
 .PARAMETER UserDetectionOnly
-    When specified, the script runs in user detection mode (scheduled task execution)
+    When set to "true", the script runs in user detection mode (scheduled task execution)
 
 .PARAMETER DetectionResultFile
     Path to write user detection results (used by scheduled task)
+
+.PARAMETER Debug
+    When set to "true", enables debug logging output
 
 .NOTES
     Author: Henrik Skovgaard
@@ -64,7 +67,7 @@
     5.18 - CRITICAL FIX: Resolved logging contamination bug - restored Out-Null suppressions in Invoke-UserContextDetection to prevent debug messages from being returned as app names (function was working but returning log messages instead of real apps)
     5.19 - PERFORMANCE OPTIMIZATION: Detection script now exits immediately with code 1 when system apps are found, skipping expensive user context detection for faster execution
     5.20 - CRITICAL FIX: Fixed user context communication timeout - JSON result file now ALWAYS written regardless of app count, preventing 30-second timeout when no user apps found
-    5.21 - CRITICAL FIX: Fixed parameter detection logic - moved UserDetectionOnly check outside Test-RunningAsSystem condition so scheduled tasks can properly detect the parameter and execute the correct code path with JSON file creation
+    5.21 - CRITICAL FIX: Fixed parameter detection logic - moved UserDetectionOnly check outside Test-RunningAsSystem condition and changed switch parameters to int parameters for reliable scheduled task parameter passing, ensuring JSON file creation
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -72,9 +75,9 @@
 #>
 
 param(
-    [switch]$UserDetectionOnly,
+    [string]$UserDetectionOnly = "",
     [string]$DetectionResultFile,
-    [switch]$Debug
+    [string]$Debug = ""
 )
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -89,7 +92,7 @@ function Test-RunningAsSystem {
 function Write-Log($message, [switch]$IsDebug) #Log script messages to temp directory
 {
     # Skip debug messages if Debug parameter is not set
-    if ($IsDebug -and -not $Debug) {
+    if ($IsDebug -and $Debug -ne "true") {
         return
     }
     
@@ -402,7 +405,7 @@ function Invoke-UserContextDetection {
         Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force
         
         $scriptPath = $tempScriptPath
-        $arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserDetectionOnly:1 -DetectionResultFile `"$resultFile`""
+        $arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserDetectionOnly `"true`" -DetectionResultFile `"$resultFile`""
         
         Write-Log "Creating user detection task: $taskName" | Out-Null
         Write-Log "Script path: $scriptPath" | Out-Null
@@ -773,7 +776,7 @@ Write-Log -Message "DEBUG: Parameter detection - UserDetectionOnly: $UserDetecti
 Write-Log -Message "DEBUG: Command line arguments: $($MyInvocation.Line)"
 Write-Log -Message "DEBUG: All parameters: $($PSBoundParameters | ConvertTo-Json -Compress)"
 
-if ($UserDetectionOnly) {
+if ($UserDetectionOnly -eq "true") {
     # This is a scheduled user detection task - detect user apps only
     # CRITICAL FIX: Check UserDetectionOnly parameter first, before context checks
     Write-Log -Message "*** RUNNING IN USER CONTEXT (SCHEDULED TASK) ***"
