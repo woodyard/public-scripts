@@ -15,7 +15,7 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.19
+    Version: 5.20
     Tag: 5W
     
     Version History:
@@ -63,6 +63,7 @@
     5.17 - FUNCTION HANG DEBUG: Enhanced Invoke-UserContextDetection function debugging to identify where execution hangs by removing Out-Null suppressions
     5.18 - CRITICAL FIX: Resolved logging contamination bug - restored Out-Null suppressions in Invoke-UserContextDetection to prevent debug messages from being returned as app names (function was working but returning log messages instead of real apps)
     5.19 - PERFORMANCE OPTIMIZATION: Detection script now exits immediately with code 1 when system apps are found, skipping expensive user context detection for faster execution
+    5.20 - CRITICAL FIX: Fixed user context communication timeout - JSON result file now ALWAYS written regardless of app count, preventing 30-second timeout when no user apps found
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -1011,6 +1012,9 @@ if ($OUTPUT) {
                 Write-Log -Message "DEBUG: User context apps: $($contextApps -join ', ')" -IsDebug
             }
             Write-Log -Message "*** USER CONTEXT DETECTION COMPLETE - WRITING RESULTS ***"
+            
+            # CRITICAL FIX: Always write JSON result file, even when no apps found
+            # The system context waits for this file regardless of app count
             if ($DetectionResultFile) {
                 Write-Log -Message "DEBUG: *** USER CONTEXT FILE CREATION START ***" -IsDebug
                 Write-Log -Message "DEBUG: Target result file: $DetectionResultFile" -IsDebug
@@ -1110,6 +1114,13 @@ if ($OUTPUT) {
                     }
                 }
                 Write-Log -Message "DEBUG: *** USER CONTEXT FILE CREATION END ***" -IsDebug
+            } else {
+                Write-Log -Message "ERROR: No DetectionResultFile parameter provided to user context task"
+                # Still write a basic result file to prevent system context timeout
+                $fallbackFile = "C:\ProgramData\Temp\UserDetection_Fallback_$(Get-Random).json"
+                Write-Log -Message "Writing fallback result to: $fallbackFile"
+                $writeSuccess = Write-DetectionResults -Apps $contextApps -FilePath $fallbackFile
+                Write-Log -Message "DEBUG: Fallback write result: $writeSuccess" -IsDebug
             }
             Write-Log -Message "*** USER CONTEXT TASK EXITING ***"
             exit 0
