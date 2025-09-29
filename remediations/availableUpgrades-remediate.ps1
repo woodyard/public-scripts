@@ -3911,6 +3911,315 @@ function Remove-OldLogs {
     }
 }
 
+# ============================================================================
+# CENTRALIZED MARKER FILE MANAGEMENT SYSTEM
+# Provides robust marker file operations with comprehensive cleanup
+# ============================================================================
+
+# Global variable to track active marker files for cleanup
+$Global:ActiveMarkerFiles = @()
+
+function New-MarkerFile {
+    <#
+    .SYNOPSIS
+        Creates a marker file with centralized tracking and logging
+    .DESCRIPTION
+        Creates marker files used for inter-process communication while tracking
+        them globally for reliable cleanup. Handles path validation and error logging.
+    .PARAMETER FilePath
+        Full path where the marker file should be created
+    .PARAMETER Content
+        Content to write to the marker file
+    .PARAMETER Description
+        Description for logging purposes
+    .OUTPUTS
+        Boolean indicating success, and adds file to global tracking
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FilePath,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$Content,
+        
+        [string]$Description = "Marker file"
+    )
+    
+    try {
+        Write-Log -Message "Creating marker file: $FilePath ($Description)"
+        
+        # Ensure directory exists
+        $directory = Split-Path -Parent $FilePath
+        if ($directory -and -not (Test-Path $directory)) {
+            New-Item -Path $directory -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            Write-Log -Message "Created directory for marker file: $directory"
+        }
+        
+        # Create the marker file
+        $Content | Out-File -FilePath $FilePath -Encoding UTF8 -Force -ErrorAction Stop
+        
+        # Add to global tracking for cleanup
+        if ($Global:ActiveMarkerFiles -notcontains $FilePath) {
+            $Global:ActiveMarkerFiles += $FilePath
+            Write-Log -Message "Added marker file to cleanup tracking: $FilePath"
+        }
+        
+        # Verify creation
+        if (Test-Path $FilePath) {
+            $fileSize = (Get-Item $FilePath -ErrorAction SilentlyContinue).Length
+            Write-Log -Message "Successfully created marker file: $FilePath (Size: $fileSize bytes, Content: $($Content.Substring(0, [Math]::Min(50, $Content.Length)))...)"
+            return $true
+        } else {
+            Write-Log -Message "ERROR: Marker file was not created despite successful Out-File: $FilePath"
+            return $false
+        }
+        
+    } catch {
+        Write-Log -Message "ERROR: Failed to create marker file '$FilePath': $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Remove-MarkerFile {
+    <#
+    .SYNOPSIS
+        Removes a specific marker file with logging and error handling
+    .DESCRIPTION
+        Safely removes marker files with comprehensive error handling and logging.
+        Also removes the file from global tracking.
+    .PARAMETER FilePath
+        Full path of the marker file to remove
+    .PARAMETER Description
+        Description for logging purposes
+    .OUTPUTS
+        Boolean indicating success
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FilePath,
+        
+        [string]$Description = "Marker file"
+    )
+    
+    try {
+        Write-Log -Message "Removing marker file: $FilePath ($Description)"
+        
+        if (Test-Path $FilePath) {
+            # Get file info before deletion for logging
+            $fileInfo = Get-Item $FilePath -ErrorAction SilentlyContinue
+            $fileSize = if ($fileInfo) { $fileInfo.Length } else { "Unknown" }
+            $fileAge = if ($fileInfo) { [Math]::Round(((Get-Date) - $fileInfo.CreationTime).TotalMinutes, 1) } else { "Unknown" }
+            
+            # Remove the file
+            Remove-Item $FilePath -Force -ErrorAction Stop
+            Write-Log -Message "Successfully removed marker file: $FilePath (Size: $fileSize bytes, Age: $fileAge minutes)"
+            
+            # Remove from global tracking
+            $Global:ActiveMarkerFiles = $Global:ActiveMarkerFiles | Where-Object { $_ -ne $FilePath }
+            Write-Log -Message "Removed marker file from cleanup tracking: $FilePath"
+            
+            return $true
+        } else {
+            Write-Log -Message "Marker file not found (may already be cleaned up): $FilePath"
+            # Still remove from tracking in case it was tracked but already deleted externally
+            $Global:ActiveMarkerFiles = $Global:ActiveMarkerFiles | Where-Object { $_ -ne $FilePath }
+            return $true
+        }
+        
+    } catch {
+        Write-Log -Message "ERROR: Failed to remove marker file '$FilePath': $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Clear-OrphanedMarkerFiles {
+    <#
+    .SYNOPSIS
+        Finds and removes orphaned marker files from previous script executions
+    .DESCRIPTION
+        Scans multiple locations for old marker files and removes them to prevent
+        accumulation. Configurable age threshold and comprehensive location scanning.
+    .PARAMETER MaxAgeMinutes
+        Maximum age of marker files to keep (default: 60 minutes)
+    .PARAMETER ScanLocations
+        Array of paths to scan for marker files (auto-detected if not provided)
+    .OUTPUTS
+        Integer count of files cleaned up
+    #>
+    param(
+        [int]$MaxAgeMinutes = 60,
+        [string[]]$ScanLocations = @()
+    )
+    
+    try {
+        Write-Log -Message "Starting orphaned marker file cleanup (MaxAge: $MaxAgeMinutes minutes)"
+        $cleanupCount = 0
+        $cleanupStartTime = Get-Date
+        
+        # Default scan locations if not provided
+        if ($ScanLocations.Count -eq 0) {
+            $ScanLocations = @(
+                "C:\ProgramData\Temp",
+                $env:TEMP,
+                "$env:SystemRoot\Temp"
+            )
+            
+            # Add user-specific temp if we can detect the user
+            try {
+                $userInfo = Get-InteractiveUser -ErrorAction SilentlyContinue
+                if ($userInfo -and $userInfo.Username) {
+                    $userTemp = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
+                    if ((Test-Path $userTemp) -and ($ScanLocations -notcontains $userTemp)) {
+                        $ScanLocations += $userTemp
+                    }
+                }
+            } catch {
+                # Ignore errors in user detection during cleanup
+            }
+        }
+        
+        Write-Log -Message "Scanning $($ScanLocations.Count) locations for orphaned marker files"
+        
+        foreach ($location in $ScanLocations) {
+            if (-not (Test-Path $location)) {
+                Write-Log -Message "Scan location does not exist, skipping: $location"
+                continue
+            }
+            
+            Write-Log -Message "Scanning location: $location"
+            
+            try {
+                # Look for various marker file patterns
+                $patterns = @(
+                    "availableUpgrades-detect_*.ps1.userdetection",
+                    "availableUpgrades-remediate_*.ps1.userdetection",
+                    "*.ps1.userdetection"  # Catch-all for any script marker files
+                )
+                
+                $locationCleanupCount = 0
+                foreach ($pattern in $patterns) {
+                    $markerFiles = Get-ChildItem -Path $location -Filter $pattern -ErrorAction SilentlyContinue
+                    
+                    foreach ($markerFile in $markerFiles) {
+                        try {
+                            $fileAge = (Get-Date) - $markerFile.CreationTime
+                            $fileAgeMinutes = $fileAge.TotalMinutes
+                            
+                            Write-Log -Message "Found marker file: $($markerFile.Name) (Age: $([Math]::Round($fileAgeMinutes, 1)) minutes)"
+                            
+                            if ($fileAgeMinutes -gt $MaxAgeMinutes) {
+                                # Check if this file is in our active tracking (don't remove active files)
+                                $isActive = $Global:ActiveMarkerFiles -contains $markerFile.FullName
+                                
+                                if (-not $isActive) {
+                                    Write-Log -Message "Removing orphaned marker file: $($markerFile.FullName) (Age: $([Math]::Round($fileAgeMinutes, 1)) minutes)"
+                                    Remove-Item $markerFile.FullName -Force -ErrorAction Stop
+                                    $cleanupCount++
+                                    $locationCleanupCount++
+                                } else {
+                                    Write-Log -Message "Skipping active marker file: $($markerFile.FullName)"
+                                }
+                            } else {
+                                Write-Log -Message "Keeping recent marker file: $($markerFile.Name) (Age: $([Math]::Round($fileAgeMinutes, 1)) minutes)"
+                            }
+                            
+                        } catch {
+                            Write-Log -Message "ERROR: Failed to process marker file '$($markerFile.FullName)': $($_.Exception.Message)"
+                        }
+                    }
+                }
+                
+                if ($locationCleanupCount -gt 0) {
+                    Write-Log -Message "Cleaned up $locationCleanupCount marker files from: $location"
+                }
+                
+            } catch {
+                Write-Log -Message "ERROR: Failed to scan location '$location': $($_.Exception.Message)"
+            }
+        }
+        
+        $cleanupDuration = (Get-Date) - $cleanupStartTime
+        if ($cleanupCount -gt 0) {
+            Write-Log -Message "Orphaned marker file cleanup completed: $cleanupCount files removed in $([Math]::Round($cleanupDuration.TotalSeconds, 1)) seconds"
+        } else {
+            Write-Log -Message "No orphaned marker files found during cleanup scan"
+        }
+        
+        return $cleanupCount
+        
+    } catch {
+        Write-Log -Message "ERROR: Orphaned marker file cleanup failed: $($_.Exception.Message)"
+        return 0
+    }
+}
+
+function Add-MarkerFileCleanupTrap {
+    <#
+    .SYNOPSIS
+        Sets up trap handlers to ensure marker files are cleaned up on script exit
+    .DESCRIPTION
+        Registers cleanup handlers for various exit scenarios to prevent orphaned files
+    #>
+    
+    # PowerShell trap for unexpected errors
+    trap {
+        Write-Log -Message "Script error trap triggered - performing marker file cleanup"
+        Invoke-MarkerFileEmergencyCleanup -Reason "PowerShell trap"
+        continue
+    }
+    
+    # Register cleanup for normal exit
+    Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+        Write-Log -Message "PowerShell exiting - performing marker file cleanup"
+        Invoke-MarkerFileEmergencyCleanup -Reason "PowerShell exit"
+    } | Out-Null
+    
+    Write-Log -Message "Marker file cleanup traps registered"
+}
+
+function Invoke-MarkerFileEmergencyCleanup {
+    <#
+    .SYNOPSIS
+        Emergency cleanup function for marker files during unexpected exits
+    .DESCRIPTION
+        Called by trap handlers to ensure marker files are cleaned up even during errors
+    .PARAMETER Reason
+        Reason for the emergency cleanup (for logging)
+    #>
+    param(
+        [string]$Reason = "Emergency cleanup"
+    )
+    
+    try {
+        Write-Log -Message "EMERGENCY: Marker file cleanup triggered ($Reason)"
+        
+        if ($Global:ActiveMarkerFiles -and $Global:ActiveMarkerFiles.Count -gt 0) {
+            Write-Log -Message "EMERGENCY: Cleaning up $($Global:ActiveMarkerFiles.Count) tracked marker files"
+            
+            foreach ($markerFile in $Global:ActiveMarkerFiles) {
+                try {
+                    if (Test-Path $markerFile) {
+                        Remove-Item $markerFile -Force -ErrorAction SilentlyContinue
+                        Write-Log -Message "EMERGENCY: Removed marker file: $markerFile"
+                    }
+                } catch {
+                    # Silently continue during emergency cleanup
+                }
+            }
+            
+            # Clear the tracking array
+            $Global:ActiveMarkerFiles = @()
+        }
+        
+    } catch {
+        # Silently handle errors during emergency cleanup to avoid loops
+    }
+}
+
+# ============================================================================
+# END MARKER FILE MANAGEMENT SYSTEM
+# ============================================================================
+
 <# Script variables #>
 $ScriptTag = "8V" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
@@ -3948,6 +4257,22 @@ $userIsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole
 $useWhitelist = $true
 
 <# ----------------------------------------------- #>
+
+# Initialize marker file management system
+Write-Log -Message "Initializing marker file management system"
+Add-MarkerFileCleanupTrap
+$orphanedCount = Clear-OrphanedMarkerFiles -MaxAgeMinutes 60
+if ($orphanedCount -gt 0) {
+    Write-Log -Message "Cleaned up $orphanedCount orphaned marker files from previous executions"
+}
+
+# Initialize marker file management system
+Write-Log -Message "Initializing marker file management system"
+Add-MarkerFileCleanupTrap
+$orphanedCount = Clear-OrphanedMarkerFiles -MaxAgeMinutes 60
+if ($orphanedCount -gt 0) {
+    Write-Log -Message "Cleaned up $orphanedCount orphaned marker files from previous executions"
+}
 
 # Clean up old log files (older than 1 month)
 Remove-OldLogs -LogPath $LogPath
@@ -4066,11 +4391,15 @@ if (Test-Path $testTriggerFile) {
         Write-Log -Message "Note: Create file 'C:\Temp\wpf-test-trigger.txt' to trigger this test"
         
         Write-Log -Message "WPF test completed - exiting"
+        Write-Log -Message "Performing marker file cleanup before exit (WPF test complete)"
+        Invoke-MarkerFileEmergencyCleanup -Reason "WPF test completed"
         exit 0
         
     } catch {
         Write-Log -Message "❌ ERROR: WPF test failed with exception: $($_.Exception.Message)"
         Write-Log -Message "Full exception: $($_.Exception.ToString())"
+        Write-Log -Message "Performing marker file cleanup before exit (WPF test error)"
+        Invoke-MarkerFileEmergencyCleanup -Reason "WPF test error"
         exit 1
     }
 }
@@ -4078,6 +4407,8 @@ if (Test-Path $testTriggerFile) {
 <# Abort script in OOBE phase #>
 if (-not (OOBEComplete)) {
     "OOBE"
+    Write-Log -Message "OOBE not complete, performing marker file cleanup before exit"
+    Invoke-MarkerFileEmergencyCleanup -Reason "OOBE not complete"
     Exit 0
 }
 
@@ -4144,6 +4475,8 @@ try {
     Write-Log -Message "Successfully loaded whitelist configuration with $($whitelistConfig.Count) enabled apps"
 } catch {
     Write-Log -Message "Error parsing whitelist JSON: $($_.Exception.Message)"
+    Write-Log -Message "Performing marker file cleanup before exit due to whitelist error"
+    Invoke-MarkerFileEmergencyCleanup -Reason "Whitelist parsing error"
     exit 1
 }
 
@@ -4379,6 +4712,8 @@ if (Test-RunningAsSystem) {
                     Write-Log -Message "Failed to write error result file: $($_.Exception.Message)"
                 }
             }
+            Write-Log -Message "Performing marker file cleanup before exit (user context error)"
+            Invoke-MarkerFileEmergencyCleanup -Reason "User context execution error"
             exit 1
         }
         
@@ -4442,6 +4777,8 @@ if (Test-RunningAsSystem) {
                     }
                     $errorResult | ConvertTo-Json -Depth 3 -Compress | Out-File -FilePath $RemediationResultFile -Encoding UTF8 -Force
                 }
+                Write-Log -Message "Performing marker file cleanup before exit (user context timeout/error)"
+                Invoke-MarkerFileEmergencyCleanup -Reason "User context timeout or error"
                 exit 1
             }
         }
@@ -4463,6 +4800,8 @@ if (Test-RunningAsSystem) {
             } catch {
                 Write-Log -Message "Error executing winget in system context: $($_.Exception.Message)"
                 Write-Log -Message "Winget execution failed, exiting"
+                Write-Log -Message "Performing marker file cleanup before exit (winget execution failed)"
+                Invoke-MarkerFileEmergencyCleanup -Reason "Winget execution failed in system context"
                 exit 1
             }
             
@@ -4482,6 +4821,8 @@ if (Test-RunningAsSystem) {
             }
         } else {
             Write-Log -Message "Winget not detected in SYSTEM context"
+            Write-Log -Message "Performing marker file cleanup before exit (no winget in system context)"
+            Invoke-MarkerFileEmergencyCleanup -Reason "Winget not detected in SYSTEM context"
             exit 0
         }
     }
@@ -4495,6 +4836,8 @@ if (Test-RunningAsSystem) {
     } catch {
         Write-Log -Message "Error executing winget in user context: $($_.Exception.Message)"
         Write-Log -Message "Winget may not be available or properly configured"
+        Write-Log -Message "Performing marker file cleanup before exit (winget not available)"
+        Invoke-MarkerFileEmergencyCleanup -Reason "Winget not available or properly configured"
         exit 1
     }
     
@@ -4966,10 +5309,16 @@ if ($OUTPUT) {
             Write-Log -Message "*** USER CONTEXT TASK EXITING after $($totalUserContextTime.TotalSeconds) seconds ***"
         }
         
+        Write-Log -Message "Performing final marker file cleanup before script completion"
+        Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (remediation complete)"
         exit 0
     }
     Write-Log -Message "[$ScriptTag] No upgrades (0x0000002)"
+    Write-Log -Message "Performing final marker file cleanup before script exit (no upgrades)"
+    Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (no upgrades)"
     exit 0
 }
 Write-Log -Message "[$ScriptTag] Winget not detected"
+Write-Log -Message "Performing final marker file cleanup before script exit (winget not detected)"
+Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (winget not detected)"
 exit 0
