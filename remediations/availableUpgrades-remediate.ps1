@@ -54,8 +54,8 @@
     8.4 - CRITICAL FIX: Fixed Azure AD identity cache registry errors in Intune by replacing Start-Job background registry access with direct Test-Path and SilentlyContinue error handling, eliminating "remediation error" messages on AAD-joined machines
     
     Exit Codes:
-    0 - Script completed successfully
-    1 - OOBE not complete
+    0 - Script completed successfully or OOBE not complete
+    1 - Error occurred during remediation
 #>
 
 param(

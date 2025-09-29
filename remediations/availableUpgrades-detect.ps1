@@ -71,8 +71,8 @@
     5.22 - CRITICAL FIX: Implemented marker file workaround for scheduled task parameter passing issues - uses file-based communication to ensure user detection tasks always execute correct code path and create JSON result files
     
     Exit Codes:
-    0 - No upgrades available or script completed successfully
-    1 - Upgrades available (triggers remediation) or OOBE not complete
+    0 - No upgrades available, script completed successfully, or OOBE not complete
+    1 - Upgrades available (triggers remediation)
 #>
 
 param(
