@@ -15,8 +15,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.20
-    Tag: 5W
+    Version: 5.21
+    Tag: 5X
     
     Version History:
     1.0 - Initial version
@@ -64,6 +64,7 @@
     5.18 - CRITICAL FIX: Resolved logging contamination bug - restored Out-Null suppressions in Invoke-UserContextDetection to prevent debug messages from being returned as app names (function was working but returning log messages instead of real apps)
     5.19 - PERFORMANCE OPTIMIZATION: Detection script now exits immediately with code 1 when system apps are found, skipping expensive user context detection for faster execution
     5.20 - CRITICAL FIX: Fixed user context communication timeout - JSON result file now ALWAYS written regardless of app count, preventing 30-second timeout when no user apps found
+    5.21 - CRITICAL FIX: Fixed parameter detection logic - moved UserDetectionOnly check outside Test-RunningAsSystem condition so scheduled tasks can properly detect the parameter and execute the correct code path with JSON file creation
     
     Exit Codes:
     0 - No upgrades available or script completed successfully
@@ -656,7 +657,7 @@ function Invoke-UserContextDetection {
 }
 
 <# Script variables #>
-$ScriptTag = "5W" # Update this tag for each script version
+$ScriptTag = "5X" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -767,38 +768,70 @@ try {
     exit 1
 }
 
-# Main detection logic - dual-context architecture
-if (Test-RunningAsSystem) {
-    if ($UserDetectionOnly) {
-        # This is a scheduled user detection task - detect user apps only
-        Write-Log -Message "*** RUNNING IN USER CONTEXT (SCHEDULED TASK) ***"
-        Write-Log -Message "Current user: $env:USERNAME"
-        Write-Log -Message "User domain: $env:USERDOMAIN"
-        Write-Log -Message "Session ID: $((Get-Process -Id $PID).SessionId)"
-        Write-Log -Message "Process ID: $PID"
-        Write-Log -Message "Running user detection task"
-        
-        # Check if we're admin in user context - if not, use --scope user
-        $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-        $userIsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        
-        Write-Log -Message "User is admin: $userIsAdmin"
-        Write-Log -Message "Test-RunningAsSystem: $(Test-RunningAsSystem)"
-        
+# Main detection logic - dual-context architecture - FIXED PARAMETER DETECTION
+if ($UserDetectionOnly) {
+    # This is a scheduled user detection task - detect user apps only
+    # CRITICAL FIX: Check UserDetectionOnly parameter first, before context checks
+    Write-Log -Message "*** RUNNING IN USER CONTEXT (SCHEDULED TASK) ***"
+    Write-Log -Message "Current user: $env:USERNAME"
+    Write-Log -Message "User domain: $env:USERDOMAIN"
+    Write-Log -Message "Session ID: $((Get-Process -Id $PID).SessionId)"
+    Write-Log -Message "Process ID: $PID"
+    Write-Log -Message "Running user detection task"
+    Write-Log -Message "DetectionResultFile parameter: $DetectionResultFile"
+    
+    # Check if we're admin in user context - if not, use --scope user
+    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    $userIsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    
+    Write-Log -Message "User is admin: $userIsAdmin"
+    Write-Log -Message "Test-RunningAsSystem: $(Test-RunningAsSystem)"
+    
+    if ($userIsAdmin) {
+        Write-Log -Message "Admin user context - detecting all apps"
+        $OUTPUT = $(winget upgrade --accept-source-agreements)
+    } else {
+        Write-Log -Message "Non-admin user context - using --scope user for detection"
+        $OUTPUT = $(winget upgrade --accept-source-agreements --scope user)
+    }
+    
+    Write-Log -Message "DEBUG: User context winget output received, $($OUTPUT.Count) lines" -IsDebug
+    # Show first few lines of user context output for debugging
+    for ($debugLine = 0; $debugLine -lt [Math]::Min(5, $OUTPUT.Count); $debugLine++) {
+        Write-Log -Message "DEBUG: User Line $debugLine`: $($OUTPUT[$debugLine])" -IsDebug
+    }
+    
+    # Check if first output is valid (contains actual app data)
+    $hasValidOutput = $false
+    foreach ($line in $OUTPUT) {
+        if ($line -like "Name*Id*Version*Available*Source*") {
+            $hasValidOutput = $true
+            break
+        }
+    }
+    
+    # If first output is nonsense, run again
+    if (-not $hasValidOutput) {
+        Write-Log -Message "First winget run produced invalid output, retrying..."
         if ($userIsAdmin) {
-            Write-Log -Message "Admin user context - detecting all apps"
             $OUTPUT = $(winget upgrade --accept-source-agreements)
         } else {
-            Write-Log -Message "Non-admin user context - using --scope user for detection"
             $OUTPUT = $(winget upgrade --accept-source-agreements --scope user)
         }
+    }
+    
+    Write-Log -Message "User context detection - processing user-scoped apps only"
+    
+} elseif (Test-RunningAsSystem) {
+    # SYSTEM context main execution - detect system apps and schedule user detection
+    Write-Log -Message "SYSTEM context - detecting system apps and scheduling user detection"
+    
+    if ($WingetPath) {
+        Write-Log -Message "Using winget path: $WingetPath"
+        Set-Location $WingetPath
         
-        Write-Log -Message "DEBUG: User context winget output received, $($OUTPUT.Count) lines" -IsDebug
-        # Show first few lines of user context output for debugging
-        for ($debugLine = 0; $debugLine -lt [Math]::Min(5, $OUTPUT.Count); $debugLine++) {
-            Write-Log -Message "DEBUG: User Line $debugLine`: $($OUTPUT[$debugLine])" -IsDebug
-        }
-        
+        # System context winget - only sees system-wide apps
+        $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
         
         # Check if first output is valid (contains actual app data)
         $hasValidOutput = $false
@@ -812,47 +845,14 @@ if (Test-RunningAsSystem) {
         # If first output is nonsense, run again
         if (-not $hasValidOutput) {
             Write-Log -Message "First winget run produced invalid output, retrying..."
-            if ($userIsAdmin) {
-                $OUTPUT = $(winget upgrade --accept-source-agreements)
-            } else {
-                $OUTPUT = $(winget upgrade --accept-source-agreements --scope user)
-            }
-        }
-        
-        Write-Log -Message "User context detection - processing user-scoped apps only"
-        
-    } else {
-        # SYSTEM context main execution - detect system apps and schedule user detection
-        Write-Log -Message "SYSTEM context - detecting system apps and scheduling user detection"
-        
-        if ($WingetPath) {
-            Write-Log -Message "Using winget path: $WingetPath"
-            Set-Location $WingetPath
-            
-            # System context winget - only sees system-wide apps
             $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
-            
-            # Check if first output is valid (contains actual app data)
-            $hasValidOutput = $false
-            foreach ($line in $OUTPUT) {
-                if ($line -like "Name*Id*Version*Available*Source*") {
-                    $hasValidOutput = $true
-                    break
-                }
-            }
-            
-            # If first output is nonsense, run again
-            if (-not $hasValidOutput) {
-                Write-Log -Message "First winget run produced invalid output, retrying..."
-                $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
-            }
-        } else {
-            Write-Log -Message "Winget not detected in SYSTEM context"
-            exit 0
         }
+    } else {
+        Write-Log -Message "Winget not detected in SYSTEM context"
+        exit 0
     }
 } else {
-    # User context execution - detect user apps only
+    # Direct user context execution - detect user apps only
     Write-Log -Message "USER context - detecting user-scoped apps"
     
     # Check if we're admin in user context - if not, use --scope user
@@ -1004,7 +1004,7 @@ if ($OUTPUT) {
         Write-Log -Message "DEBUG: DetectionResultFile parameter: '$DetectionResultFile'" -IsDebug
         Write-Log -Message "DEBUG: Checking execution path conditions..." -IsDebug
         
-        if ((-not (Test-RunningAsSystem)) -and $UserDetectionOnly) {
+        if ($UserDetectionOnly) {
             Write-Log -Message "DEBUG: *** TAKING USER CONTEXT SCHEDULED TASK PATH ***" -IsDebug
             # User context scheduled task - write results and exit
             Write-Log -Message "User detection found $($contextApps.Count) apps"
@@ -1125,7 +1125,7 @@ if ($OUTPUT) {
             Write-Log -Message "*** USER CONTEXT TASK EXITING ***"
             exit 0
             
-        } elseif ((Test-RunningAsSystem) -and (-not $UserDetectionOnly)) {
+        } elseif (Test-RunningAsSystem) {
             Write-Log -Message "DEBUG: *** TAKING SYSTEM CONTEXT MAIN EXECUTION PATH ***" -IsDebug
             # SYSTEM context main execution - check system apps first, only run user detection if none found
             $systemApps = $contextApps
