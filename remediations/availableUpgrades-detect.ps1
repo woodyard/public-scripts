@@ -402,7 +402,7 @@ function Invoke-UserContextDetection {
         Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force
         
         $scriptPath = $tempScriptPath
-        $arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserDetectionOnly -DetectionResultFile `"$resultFile`""
+        $arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserDetectionOnly:1 -DetectionResultFile `"$resultFile`""
         
         Write-Log "Creating user detection task: $taskName" | Out-Null
         Write-Log "Script path: $scriptPath" | Out-Null
