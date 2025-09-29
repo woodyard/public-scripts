@@ -19,7 +19,7 @@
 .NOTES
     Author: Henrik Skovgaard
     Version: 5.21
-    Tag: 5Y
+    Tag: 5Z
     
     Version History:
     1.0 - Initial version
@@ -405,12 +405,18 @@ function Invoke-UserContextDetection {
         Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force
         
         $scriptPath = $tempScriptPath
-        $arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserDetectionOnly `"true`" -DetectionResultFile `"$resultFile`""
+        
+        # Create a marker file to indicate this is a user detection task (workaround for parameter passing issues)
+        $markerFile = "$tempScriptPath.userdetection"
+        "USERDETECTION:$resultFile" | Out-File -FilePath $markerFile -Encoding UTF8 -Force
+        
+        $arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
         
         Write-Log "Creating user detection task: $taskName" | Out-Null
         Write-Log "Script path: $scriptPath" | Out-Null
         Write-Log "Arguments: $arguments" | Out-Null
         Write-Log "Result file: $resultFile" | Out-Null
+        Write-Log "Marker file: $markerFile" | Out-Null
         
         # Verify script copy exists and is readable
         if (Test-Path $tempScriptPath) {
@@ -660,7 +666,7 @@ function Invoke-UserContextDetection {
 }
 
 <# Script variables #>
-$ScriptTag = "5Y" # Update this tag for each script version
+$ScriptTag = "5Z" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -772,11 +778,32 @@ try {
 }
 
 # Main detection logic - dual-context architecture - FIXED PARAMETER DETECTION
-Write-Log -Message "DEBUG: Parameter detection - UserDetectionOnly: $UserDetectionOnly, Type: $($UserDetectionOnly.GetType()), DetectionResultFile: '$DetectionResultFile'"
+Write-Log -Message "DEBUG: Parameter detection - UserDetectionOnly: '$UserDetectionOnly', Type: $($UserDetectionOnly.GetType()), DetectionResultFile: '$DetectionResultFile'"
 Write-Log -Message "DEBUG: Command line arguments: $($MyInvocation.Line)"
 Write-Log -Message "DEBUG: All parameters: $($PSBoundParameters | ConvertTo-Json -Compress)"
 
-if ($UserDetectionOnly -eq "true") {
+# Check for marker file (workaround for scheduled task parameter passing issues)
+$currentScriptPath = $MyInvocation.MyCommand.Path
+$markerFile = "$currentScriptPath.userdetection"
+$isUserDetectionTask = $false
+$markerResultFile = ""
+
+if (Test-Path $markerFile) {
+    try {
+        $markerContent = Get-Content $markerFile -Raw
+        if ($markerContent -match "USERDETECTION:(.+)") {
+            $isUserDetectionTask = $true
+            $markerResultFile = $matches[1].Trim()
+            Write-Log -Message "DEBUG: Found user detection marker file with result path: $markerResultFile" -IsDebug
+        }
+    } catch {
+        Write-Log -Message "DEBUG: Error reading marker file: $($_.Exception.Message)" -IsDebug
+    }
+}
+
+Write-Log -Message "DEBUG: Marker detection - isUserDetectionTask: $isUserDetectionTask, markerResultFile: '$markerResultFile'" -IsDebug
+
+if ($UserDetectionOnly -eq "true" -or $isUserDetectionTask) {
     # This is a scheduled user detection task - detect user apps only
     # CRITICAL FIX: Check UserDetectionOnly parameter first, before context checks
     Write-Log -Message "*** RUNNING IN USER CONTEXT (SCHEDULED TASK) ***"
@@ -785,7 +812,14 @@ if ($UserDetectionOnly -eq "true") {
     Write-Log -Message "Session ID: $((Get-Process -Id $PID).SessionId)"
     Write-Log -Message "Process ID: $PID"
     Write-Log -Message "Running user detection task"
+    # Use marker file result path if parameter is empty
+    $effectiveResultFile = if (-not [string]::IsNullOrEmpty($DetectionResultFile)) {
+        $DetectionResultFile
+    } else {
+        $markerResultFile
+    }
     Write-Log -Message "DetectionResultFile parameter: $DetectionResultFile"
+    Write-Log -Message "Effective result file (from marker): $effectiveResultFile"
     
     # Check if we're admin in user context - if not, use --scope user
     $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -1011,7 +1045,7 @@ if ($OUTPUT) {
         Write-Log -Message "DEBUG: DetectionResultFile parameter: '$DetectionResultFile'" -IsDebug
         Write-Log -Message "DEBUG: Checking execution path conditions..." -IsDebug
         
-        if ($UserDetectionOnly) {
+        if ($UserDetectionOnly -eq "true" -or $isUserDetectionTask) {
             Write-Log -Message "DEBUG: *** TAKING USER CONTEXT SCHEDULED TASK PATH ***" -IsDebug
             # User context scheduled task - write results and exit
             Write-Log -Message "User detection found $($contextApps.Count) apps"
@@ -1022,16 +1056,16 @@ if ($OUTPUT) {
             
             # CRITICAL FIX: Always write JSON result file, even when no apps found
             # The system context waits for this file regardless of app count
-            if ($DetectionResultFile) {
+            if ($effectiveResultFile) {
                 Write-Log -Message "DEBUG: *** USER CONTEXT FILE CREATION START ***" -IsDebug
-                Write-Log -Message "DEBUG: Target result file: $DetectionResultFile" -IsDebug
-                $targetDir = Split-Path $DetectionResultFile
+                Write-Log -Message "DEBUG: Target result file: $effectiveResultFile" -IsDebug
+                $targetDir = Split-Path $effectiveResultFile
                 Write-Log -Message "DEBUG: File directory: $targetDir" -IsDebug
-                Write-Log -Message "DEBUG: File name: $(Split-Path $DetectionResultFile -Leaf)" -IsDebug
+                Write-Log -Message "DEBUG: File name: $(Split-Path $effectiveResultFile -Leaf)" -IsDebug
                 Write-Log -Message "DEBUG: Directory exists: $(Test-Path $targetDir)" -IsDebug
                 Write-Log -Message "DEBUG: About to write $($contextApps.Count) apps to result file" -IsDebug
                 Write-Log -Message "DEBUG: Apps to write: $($contextApps -join ', ')" -IsDebug
-                Write-Log -Message "Writing results to file: $DetectionResultFile"
+                Write-Log -Message "Writing results to file: $effectiveResultFile"
                 
                 # COMPREHENSIVE PERMISSIONS TESTING FROM SCHEDULED TASK CONTEXT
                 Write-Log -Message "DEBUG: *** TESTING DIRECTORY PERMISSIONS ***" -IsDebug
@@ -1080,27 +1114,27 @@ if ($OUTPUT) {
                 }
                 
                 # Check if file already exists (shouldn't happen)
-                if (Test-Path $DetectionResultFile) {
+                if (Test-Path $effectiveResultFile) {
                     Write-Log -Message "WARNING: Result file already exists before writing!"
-                    $existingSize = (Get-Item $DetectionResultFile).Length
+                    $existingSize = (Get-Item $effectiveResultFile).Length
                     Write-Log -Message "DEBUG: Existing file size: $existingSize bytes" -IsDebug
                 }
                 
-                $writeSuccess = Write-DetectionResults -Apps $contextApps -FilePath $DetectionResultFile
+                $writeSuccess = Write-DetectionResults -Apps $contextApps -FilePath $effectiveResultFile
                 Write-Log -Message "DEBUG: Write-DetectionResults returned: $writeSuccess" -IsDebug
                 
                 # Verify file was created and contains expected data
-                if (Test-Path $DetectionResultFile) {
-                    $fileSize = (Get-Item $DetectionResultFile).Length
-                    $fileCreationTime = (Get-Item $DetectionResultFile).CreationTime
-                    $fileModifiedTime = (Get-Item $DetectionResultFile).LastWriteTime
+                if (Test-Path $effectiveResultFile) {
+                    $fileSize = (Get-Item $effectiveResultFile).Length
+                    $fileCreationTime = (Get-Item $effectiveResultFile).CreationTime
+                    $fileModifiedTime = (Get-Item $effectiveResultFile).LastWriteTime
                     Write-Log -Message "DEBUG: *** FILE CREATED SUCCESSFULLY ***" -IsDebug
-                    Write-Log -Message "DEBUG: Result file path: $DetectionResultFile" -IsDebug
+                    Write-Log -Message "DEBUG: Result file path: $effectiveResultFile" -IsDebug
                     Write-Log -Message "DEBUG: File size: $fileSize bytes" -IsDebug
                     Write-Log -Message "DEBUG: Created: $fileCreationTime" -IsDebug
                     Write-Log -Message "DEBUG: Modified: $fileModifiedTime" -IsDebug
                     try {
-                        $verifyContent = Get-Content $DetectionResultFile -Raw
+                        $verifyContent = Get-Content $effectiveResultFile -Raw
                         $verifyJson = $verifyContent | ConvertFrom-Json
                         Write-Log -Message "DEBUG: File verification successful - Apps count: $($verifyJson.Apps.Count)" -IsDebug
                     } catch {
@@ -1131,10 +1165,18 @@ if ($OUTPUT) {
             }
             Write-Log -Message "*** USER CONTEXT TASK EXITING ***"
             Write-Host "Press any key to continue..." -ForegroundColor Yellow
-            Write-Host "UserDetectionOnly: $UserDetectionOnly" -ForegroundColor Cyan
-            Write-Host "DetectionResultFile: $DetectionResultFile" -ForegroundColor Cyan
+            Write-Host "UserDetectionOnly: '$UserDetectionOnly'" -ForegroundColor Cyan
+            Write-Host "DetectionResultFile: '$DetectionResultFile'" -ForegroundColor Cyan
+            Write-Host "EffectiveResultFile: '$effectiveResultFile'" -ForegroundColor Cyan
             Write-Host "Apps found: $($contextApps.Count)" -ForegroundColor Cyan
+            Write-Host "Marker file used: $isUserDetectionTask" -ForegroundColor Cyan
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            
+            # Clean up marker file
+            if (Test-Path $markerFile) {
+                Remove-Item $markerFile -Force -ErrorAction SilentlyContinue
+                Write-Log -Message "Cleaned up marker file: $markerFile" -IsDebug
+            }
             exit 0
             
         } elseif (Test-RunningAsSystem) {
