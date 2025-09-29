@@ -1127,6 +1127,11 @@ if ($OUTPUT) {
                 Write-Log -Message "DEBUG: Fallback write result: $writeSuccess" -IsDebug
             }
             Write-Log -Message "*** USER CONTEXT TASK EXITING ***"
+            Write-Host "Press any key to continue..." -ForegroundColor Yellow
+            Write-Host "UserDetectionOnly: $UserDetectionOnly" -ForegroundColor Cyan
+            Write-Host "DetectionResultFile: $DetectionResultFile" -ForegroundColor Cyan
+            Write-Host "Apps found: $($contextApps.Count)" -ForegroundColor Cyan
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
             exit 0
             
         } elseif (Test-RunningAsSystem) {
@@ -1175,6 +1180,11 @@ if ($OUTPUT) {
                 exit 1  # Trigger remediation
             } else {
                 Write-Log -Message "[$ScriptTag] No user context upgrades available"
+                Write-Host "DIRECT USER CONTEXT - Press any key to continue..." -ForegroundColor Red
+                Write-Host "UserDetectionOnly: $UserDetectionOnly" -ForegroundColor Cyan
+                Write-Host "DetectionResultFile: $DetectionResultFile" -ForegroundColor Cyan
+                Write-Host "This should NOT be the path for scheduled tasks!" -ForegroundColor Red
+                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
                 exit 0
             }
         }
