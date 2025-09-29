@@ -12,8 +12,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 8.4
- Tag: 8V
+ Version: 8.5
+ Tag: 8W
     
     Version History:
     1.0 - Initial version
@@ -52,6 +52,7 @@
     8.2 - CRITICAL FIX: Fixed empty script path issue in scheduled tasks by capturing $MyInvocation.MyCommand.Path at global scope with multiple fallback methods; Fixed PowerShell syntax errors with Test-RunningAsSystem function calls
     8.3 - SECURITY IMPROVEMENT: Scripts now copy themselves to user-accessible temp locations before scheduling tasks, improving security and access control with automatic cleanup
     8.4 - CRITICAL FIX: Fixed Azure AD identity cache registry errors in Intune by replacing Start-Job background registry access with direct Test-Path and SilentlyContinue error handling, eliminating "remediation error" messages on AAD-joined machines
+    8.5 - ENHANCEMENT: Implemented comprehensive marker file management system with centralized cleanup functions, orphaned file detection, and emergency cleanup handlers to prevent accumulation of .userdetection files; Added hidden console window execution method using cmd.exe with /min flag to eliminate visible console windows during scheduled task execution
     
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -399,11 +400,11 @@ function New-UserPromptTask {
         Write-Log "Forcing PowerShell 5.1 for toast notifications (PowerShell 7 has Windows Runtime limitations in scheduled task context)" | Out-Null
         $powershellExe = "powershell.exe"
         
-        # Prepare script arguments with enhanced debugging, position control, and timeout
-        $arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`" -Position `"BottomRight`" -TimeoutSeconds $TimeoutSeconds -DebugMode"
+        # Use hidden console window execution method to prevent visible windows
+        $hiddenArguments = "/c start /min `"`" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`" -Position `"BottomRight`" -TimeoutSeconds $TimeoutSeconds -DebugMode"
         
-        # Create task action - Force PowerShell 5.1 for Windows Runtime compatibility
-        $action = New-ScheduledTaskAction -Execute $powershellExe -Argument $arguments
+        # Create task action using hidden console window method
+        $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $hiddenArguments
         
         # Create task principal (run as interactive user) - Azure AD aware
         $principal = $null
@@ -505,9 +506,9 @@ function New-UserPromptTask {
                     # Create a SYSTEM principal that will launch the script and let it handle user context
                     $fallbackPrincipal = New-ScheduledTaskPrincipal -UserID "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
                     
-                    # Modify arguments to include user information for the script to handle internally
-                    $fallbackArguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`""
-                    $fallbackAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $fallbackArguments
+                    # Use hidden console window execution method for Azure AD fallback
+                    $fallbackHiddenArguments = "/c start /min `"`" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`""
+                    $fallbackAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $fallbackHiddenArguments
                     
                     $fallbackTask = New-ScheduledTask -Action $fallbackAction -Principal $fallbackPrincipal -Settings $settings -Description "Interactive user prompt for system operations (Azure AD SYSTEM fallback)"
                     
@@ -2200,10 +2201,11 @@ $countdownTimer.Stop()
         # Create task arguments with encoded parameters
         $encodedQuestion = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Question))
         $encodedTitle = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Title))
-        $arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$mandatoryScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -TimeoutSeconds $TimeoutSeconds"
+        # Use hidden console window execution method
+        $hiddenArguments = "/c start /min `"`" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$mandatoryScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -TimeoutSeconds $TimeoutSeconds"
         
-        # Create and register task
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
+        # Create and register task using hidden console method
+        $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $hiddenArguments
         
         # Create task principal
         $principal = $null
@@ -3261,10 +3263,11 @@ $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding
         # Create task arguments with timeout parameter - ensure proper encoding for text parameters
         $encodedQuestion = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Question))
         $encodedTitle = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Title))
-        $arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -DeferralOptionsJson `"$deferralOptionsJson`" -HasBlockingProcess $$HasBlockingProcess -TimeoutSeconds $TimeoutSeconds"
+        # Use hidden console window execution method
+        $hiddenArguments = "/c start /min `"`" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -DeferralOptionsJson `"$deferralOptionsJson`" -HasBlockingProcess $$HasBlockingProcess -TimeoutSeconds $TimeoutSeconds"
         
-        # Create task using existing approach but with custom arguments
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
+        # Create task using hidden console method
+        $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $hiddenArguments
         
         # Create task principal using existing user info
         $principal = $null
@@ -3469,11 +3472,12 @@ function Schedule-UserContextRemediation {
         Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force
         
         $scriptPath = $tempScriptPath
-        $arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`""
+        # Use hidden console window execution method to prevent visible windows
+        $hiddenArguments = "/c start /min `"`" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`""
         
         Write-Log "Creating user remediation task: $taskName" | Out-Null
         Write-Log "Script path: $scriptPath" | Out-Null
-        Write-Log "Arguments: $arguments" | Out-Null
+        Write-Log "Hidden execution arguments: $hiddenArguments" | Out-Null
         Write-Log "Result file: $resultFile" | Out-Null
         
         # Verify script copy exists and is readable
@@ -3486,11 +3490,11 @@ function Schedule-UserContextRemediation {
         }
         
         try {
-            Write-Log "Creating scheduled task action..." | Out-Null
+            Write-Log "Creating scheduled task action with hidden console method..." | Out-Null
             $taskCreationStart = Get-Date
             
-            # Create task action
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
+            # Create task action using hidden console window method
+            $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $hiddenArguments
             Write-Log "Task action created successfully" | Out-Null
             
             # Create task principal (run as interactive user) - SAME AS DETECTION
@@ -4221,7 +4225,7 @@ function Invoke-MarkerFileEmergencyCleanup {
 # ============================================================================
 
 <# Script variables #>
-$ScriptTag = "8V" # Update this tag for each script version
+$ScriptTag = "8W" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"

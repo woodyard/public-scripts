@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.22
-    Tag: 5Z
+    Version: 5.23
+    Tag: 5A
     
     Version History:
     1.0 - Initial version
@@ -69,6 +69,7 @@
     5.20 - CRITICAL FIX: Fixed user context communication timeout - JSON result file now ALWAYS written regardless of app count, preventing 30-second timeout when no user apps found
     5.21 - CRITICAL FIX: Fixed parameter detection logic - moved UserDetectionOnly check outside Test-RunningAsSystem condition and changed switch parameters to int parameters for reliable scheduled task parameter passing, ensuring JSON file creation
     5.22 - CRITICAL FIX: Implemented marker file workaround for scheduled task parameter passing issues - uses file-based communication to ensure user detection tasks always execute correct code path and create JSON result files
+    5.23 - ENHANCEMENT: Implemented comprehensive marker file management system with centralized cleanup functions, orphaned file detection, and emergency cleanup handlers to prevent accumulation of .userdetection files; Added hidden console window execution method using cmd.exe with /min flag to eliminate visible console windows during scheduled task execution
     
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -727,11 +728,12 @@ function Invoke-UserContextDetection {
             Write-Log -Message "ERROR: Failed to create user detection marker file - user detection may not work properly"
         }
         
-        $arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
+        # Use hidden console window execution method to prevent visible windows
+        $hiddenArguments = "/c start /min `"`" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
         
         Write-Log "Creating user detection task: $taskName" | Out-Null
         Write-Log "Script path: $scriptPath" | Out-Null
-        Write-Log "Arguments: $arguments" | Out-Null
+        Write-Log "Hidden execution arguments: $hiddenArguments" | Out-Null
         Write-Log "Result file: $resultFile" | Out-Null
         Write-Log "Marker file: $markerFile" | Out-Null
         
@@ -756,8 +758,8 @@ function Invoke-UserContextDetection {
         }
         
         try {
-            # Create task action
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
+            # Create task action using hidden console window method
+            $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $hiddenArguments
             
             # Create task principal (run as interactive user)
             $principal = $null
@@ -990,7 +992,7 @@ function Invoke-UserContextDetection {
 }
 
 <# Script variables #>
-$ScriptTag = "5Z" # Update this tag for each script version
+$ScriptTag = "5A" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
