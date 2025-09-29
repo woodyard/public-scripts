@@ -769,6 +769,10 @@ try {
 }
 
 # Main detection logic - dual-context architecture - FIXED PARAMETER DETECTION
+Write-Log -Message "DEBUG: Parameter detection - UserDetectionOnly: $UserDetectionOnly, Type: $($UserDetectionOnly.GetType()), DetectionResultFile: '$DetectionResultFile'"
+Write-Log -Message "DEBUG: Command line arguments: $($MyInvocation.Line)"
+Write-Log -Message "DEBUG: All parameters: $($PSBoundParameters | ConvertTo-Json -Compress)"
+
 if ($UserDetectionOnly) {
     # This is a scheduled user detection task - detect user apps only
     # CRITICAL FIX: Check UserDetectionOnly parameter first, before context checks
