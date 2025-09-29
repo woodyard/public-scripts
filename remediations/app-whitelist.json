@@ -473,5 +473,21 @@
     {
         "AppID": "Microsoft.DotNet.DesktopRuntime.8",
         "FriendlyName": ".NET 8 Desktop Runtime"
+    },
+    {
+        "AppID": "Anthropic.Claude",
+        "FriendlyName": "Claude",
+        "BlockingProcess": "Claude",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 60,
+        "DeferralEnabled": true,
+        "MaxDeferralDays": 5,
+        "DeferralOptions": [
+            {"Days": 1, "Label": "1 day"},
+            {"Days": 3, "Label": "3 days"},
+            {"Days": 5, "Label": "5 days"}
+        ],
+        "ForcedUpgradeMessage": "Claude updates can no longer be deferred."
     }
 ]
