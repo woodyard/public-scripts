@@ -16,7 +16,7 @@
 .NOTES
     Author: Henrik Skovgaard
     Version: 5.21
-    Tag: 5X
+    Tag: 5Y
     
     Version History:
     1.0 - Initial version
@@ -657,7 +657,7 @@ function Invoke-UserContextDetection {
 }
 
 <# Script variables #>
-$ScriptTag = "5X" # Update this tag for each script version
+$ScriptTag = "5Y" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
