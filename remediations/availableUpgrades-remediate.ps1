@@ -3498,7 +3498,57 @@ function Schedule-UserContextRemediation {
         $tempScriptPath = Join-Path $sharedTempPath $tempScriptName
         
         Write-Log "Copying script to user-accessible location: $tempScriptPath" | Out-Null
-        Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force
+        
+        # Verify source script exists and get its size first
+        if (-not (Test-Path $Global:CurrentScriptPath)) {
+            Write-Log "ERROR: Source script does not exist: $Global:CurrentScriptPath" | Out-Null
+            return $false
+        }
+        
+        $sourceSize = (Get-Item $Global:CurrentScriptPath).Length
+        Write-Log "Source script size: $sourceSize bytes" | Out-Null
+        
+        # Copy with enhanced error handling and verification
+        try {
+            Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force -ErrorAction Stop
+            Write-Log "Copy-Item completed successfully" | Out-Null
+        } catch {
+            Write-Log "ERROR: Copy-Item failed: $($_.Exception.Message)" | Out-Null
+            return $false
+        }
+        
+        # Verify script copy with size validation
+        if (Test-Path $tempScriptPath) {
+            $scriptSize = (Get-Item $tempScriptPath).Length
+            Write-Log "Temp script exists, size: $scriptSize bytes (source: $sourceSize bytes)" | Out-Null
+            
+            # Validate copy integrity
+            if ($scriptSize -ne $sourceSize) {
+                Write-Log "ERROR: Script copy size mismatch! Copied: $scriptSize bytes, Expected: $sourceSize bytes" | Out-Null
+                Write-Log "Attempting second copy operation..." | Out-Null
+                
+                # Remove corrupted copy and try again
+                Remove-Item $tempScriptPath -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Milliseconds 500
+                
+                try {
+                    Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force -ErrorAction Stop
+                    $retrySize = (Get-Item $tempScriptPath).Length
+                    Write-Log "Retry copy completed, size: $retrySize bytes" | Out-Null
+                    
+                    if ($retrySize -ne $sourceSize) {
+                        Write-Log "ERROR: Retry copy also failed - size still incorrect" | Out-Null
+                        return $false
+                    }
+                } catch {
+                    Write-Log "ERROR: Retry copy failed: $($_.Exception.Message)" | Out-Null
+                    return $false
+                }
+            }
+        } else {
+            Write-Log "ERROR: Temp script copy does not exist: $tempScriptPath" | Out-Null
+            return $false
+        }
         
         $scriptPath = $tempScriptPath
         # Use hidden console window execution method to prevent visible windows
@@ -3508,15 +3558,6 @@ function Schedule-UserContextRemediation {
         Write-Log "Script path: $scriptPath" | Out-Null
         Write-Log "Hidden execution arguments: $hiddenArguments" | Out-Null
         Write-Log "Result file: $resultFile" | Out-Null
-        
-        # Verify script copy exists and is readable
-        if (Test-Path $tempScriptPath) {
-            $scriptSize = (Get-Item $tempScriptPath).Length
-            Write-Log "Temp script exists, size: $scriptSize bytes" | Out-Null
-        } else {
-            Write-Log "ERROR: Temp script copy does not exist: $tempScriptPath" | Out-Null
-            return $false
-        }
         
         try {
             Write-Log "Creating scheduled task action with hidden console method..." | Out-Null
@@ -3647,28 +3688,92 @@ function Schedule-UserContextRemediation {
                     }
                 }
                 
-                # Check heartbeat file to see if user context is still active
+                # Enhanced heartbeat checking with multiple indicators
                 $isUserContextActive = $false
                 $heartbeatAge = 999
+                $heartbeatSources = @()
+                
+                # Check primary heartbeat file
                 if (Test-Path $heartbeatFile) {
                     try {
                         $heartbeatTime = (Get-Item $heartbeatFile).LastWriteTime
                         $heartbeatAge = ($currentTime - $heartbeatTime).TotalSeconds
                         $isUserContextActive = ($heartbeatAge -lt $heartbeatTimeout)
+                        $heartbeatSources += "primary"
                         
                         if (-not $isUserContextActive) {
-                            Write-Log "WARNING: Heartbeat file is $([int]$heartbeatAge) seconds old (timeout: $heartbeatTimeout)" | Out-Null
+                            Write-Log "WARNING: Primary heartbeat file is $([int]$heartbeatAge) seconds old (timeout: $heartbeatTimeout)" | Out-Null
                         }
                     } catch {
-                        Write-Log "Error reading heartbeat file: $($_.Exception.Message)" | Out-Null
+                        Write-Log "Error reading primary heartbeat file: $($_.Exception.Message)" | Out-Null
                     }
-                } else {
-                    # If no heartbeat file yet, check if task just started (give it some time)
-                    if ($elapsedTotal -gt 30) {  # Give 30 seconds for initial heartbeat
-                        Write-Log "No heartbeat file found after $([int]$elapsedTotal) seconds" | Out-Null
-                    } else {
-                        $isUserContextActive = $true  # Still within startup grace period
+                }
+                
+                # Check emergency heartbeat file
+                if (-not $isUserContextActive -and (Test-Path "$heartbeatFile.emergency")) {
+                    try {
+                        $emergencyTime = (Get-Item "$heartbeatFile.emergency").LastWriteTime
+                        $emergencyAge = ($currentTime - $emergencyTime).TotalSeconds
+                        if ($emergencyAge -lt $heartbeatTimeout) {
+                            $isUserContextActive = $true
+                            $heartbeatAge = $emergencyAge
+                            $heartbeatSources += "emergency"
+                            Write-Log "Using emergency heartbeat (age: $([int]$emergencyAge)s)" | Out-Null
+                        }
+                    } catch {
+                        Write-Log "Error reading emergency heartbeat file: $($_.Exception.Message)" | Out-Null
                     }
+                }
+                
+                # Check timestamp file as backup
+                if (-not $isUserContextActive -and (Test-Path "$heartbeatFile.timestamp")) {
+                    try {
+                        $timestampTime = (Get-Item "$heartbeatFile.timestamp").LastWriteTime
+                        $timestampAge = ($currentTime - $timestampTime).TotalSeconds
+                        if ($timestampAge -lt $heartbeatTimeout) {
+                            $isUserContextActive = $true
+                            $heartbeatAge = $timestampAge
+                            $heartbeatSources += "timestamp"
+                            Write-Log "Using timestamp heartbeat (age: $([int]$timestampAge)s)" | Out-Null
+                        }
+                    } catch {
+                        Write-Log "Error reading timestamp heartbeat file: $($_.Exception.Message)" | Out-Null
+                    }
+                }
+                
+                # Check for user context debug files as indicator of activity
+                if (-not $isUserContextActive) {
+                    try {
+                        $debugFiles = @(
+                            "C:\ProgramData\Temp\UserContext_Debug.log",
+                            "$env:TEMP\UserContext_Debug_Fallback.log"
+                        )
+                        
+                        foreach ($debugFile in $debugFiles) {
+                            if (Test-Path $debugFile) {
+                                $debugTime = (Get-Item $debugFile).LastWriteTime
+                                $debugAge = ($currentTime - $debugTime).TotalSeconds
+                                if ($debugAge -lt $heartbeatTimeout) {
+                                    $isUserContextActive = $true
+                                    $heartbeatAge = $debugAge
+                                    $heartbeatSources += "debug"
+                                    Write-Log "Using debug file as heartbeat indicator (age: $([int]$debugAge)s)" | Out-Null
+                                    break
+                                }
+                            }
+                        }
+                    } catch {
+                        # Ignore debug file errors
+                    }
+                }
+                
+                # Log heartbeat status
+                if ($elapsedTotal -gt 30 -and -not $isUserContextActive) {
+                    Write-Log "No heartbeat indicators found after $([int]$elapsedTotal) seconds (checked: $($heartbeatSources -join ', '))" | Out-Null
+                } elseif ($isUserContextActive -and $heartbeatSources.Count -gt 0) {
+                    Write-Log "Heartbeat active via: $($heartbeatSources -join ', ') (age: $([int]$heartbeatAge)s)" | Out-Null
+                } elseif ($elapsedTotal -le 30) {
+                    $isUserContextActive = $true  # Still within startup grace period
                 }
                 
                 # Check status file for progress updates
@@ -4566,11 +4671,12 @@ if (Test-RunningAsSystem) {
             )
             
             try {
-                # Ensure directory exists before writing
-                $heartbeatDir = Split-Path $heartbeatFile -Parent
-                if (-not (Test-Path $heartbeatDir)) {
-                    New-Item -Path $heartbeatDir -ItemType Directory -Force | Out-Null
-                }
+                # Enhanced heartbeat creation with multiple fallback paths
+                $heartbeatPaths = @(
+                    $heartbeatFile,
+                    "$env:TEMP\UserRemediationHeartbeat_$(Split-Path (Split-Path $heartbeatFile -Leaf) -LeafBase).json",
+                    "C:\ProgramData\Temp\UserRemediationHeartbeat_$(Split-Path (Split-Path $heartbeatFile -Leaf) -LeafBase).json"
+                )
                 
                 $heartbeatData = @{
                     Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
@@ -4578,6 +4684,8 @@ if (Test-RunningAsSystem) {
                     ProcessId = $PID
                     Username = $env:USERNAME
                     SessionId = (Get-Process -Id $PID).SessionId
+                    ScriptPath = $MyInvocation.MyCommand.Path
+                    WorkingDirectory = (Get-Location).Path
                 }
                 
                 # Add any additional context data
@@ -4586,26 +4694,64 @@ if (Test-RunningAsSystem) {
                 }
                 
                 $heartbeatJson = $heartbeatData | ConvertTo-Json -Compress
-                $heartbeatJson | Out-File -FilePath $heartbeatFile -Force -Encoding UTF8
+                $success = $false
                 
-                # Also create a simple timestamp file for basic monitoring
-                (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff") | Out-File -FilePath "$heartbeatFile.timestamp" -Force
-                
-                return $true
-            } catch {
-                # Log heartbeat failures to a separate error file instead of silencing them
-                $errorMsg = "Heartbeat failed at stage '$Stage': $($_.Exception.Message)"
-                try {
-                    $errorMsg | Out-File -FilePath "$heartbeatFile.error" -Append -Force -ErrorAction Stop
-                } catch {
-                    # Final fallback - try Windows Event Log
+                # Try each heartbeat path until one succeeds
+                foreach ($hbPath in $heartbeatPaths) {
                     try {
-                        Write-EventLog -LogName Application -Source "WingetRemediation" -EntryType Error -EventId 1002 -Message $errorMsg -ErrorAction SilentlyContinue
+                        # Ensure directory exists
+                        $hbDir = Split-Path $hbPath -Parent
+                        if (-not (Test-Path $hbDir)) {
+                            New-Item -Path $hbDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+                        }
+                        
+                        # Write heartbeat file
+                        $heartbeatJson | Out-File -FilePath $hbPath -Force -Encoding UTF8 -ErrorAction Stop
+                        
+                        # Create simple timestamp file for basic monitoring
+                        (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff") | Out-File -FilePath "$hbPath.timestamp" -Force -ErrorAction SilentlyContinue
+                        
+                        # Log successful creation only for primary path
+                        if ($hbPath -eq $heartbeatFile) {
+                            Write-Log -Message "Heartbeat created successfully at stage '$Stage'" | Out-Null
+                        }
+                        
+                        $success = $true
+                        break
+                        
                     } catch {
-                        # Complete failure - at least try user temp
-                        $errorMsg | Out-File -FilePath "$env:TEMP\UserContext_Heartbeat_Error.log" -Append -Force -ErrorAction SilentlyContinue
+                        # Try next path
+                        continue
                     }
                 }
+                
+                if (-not $success) {
+                    throw "All heartbeat paths failed"
+                }
+                
+                return $true
+                
+            } catch {
+                # Enhanced error logging with immediate file creation
+                $errorMsg = "Heartbeat failed at stage '$Stage': $($_.Exception.Message)"
+                Write-Log -Message "WARNING: $errorMsg" | Out-Null
+                
+                # Try multiple error logging approaches
+                $errorPaths = @(
+                    "$heartbeatFile.error",
+                    "$env:TEMP\UserContext_Heartbeat_Error_$PID.log",
+                    "C:\ProgramData\Temp\UserContext_Heartbeat_Error_$PID.log"
+                )
+                
+                foreach ($errorPath in $errorPaths) {
+                    try {
+                        $errorMsg | Out-File -FilePath $errorPath -Append -Force -ErrorAction Stop
+                        break
+                    } catch {
+                        continue
+                    }
+                }
+                
                 return $false
             }
         }
@@ -4628,13 +4774,30 @@ if (Test-RunningAsSystem) {
             }
         }
         
-        # Initial heartbeat and status
-        Update-Heartbeat -Stage "ScriptStart" -AdditionalData @{
+        # Enhanced initial heartbeat with immediate creation
+        Write-Log -Message "Creating initial heartbeat and status files..." | Out-Null
+        $heartbeatSuccess = Update-Heartbeat -Stage "ScriptStart" -AdditionalData @{
             ScriptPath = $MyInvocation.MyCommand.Path
             Arguments = $MyInvocation.Line
             PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+            ExecutionPolicy = (Get-ExecutionPolicy).ToString()
+            ScriptSize = if ($MyInvocation.MyCommand.Path -and (Test-Path $MyInvocation.MyCommand.Path)) { (Get-Item $MyInvocation.MyCommand.Path).Length } else { "Unknown" }
         }
-        Update-Status -Status "Starting" -Progress "User context remediation initialized"
+        
+        if ($heartbeatSuccess) {
+            Write-Log -Message "Initial heartbeat created successfully" | Out-Null
+        } else {
+            Write-Log -Message "WARNING: Initial heartbeat creation failed - system context may timeout" | Out-Null
+        }
+        
+        Update-Status -Status "Starting" -Progress "User context remediation initialized, heartbeat: $heartbeatSuccess"
+        
+        # Create emergency heartbeat immediately to signal we're alive
+        try {
+            "ALIVE_$(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss')" | Out-File -FilePath "$heartbeatFile.emergency" -Force -ErrorAction SilentlyContinue
+        } catch {
+            # Ignore emergency heartbeat errors
+        }
         
         # Check if we're admin in user context - if not, use --scope user
         Write-Log -Message "Checking user admin privileges..."
