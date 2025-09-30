@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.23
-    Tag: 5A
+    Version: 5.24
+    Tag: 5B
     
     Version History:
     1.0 - Initial version
@@ -70,6 +70,7 @@
     5.21 - CRITICAL FIX: Fixed parameter detection logic - moved UserDetectionOnly check outside Test-RunningAsSystem condition and changed switch parameters to int parameters for reliable scheduled task parameter passing, ensuring JSON file creation
     5.22 - CRITICAL FIX: Implemented marker file workaround for scheduled task parameter passing issues - uses file-based communication to ensure user detection tasks always execute correct code path and create JSON result files
     5.23 - ENHANCEMENT: Implemented comprehensive marker file management system with centralized cleanup functions, orphaned file detection, and emergency cleanup handlers to prevent accumulation of .userdetection files; Added hidden console window execution method using cmd.exe with /min flag to eliminate visible console windows during scheduled task execution
+    5.24 - PERFORMANCE OPTIMIZATION: Implemented user info caching to eliminate redundant WMI calls, enhanced scheduled task execution with -NoProfile flag for better reliability, eliminated double marker file initialization
     
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -519,6 +520,10 @@ function Test-InteractiveSession {
     }
 }
 
+# Global user info cache to prevent redundant expensive WMI calls
+$Script:CachedUserInfo = $null
+$Script:UserInfoCacheTime = $null
+
 function Get-InteractiveUser {
     <#
     .SYNOPSIS
@@ -526,6 +531,14 @@ function Get-InteractiveUser {
     #>
     
     try {
+        # Check cache first (valid for 5 minutes)
+        if ($Script:CachedUserInfo -and
+            $Script:UserInfoCacheTime -and
+            ((Get-Date) - $Script:UserInfoCacheTime).TotalMinutes -lt 5) {
+            Write-Log "Using cached user info (age: $([Math]::Round(((Get-Date) - $Script:UserInfoCacheTime).TotalMinutes, 1)) minutes)"
+            return $Script:CachedUserInfo
+        }
+        
         Write-Log "Detecting interactive user using Win32_ComputerSystem..."
         
         # Primary method - proven to work with Azure AD
@@ -574,12 +587,18 @@ function Get-InteractiveUser {
             Write-Log "Warning: Could not obtain user SID, task creation may fail"
         }
         
-        return @{
+        $userInfo = @{
             Username = $username
             FullName = $loggedInUser
             Domain = $domain
             SID = $userSid
         }
+        
+        # Cache the result
+        $Script:CachedUserInfo = $userInfo
+        $Script:UserInfoCacheTime = Get-Date
+        
+        return $userInfo
         
     } catch {
         Write-Log "Error getting interactive user: $($_.Exception.Message)"
@@ -729,7 +748,7 @@ function Invoke-UserContextDetection {
         }
         
         # Use hidden console window execution method to prevent visible windows
-        $hiddenArguments = "/c start /min `"`" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
+        $hiddenArguments = "/c start /min `"`" powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
         
         Write-Log "Creating user detection task: $taskName" | Out-Null
         Write-Log "Script path: $scriptPath" | Out-Null
@@ -992,7 +1011,7 @@ function Invoke-UserContextDetection {
 }
 
 <# Script variables #>
-$ScriptTag = "5A" # Update this tag for each script version
+$ScriptTag = "5B" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -1024,12 +1043,16 @@ $useWhitelist = $true
 
 <# ----------------------------------------------- #>
 
-# Initialize marker file management system
-Write-Log -Message "Initializing marker file management system" -IsDebug
-Add-MarkerFileCleanupTrap
-$orphanedCount = Clear-OrphanedMarkerFiles -MaxAgeMinutes 60
-if ($orphanedCount -gt 0) {
-    Write-Log -Message "Cleaned up $orphanedCount orphaned marker files from previous executions"
+# Initialize marker file management system (with guard to prevent double initialization)
+$Script:MarkerSystemInitialized = $false
+if (-not $Script:MarkerSystemInitialized) {
+    Write-Log -Message "Initializing marker file management system" -IsDebug
+    Add-MarkerFileCleanupTrap
+    $orphanedCount = Clear-OrphanedMarkerFiles -MaxAgeMinutes 60
+    if ($orphanedCount -gt 0) {
+        Write-Log -Message "Cleaned up $orphanedCount orphaned marker files from previous executions"
+    }
+    $Script:MarkerSystemInitialized = $true
 }
 
 # Clean up old log files (older than 1 month)

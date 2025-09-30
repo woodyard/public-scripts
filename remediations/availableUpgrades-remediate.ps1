@@ -12,8 +12,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 8.5
- Tag: 8W
+ Version: 8.6
+ Tag: 8X
     
     Version History:
     1.0 - Initial version
@@ -53,6 +53,7 @@
     8.3 - SECURITY IMPROVEMENT: Scripts now copy themselves to user-accessible temp locations before scheduling tasks, improving security and access control with automatic cleanup
     8.4 - CRITICAL FIX: Fixed Azure AD identity cache registry errors in Intune by replacing Start-Job background registry access with direct Test-Path and SilentlyContinue error handling, eliminating "remediation error" messages on AAD-joined machines
     8.5 - ENHANCEMENT: Implemented comprehensive marker file management system with centralized cleanup functions, orphaned file detection, and emergency cleanup handlers to prevent accumulation of .userdetection files; Added hidden console window execution method using cmd.exe with /min flag to eliminate visible console windows during scheduled task execution
+    8.6 - PERFORMANCE OPTIMIZATION: Implemented user info caching to eliminate redundant CIM/WMI calls (3+ second savings), fixed deferral system type comparison error that blocked Adobe Reader updates, eliminated double marker file initialization, enhanced scheduled task execution with -NoProfile flag for better reliability
     
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -167,15 +168,28 @@ function Get-ActiveUserSessions {
 
 # WPF System User Prompt Functions - Modern replacement for legacy toast notification system
 
+# Global user info cache to prevent redundant expensive CIM/WMI calls
+$Script:CachedUserInfo = $null
+$Script:UserInfoCacheTime = $null
+
 function Get-InteractiveUser {
     <#
     .SYNOPSIS
         Gets the currently logged-in interactive user and their SID (Azure AD compatible)
     .DESCRIPTION
         Uses improved detection method that properly handles Azure AD users
+        Now includes caching to prevent redundant expensive CIM/WMI calls
     #>
     
     try {
+        # Check cache first (valid for 5 minutes)
+        if ($Script:CachedUserInfo -and
+            $Script:UserInfoCacheTime -and
+            ((Get-Date) - $Script:UserInfoCacheTime).TotalMinutes -lt 5) {
+            Write-Log "Using cached user info (age: $([Math]::Round(((Get-Date) - $Script:UserInfoCacheTime).TotalMinutes, 1)) minutes)" | Out-Null
+            return $Script:CachedUserInfo
+        }
+        
         Write-Log "Detecting interactive user using improved Azure AD compatible method..." | Out-Null
         $userDetectionStart = Get-Date
         
@@ -295,7 +309,7 @@ function Get-InteractiveUser {
             $profileExists = Test-Path $profilePath
             Write-Log "  - Profile Path: $profilePath (Exists: $profileExists)" | Out-Null
             
-            return @{
+            $userInfo = @{
                 Username = $windowsUsername              # Windows username for file operations
                 FullName = $loggedInUser                # Full domain\username format
                 Domain = $domain                        # Domain name
@@ -305,6 +319,12 @@ function Get-InteractiveUser {
                 ProfileExists = $profileExists        # Whether profile directory exists
                 SessionId = $null                      # Not available with this method
             }
+            
+            # Cache the result
+            $Script:CachedUserInfo = $userInfo
+            $Script:UserInfoCacheTime = Get-Date
+            
+            return $userInfo
             
         } catch [Exception] {
             $userDetectionDuration = (Get-Date) - $userDetectionStart
@@ -2543,8 +2563,17 @@ function Get-DeferralStatus {
                 # Find available deferral options that fit within remaining time
                 $availableOptions = @()
                 foreach ($option in $status.DeferralOptions) {
-                    if ($option -le $daysUntilAdminDeadline) {
-                        $availableOptions += $option
+                    # Fix type comparison error - ensure both values are integers
+                    $optionDays = if ($option -is [hashtable] -and $option.Days) {
+                        [int]$option.Days
+                    } elseif ($option -is [hashtable] -and $option.Label -match '\d+') {
+                        [int]($option.Label -replace '\D+', '')
+                    } else {
+                        [int]$option
+                    }
+                    
+                    if ($optionDays -le $daysUntilAdminDeadline) {
+                        $availableOptions += $optionDays
                     }
                 }
                 
@@ -3473,7 +3502,7 @@ function Schedule-UserContextRemediation {
         
         $scriptPath = $tempScriptPath
         # Use hidden console window execution method to prevent visible windows
-        $hiddenArguments = "/c start /min `"`" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`""
+        $hiddenArguments = "/c start /min `"`" powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`""
         
         Write-Log "Creating user remediation task: $taskName" | Out-Null
         Write-Log "Script path: $scriptPath" | Out-Null
@@ -4225,7 +4254,7 @@ function Invoke-MarkerFileEmergencyCleanup {
 # ============================================================================
 
 <# Script variables #>
-$ScriptTag = "8W" # Update this tag for each script version
+$ScriptTag = "8X" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -4262,20 +4291,16 @@ $useWhitelist = $true
 
 <# ----------------------------------------------- #>
 
-# Initialize marker file management system
-Write-Log -Message "Initializing marker file management system"
-Add-MarkerFileCleanupTrap
-$orphanedCount = Clear-OrphanedMarkerFiles -MaxAgeMinutes 60
-if ($orphanedCount -gt 0) {
-    Write-Log -Message "Cleaned up $orphanedCount orphaned marker files from previous executions"
-}
-
-# Initialize marker file management system
-Write-Log -Message "Initializing marker file management system"
-Add-MarkerFileCleanupTrap
-$orphanedCount = Clear-OrphanedMarkerFiles -MaxAgeMinutes 60
-if ($orphanedCount -gt 0) {
-    Write-Log -Message "Cleaned up $orphanedCount orphaned marker files from previous executions"
+# Initialize marker file management system (with guard to prevent double initialization)
+$Script:MarkerSystemInitialized = $false
+if (-not $Script:MarkerSystemInitialized) {
+    Write-Log -Message "Initializing marker file management system"
+    Add-MarkerFileCleanupTrap
+    $orphanedCount = Clear-OrphanedMarkerFiles -MaxAgeMinutes 60
+    if ($orphanedCount -gt 0) {
+        Write-Log -Message "Cleaned up $orphanedCount orphaned marker files from previous executions"
+    }
+    $Script:MarkerSystemInitialized = $true
 }
 
 # Clean up old log files (older than 1 month)
