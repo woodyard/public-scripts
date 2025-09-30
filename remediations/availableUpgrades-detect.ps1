@@ -19,7 +19,7 @@
 .NOTES
     Author: Henrik Skovgaard
     Version: 5.24
-    Tag: 5B
+    Tag: 5C
     
     Version History:
     1.0 - Initial version
@@ -1011,7 +1011,7 @@ function Invoke-UserContextDetection {
 }
 
 <# Script variables #>
-$ScriptTag = "5B" # Update this tag for each script version
+$ScriptTag = "5C" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -1539,13 +1539,11 @@ if ($OUTPUT) {
             Write-Log -Message "DEBUG: *** TAKING SYSTEM CONTEXT MAIN EXECUTION PATH ***" -IsDebug
             # SYSTEM context main execution - check system apps first, only run user detection if none found
             $systemApps = $contextApps
-            Write-Log -Message "System detection found $($systemApps.Count) apps: $($systemApps -join ', ')"
+            # Write-Log -Message "System detection found $($systemApps.Count) apps: $($systemApps -join ', ')"
             
             # PERFORMANCE OPTIMIZATION: Exit immediately if system apps are found
             if ($systemApps.Count -gt 0) {
-                Write-Log -Message "[$ScriptTag] System apps found - skipping user detection for faster execution"
-                Write-Log -Message "[$ScriptTag] System apps: $($systemApps -join '|')"
-                Write-Log -Message "[$ScriptTag] Total apps found: $($systemApps.Count) (system only, user detection skipped)"
+                Write-Log -Message "[$ScriptTag] $($systemApps -join ', ')"
                 Write-Log -Message "Performing marker file cleanup before exit (system apps found)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "System apps found, triggering remediation"
                 exit 1  # Trigger remediation immediately
@@ -1565,11 +1563,10 @@ if ($OUTPUT) {
             Write-Log -Message "DEBUG: About to call Invoke-UserContextDetection function" -IsDebug
             $userApps = Invoke-UserContextDetection
             Write-Log -Message "DEBUG: Invoke-UserContextDetection returned $($userApps.Count) apps" -IsDebug
-            Write-Log -Message "User detection found $($userApps.Count) apps: $($userApps -join ', ')"
+            # Write-Log -Message "User detection found $($userApps.Count) apps: $($userApps -join ', ')"
             
             if ($userApps.Count -gt 0) {
-                Write-Log -Message "[$ScriptTag] User apps found: $($userApps -join '|')"
-                Write-Log -Message "[$ScriptTag] Total apps found: $($userApps.Count) (user only, no system apps)"
+                Write-Log -Message "[$ScriptTag] $($userApps -join ', ')"
                 Write-Log -Message "Performing marker file cleanup before exit (user apps found)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "User apps found, triggering remediation"
                 exit 1  # Trigger remediation
@@ -1585,7 +1582,7 @@ if ($OUTPUT) {
             Write-Log -Message "DEBUG: This path is for direct user context execution (not scheduled task)" -IsDebug
             # Direct user context execution
             if ($contextApps.Count -gt 0) {
-                Write-Log -Message "[$ScriptTag] User context apps found: $($contextApps -join '|')"
+                Write-Log -Message "[$ScriptTag] $($contextApps -join ', ')"
                 Write-Log -Message "Performing marker file cleanup before exit (direct user context apps found)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "Direct user context apps found"
                 exit 1  # Trigger remediation
