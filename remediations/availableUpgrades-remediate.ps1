@@ -1715,6 +1715,376 @@ function Show-DirectUserDialog {
     }
 }
 
+function Show-CompletionNotification {
+    <#
+    .SYNOPSIS
+        Shows a completion notification that auto-closes after 5 seconds
+    .DESCRIPTION
+        Displays an informational notification when an upgrade completes successfully
+    #>
+    param(
+        [string]$AppName,
+        [string]$FriendlyName
+    )
+
+    try {
+        $displayName = if (-not [string]::IsNullOrEmpty($FriendlyName)) { $FriendlyName } else { $AppName }
+
+        if (Test-RunningAsSystem) {
+            # System context - use scheduled task approach
+            Invoke-SystemCompletionNotification -AppName $displayName
+        } else {
+            # Direct user context
+            Show-DirectCompletionNotification -AppName $displayName
+        }
+    } catch {
+        Write-Log "Error showing completion notification: $($_.Exception.Message)" | Out-Null
+    }
+}
+
+function Show-DirectCompletionNotification {
+    <#
+    .SYNOPSIS
+        Direct user context completion notification
+    #>
+    param(
+        [string]$AppName
+    )
+
+    try {
+        Write-Log "Showing completion notification for $AppName" | Out-Null
+
+        # Load WPF assemblies
+        Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+        Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+        Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+
+        # Create XAML dialog matching the existing dialog style
+        $messageText = "$AppName has been successfully updated."
+        $xaml = @"
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Update Complete"
+    Width="420"
+    MinHeight="140"
+    SizeToContent="Height"
+    WindowStartupLocation="Manual"
+    ResizeMode="NoResize"
+    WindowStyle="None"
+    AllowsTransparency="True"
+    Background="Transparent"
+    Topmost="True"
+    ShowInTaskbar="False">
+
+    <Window.Triggers>
+        <EventTrigger RoutedEvent="Window.Loaded">
+            <BeginStoryboard>
+                <Storyboard>
+                    <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                     From="0" To="1" Duration="0:0:0.3"/>
+                    <ThicknessAnimation Storyboard.TargetProperty="Margin"
+                                        From="0,50,0,0" To="0,0,0,0" Duration="0:0:0.3"/>
+                </Storyboard>
+            </BeginStoryboard>
+        </EventTrigger>
+    </Window.Triggers>
+
+    <Border Name="MainBorder"
+            Background="#FF1F1F1F"
+            CornerRadius="8"
+            BorderBrush="#FF323232"
+            BorderThickness="1">
+        <Border.Effect>
+            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
+        </Border.Effect>
+
+        <Grid Margin="16,12,16,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="32"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <!-- Icon (info/success indicator) -->
+            <Ellipse Grid.Column="0" Grid.RowSpan="2"
+                     Width="24" Height="24"
+                     Fill="#FF107C10"
+                     VerticalAlignment="Top"
+                     Margin="0,2,0,0"/>
+
+            <Path Grid.Column="0" Grid.RowSpan="2"
+                  Data="M9,16.17L4.83,12l-1.42,1.41L9,19L21,7l-1.41-1.41L9,16.17z"
+                  Fill="White"
+                  Stretch="Uniform"
+                  Width="14"
+                  Height="14"
+                  HorizontalAlignment="Center"
+                  VerticalAlignment="Top"
+                  Margin="0,7,0,0"/>
+
+            <!-- Title -->
+            <TextBlock Grid.Column="1" Grid.Row="0"
+                       Text="Update Complete"
+                       Foreground="White"
+                       FontSize="14"
+                       FontWeight="SemiBold"
+                       Margin="12,0,0,2"
+                       TextWrapping="Wrap"/>
+
+            <!-- Message -->
+            <TextBlock Grid.Column="1" Grid.Row="1"
+                       Text="$messageText"
+                       Foreground="#FFCCCCCC"
+                       FontSize="12"
+                       Margin="12,0,0,8"
+                       TextWrapping="Wrap"/>
+
+            <!-- Countdown -->
+            <TextBlock Grid.Column="1" Grid.Row="2"
+                       Foreground="#FF888888"
+                       FontSize="11"
+                       Margin="12,4,0,0"
+                       HorizontalAlignment="Right">
+                <Run Text="Closing in "/>
+                <Run Name="CountdownText" Text="5"/>
+                <Run Text="s"/>
+            </TextBlock>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+        $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]$xaml)
+        $window = [Windows.Markup.XamlReader]::Load($reader)
+        $countdownRun = $window.FindName("CountdownText")
+
+        # Position window in bottom-right corner like system notifications
+        $window.Add_Loaded({
+            $screen = [System.Windows.Forms.Screen]::PrimaryScreen
+            $window.Left = $screen.WorkingArea.Right - $window.ActualWidth - 20
+            $window.Top = $screen.WorkingArea.Bottom - $window.ActualHeight - 20
+        })
+
+        # Create timer to auto-close after 5 seconds
+        $script:remainingSeconds = 5
+        $timer = New-Object System.Windows.Threading.DispatcherTimer
+        $timer.Interval = [TimeSpan]::FromSeconds(1)
+        $timer.Add_Tick({
+            $script:remainingSeconds--
+            $countdownRun.Text = $script:remainingSeconds.ToString()
+            if ($script:remainingSeconds -le 0) {
+                $timer.Stop()
+                $window.Close()
+            }
+        })
+        $timer.Start()
+
+        # Show dialog (will auto-close)
+        $window.ShowDialog() | Out-Null
+
+    } catch {
+        Write-Log "Error in Show-DirectCompletionNotification: $($_.Exception.Message)" | Out-Null
+    }
+}
+
+function Invoke-SystemCompletionNotification {
+    <#
+    .SYNOPSIS
+        System context completion notification using scheduled task
+    #>
+    param(
+        [string]$AppName
+    )
+
+    try {
+        Write-Log "Creating system context completion notification for $AppName" | Out-Null
+
+        $userInfo = Get-InteractiveUser
+        if (-not $userInfo) {
+            Write-Log "No interactive user for completion notification" | Out-Null
+            return
+        }
+
+        # Create completion notification script
+        $notificationId = Get-Random -Minimum 1000 -Maximum 9999
+        $notificationScriptPath = "$env:TEMP\Show-CompletionNotification_$notificationId.ps1"
+
+        $notificationScriptContent = @"
+param([string]`$AppName)
+
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName System.Windows.Forms
+
+`$messageText = "`$AppName has been successfully updated."
+
+`$xaml = @`"
+<Window
+    xmlns=`"http://schemas.microsoft.com/winfx/2006/xaml/presentation`"
+    xmlns:x=`"http://schemas.microsoft.com/winfx/2006/xaml`"
+    Title=`"Update Complete`"
+    Width=`"420`"
+    MinHeight=`"140`"
+    SizeToContent=`"Height`"
+    WindowStartupLocation=`"Manual`"
+    ResizeMode=`"NoResize`"
+    WindowStyle=`"None`"
+    AllowsTransparency=`"True`"
+    Background=`"Transparent`"
+    Topmost=`"True`"
+    ShowInTaskbar=`"False`">
+
+    <Window.Triggers>
+        <EventTrigger RoutedEvent=`"Window.Loaded`">
+            <BeginStoryboard>
+                <Storyboard>
+                    <DoubleAnimation Storyboard.TargetProperty=`"Opacity`"
+                                     From=`"0`" To=`"1`" Duration=`"0:0:0.3`"/>
+                    <ThicknessAnimation Storyboard.TargetProperty=`"Margin`"
+                                        From=`"0,50,0,0`" To=`"0,0,0,0`" Duration=`"0:0:0.3`"/>
+                </Storyboard>
+            </BeginStoryboard>
+        </EventTrigger>
+    </Window.Triggers>
+
+    <Border Name=`"MainBorder`"
+            Background=`"#FF1F1F1F`"
+            CornerRadius=`"8`"
+            BorderBrush=`"#FF323232`"
+            BorderThickness=`"1`">
+        <Border.Effect>
+            <DropShadowEffect ShadowDepth=`"4`" Direction=`"270`" Color=`"Black`" Opacity=`"0.6`" BlurRadius=`"12`"/>
+        </Border.Effect>
+
+        <Grid Margin=`"16,12,16,12`">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width=`"32`"/>
+                <ColumnDefinition Width=`"*`"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height=`"Auto`"/>
+                <RowDefinition Height=`"Auto`"/>
+                <RowDefinition Height=`"Auto`"/>
+            </Grid.RowDefinitions>
+
+            <!-- Icon (info/success indicator) -->
+            <Ellipse Grid.Column=`"0`" Grid.RowSpan=`"2`"
+                     Width=`"24`" Height=`"24`"
+                     Fill=`"#FF107C10`"
+                     VerticalAlignment=`"Top`"
+                     Margin=`"0,2,0,0`"/>
+
+            <Path Grid.Column=`"0`" Grid.RowSpan=`"2`"
+                  Data=`"M9,16.17L4.83,12l-1.42,1.41L9,19L21,7l-1.41-1.41L9,16.17z`"
+                  Fill=`"White`"
+                  Stretch=`"Uniform`"
+                  Width=`"14`"
+                  Height=`"14`"
+                  HorizontalAlignment=`"Center`"
+                  VerticalAlignment=`"Top`"
+                  Margin=`"0,7,0,0`"/>
+
+            <!-- Title -->
+            <TextBlock Grid.Column=`"1`" Grid.Row=`"0`"
+                       Text=`"Update Complete`"
+                       Foreground=`"White`"
+                       FontSize=`"14`"
+                       FontWeight=`"SemiBold`"
+                       Margin=`"12,0,0,2`"
+                       TextWrapping=`"Wrap`"/>
+
+            <!-- Message -->
+            <TextBlock Grid.Column=`"1`" Grid.Row=`"1`"
+                       Text=`"`$messageText`"
+                       Foreground=`"#FFCCCCCC`"
+                       FontSize=`"12`"
+                       Margin=`"12,0,0,8`"
+                       TextWrapping=`"Wrap`"/>
+
+            <!-- Countdown -->
+            <TextBlock Grid.Column=`"1`" Grid.Row=`"2`"
+                       Foreground=`"#FF888888`"
+                       FontSize=`"11`"
+                       Margin=`"12,4,0,0`"
+                       HorizontalAlignment=`"Right`">
+                <Run Text=`"Closing in `"/>
+                <Run Name=`"CountdownText`" Text=`"5`"/>
+                <Run Text=`"s`"/>
+            </TextBlock>
+        </Grid>
+    </Border>
+</Window>
+`"@
+
+`$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]`$xaml)
+`$window = [Windows.Markup.XamlReader]::Load(`$reader)
+`$countdownRun = `$window.FindName("CountdownText")
+
+# Position window in bottom-right corner like system notifications
+`$window.Add_Loaded({
+    `$screen = [System.Windows.Forms.Screen]::PrimaryScreen
+    `$window.Left = `$screen.WorkingArea.Right - `$window.ActualWidth - 20
+    `$window.Top = `$screen.WorkingArea.Bottom - `$window.ActualHeight - 20
+})
+
+`$script:remainingSeconds = 5
+`$timer = New-Object System.Windows.Threading.DispatcherTimer
+`$timer.Interval = [TimeSpan]::FromSeconds(1)
+`$timer.Add_Tick({
+    `$script:remainingSeconds--
+    `$countdownRun.Text = `$script:remainingSeconds.ToString()
+    if (`$script:remainingSeconds -le 0) {
+        `$timer.Stop()
+        `$window.Close()
+    }
+})
+`$timer.Start()
+
+`$window.ShowDialog() | Out-Null
+"@
+
+        $notificationScriptContent | Out-File -FilePath $notificationScriptPath -Encoding UTF8 -Force
+
+        # Create and run scheduled task
+        $taskName = "CompletionNotification_$notificationId"
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$notificationScriptPath`" -AppName `"$AppName`""
+
+        $principal = $null
+        $userFormats = @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")
+
+        foreach ($userFormat in $userFormats) {
+            try {
+                $principal = New-ScheduledTaskPrincipal -UserId $userFormat -LogonType Interactive -RunLevel Limited
+                break
+            } catch {
+                continue
+            }
+        }
+
+        if ($principal) {
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+            $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings
+            Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+            Start-ScheduledTask -TaskName $taskName
+
+            # Schedule cleanup of task and script
+            Start-Sleep -Seconds 10
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            Remove-Item $notificationScriptPath -Force -ErrorAction SilentlyContinue
+        }
+
+    } catch {
+        Write-Log "Error in Invoke-SystemCompletionNotification: $($_.Exception.Message)" | Out-Null
+    }
+}
+
 function Show-MandatoryUpdateDialog {
     <#
     .SYNOPSIS
@@ -1728,7 +2098,7 @@ function Show-MandatoryUpdateDialog {
         [int]$TimeoutSeconds = 60,
         [bool]$HasBlockingProcess = $false
     )
-    
+
     try {
         if (Test-RunningAsSystem) {
             # System context - use scheduled task approach
@@ -5392,6 +5762,11 @@ if ($OUTPUT) {
                         if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*") {
                             Write-Log -Message "Upgrade completed successfully for: $($appInfo.AppID)"
                             $message += "$($appInfo.AppID)|"
+
+                            # Show completion notification if user was prompted to close a process
+                            if ($dialogResult -and ($dialogResult.CloseProcess -or $dialogResult.UserChoice)) {
+                                Show-CompletionNotification -AppName $okapp.AppID -FriendlyName $okapp.FriendlyName
+                            }
                         } else {
                             Write-Log -Message "Upgrade failed for $($appInfo.AppID) - Exit code: $LASTEXITCODE"
                             $message += "$($appInfo.AppID) (FAILED)|"
