@@ -1,0 +1,7 @@
+{
+    "ApiToken": "YOUR_CLOUDFLARE_API_TOKEN_HERE",
+    "AccountId": "YOUR_CLOUDFLARE_ACCOUNT_ID_HERE",
+    "WhitelistDomains": [
+        "officeapps.live.com"
+    ]
+}
