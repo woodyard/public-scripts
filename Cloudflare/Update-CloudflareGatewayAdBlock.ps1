@@ -48,9 +48,7 @@
     #     "ApiToken": "your_api_token_here",
     #     "AccountId": "your_account_id_here",
     #     "WhitelistDomains": [
-    #         "officeapps.live.com",
-    #         "clients4.google.com",
-    #         "aiv-delivery.net"
+    #         "officeapps.live.com"
     #     ]
     # }
 
