@@ -398,9 +398,16 @@ function New-GatewayWhitelistPolicy {
     
     # Convert domain list to multiple any() conditions joined with OR
     # Use regex to match domain and all subdomains: (^|\.)domain\.com$
+    # Supports wildcards (*) by replacing them with .*
     $conditions = $Domains | ForEach-Object {
         $escapedDomain = [regex]::Escape($_)
-        "any(dns.domains[*] matches `"(^|\\.)$escapedDomain`$`")"
+        if ($escapedDomain -match "\\\*") {
+            # Un-escape the asterisk to make it a regex wildcard
+            $regexPattern = $escapedDomain.Replace("\*", ".*")
+            "any(dns.domains[*] matches `"(^|\\.)$regexPattern`$`")"
+        } else {
+            "any(dns.domains[*] matches `"(^|\\.)$escapedDomain`$`")"
+        }
     }
     $TrafficCondition = $conditions -join ' or '
 
@@ -443,9 +450,16 @@ function Update-GatewayWhitelistPolicy {
 
     # Convert domain list to multiple any() conditions joined with OR
     # Use regex to match domain and all subdomains: (^|\.)domain\.com$
+    # Supports wildcards (*) by replacing them with .*
     $conditions = $Domains | ForEach-Object {
         $escapedDomain = [regex]::Escape($_)
-        "any(dns.domains[*] matches `"(^|\\.)$escapedDomain`$`")"
+        if ($escapedDomain -match "\\\*") {
+            # Un-escape the asterisk to make it a regex wildcard
+            $regexPattern = $escapedDomain.Replace("\*", ".*")
+            "any(dns.domains[*] matches `"(^|\\.)$regexPattern`$`")"
+        } else {
+            "any(dns.domains[*] matches `"(^|\\.)$escapedDomain`$`")"
+        }
     }
     $TrafficCondition = $conditions -join ' or '
 
