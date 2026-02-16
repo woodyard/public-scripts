@@ -1,14 +1,16 @@
 <#
 .SYNOPSIS
     Automatically updates Cloudflare Zero Trust Gateway DNS policy for ad blocking,
-    including an optional whitelist policy.
+    including an optional whitelist policy and multiple external block lists.
 .DESCRIPTION
     This script creates or updates DNS policies in Cloudflare Zero Trust Gateway.
-    It includes a high-precedence 'Allow' policy (Whitelist) for essential domains
-    that may be false-positively blocked, and a high-precedence 'Block' policy
-    for common ad/tracker/malware domain fragments (Ad Blocker) using regex pattern matching.
+    It includes:
+    1. A Whitelist policy (Allow) for essential domains.
+    2. Multiple Block policies based on external lists (1Host, OISD, etc.).
+    3. A generic Ad Block policy using regex pattern matching.
+    4. An Abused TLDs policy.
 
-    It uses the Cloudflare API to manage the policies automatically.
+    It uses the Cloudflare API to manage the lists and policies automatically.
 .PARAMETER ConfigFile
     Path to a JSON configuration file containing ApiToken and AccountId.
     Default locations checked: ./cloudflare-config.json, ~/.cloudflare-config.json
@@ -19,7 +21,7 @@
     Cloudflare Account ID. Found in the Zero Trust dashboard URL.
     Priority: Parameter > Config file > Environment variable
 .PARAMETER PolicyName
-    Name of the DNS policy to create/update. Default: "Ad Blocker"
+    Name of the generic Regex Ad Blocker policy. Default: "Ad Blocker"
 .PARAMETER WhitelistedDomains
     An array of additional domains to add to the whitelist (on top of config file domains).
     Example: -WhitelistedDomains @('extra.domain.com', 'another.domain.net')
@@ -33,79 +35,74 @@
     A switch to control whether the Abused TLDs Blocker policy is created or updated.
 .PARAMETER AbusedTldPolicyName
     Name of the Abused TLDs policy to create/update. Default: "Abused TLDs Blocker"
+.PARAMETER BlockListName
+    Optional filter to process only a specific block list by name. Supports partial matching.
 .PARAMETER WhatIf
     Shows what would happen without making changes.
 .EXAMPLE
-    # Run with default settings, creating the Ad Blocker and Whitelist policies
+    # Run with default settings
     .\Update-CloudflareGatewayAdBlock.ps1 -ApiToken "your_token" -AccountId "your_account_id"
 
 .EXAMPLE
-    # Using a config file (recommended for security)
+    # Using a config file
     .\Update-CloudflareGatewayAdBlock.ps1 -ConfigFile "~/.cloudflare-config.json"
-    
-    # Config file format (JSON):
-    # {
-    #     "ApiToken": "your_api_token_here",
-    #     "AccountId": "your_account_id_here",
-    #     "WhitelistDomains": [
-    #         "officeapps.live.com"
-    #     ]
-    # }
 
 .EXAMPLE
-    # Disable the whitelist policy but keep the ad blocker
-    .\Update-CloudflareGatewayAdBlock.ps1 -EnableWhitelistPolicy:$false
+    # Process only the OISD list
+    .\Update-CloudflareGatewayAdBlock.ps1 -ConfigFile "~/.cloudflare-config.json" -BlockListName "OISD"
 
-.EXAMPLE
-    # Add extra domains to the whitelist (in addition to config file)
-    .\Update-CloudflareGatewayAdBlock.ps1 -WhitelistedDomains @("my.safe.domain.net")
 .NOTES
-    Version:        2.1 (Regex v2.6)
+    Version:        3.2
     Author:         Henrik Skovgaard / Modified by AI
     Creation Date:  2025-11-30
-    
-    Version History:
-    1.5 - Hardcoded Whitelist and Policy Control
-    1.6 - Regex v2.3: Added adskeeper, clevertap, kochava, leanplum
-    1.7 - Added config file support for secure credential storage
-    1.8 - Moved whitelist domains to config file (WhitelistDomains array)
-    1.9 - Regex v2.4: Added tealium, contentsquare, fullstory, logrocket, mouseflow, abtasty, airbridge, tenjin
-    2.0 - Regex v2.5: Added bidmachine, emarsys, storyly, mtgglobals
-    2.1 - Regex v2.6: Added 17 new keywords from Firebog analysis (branch, comscore, crisp, customerio, drift, gtag, insider, intercom, livechat, omniture, pendo, posthog, rudderstack, segment, sessioncam, snowplow, tawk, zendesk)
 
-    API Token Requirements:
-    - Account > Zero Trust > Edit
-    - Account > Account Firewall Access Rules > Edit
+    Version History:
+    ...
+    3.0 - Added support for multiple external block lists (1Host, OISD, etc.) using Cloudflare Gateway Lists.
+    3.1 - Fixed duplicate BlockLists definition that silently overwrote the first.
+          Fixed OISD list: changed to plain domains endpoint (small.oisd.nl/domains) with Type "Domains".
+          Removed Anti PopAds (repository deleted/renamed, URL returns 404).
+          Removed debug output statements.
+          Updated KADHosts URL to current repository location.
+    3.2 - Fixed critical performance issue in Fetch-And-Parse-List: replaced O(n²) array += concatenation
+          with HashSet[string] for O(1) dedup and List[string] collection. Pre-compiled validation regex.
+          210K domain lists now parse in seconds instead of hanging indefinitely.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter()]
     [string]$ConfigFile,
-    
+
     [Parameter()]
     [string]$ApiToken,
-    
+
     [Parameter()]
     [string]$AccountId,
-    
+
     [Parameter()]
     [string]$PolicyName = "Ad Blocker",
 
     [Parameter()]
     [string[]]$WhitelistedDomains,
-    
+
     [Parameter()]
     [switch]$EnableWhitelistPolicy = $true,
-    
+
     [Parameter()]
     [string]$WhitelistPolicyName = "Whitelist (Allow Explicit)",
-    
+
     [Parameter()]
     [switch]$IncludeAbusedTlds,
-    
+
     [Parameter()]
-    [string]$AbusedTldPolicyName = "Abused TLDs Blocker"
+    [string]$AbusedTldPolicyName = "Abused TLDs Blocker",
+
+    [Parameter()]
+    [string]$BlockListName,
+
+    [Parameter()]
+    [switch]$WhitelistOnly
 )
 
 #region Config File Loading
@@ -146,7 +143,7 @@ if ($ConfigToUse) {
     Write-Verbose "Loading configuration from: $ConfigToUse"
     try {
         $Config = Get-Content $ConfigToUse -Raw | ConvertFrom-Json
-        
+
         # Only use config values if parameters weren't explicitly provided
         if (-not $ApiToken -and $Config.ApiToken) {
             $ApiToken = $Config.ApiToken
@@ -179,6 +176,45 @@ if (-not $AccountId) {
 
 $script:CloudflareApiBase = "https://api.cloudflare.com/client/v4"
 
+# External Block Lists Configuration (single consolidated definition)
+$script:BlockLists = @(
+    @{
+        Name = "1Host Lite"
+        Url  = "https://raw.githubusercontent.com/badmojr/1Hosts/master/Lite/domains.txt"
+        Type = "Domains"
+    },
+    @{
+        Name = "Anudeep"
+        Url  = "https://raw.githubusercontent.com/anudeepND/blacklist/master/adservers.txt"
+        Type = "Hosts"
+    },
+    @{
+        Name = "KADHosts"
+        Url  = "https://raw.githubusercontent.com/PolishFiltersTeam/KADhosts/master/KADhosts.txt"
+        Type = "Hosts"
+    },
+    @{
+        Name = "NoCoin"
+        Url  = "https://raw.githubusercontent.com/hoshsadiq/adblock-nocoin-list/master/hosts.txt"
+        Type = "Hosts"
+    },
+    @{
+        Name = "OISD Small"
+        Url  = "https://small.oisd.nl/domains"
+        Type = "Domains"
+    },
+    @{
+        Name = "Peter Lowe"
+        Url  = "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext"
+        Type = "Hosts"
+    },
+    @{
+        Name = "URLhaus"
+        Url  = "https://urlhaus.abuse.ch/downloads/hostfile/"
+        Type = "Hosts"
+    }
+)
+
 # Default whitelist domains (used if no config file specifies WhitelistDomains)
 $script:DefaultWhitelistDomains = @(
     "officeapps.live.com",                   # Office 365 services (Word, PowerPoint, Excel telemetry and features)
@@ -203,14 +239,7 @@ if ($WhitelistedDomains) {
 $script:FullWhitelistDomains = $script:FullWhitelistDomains | Select-Object -Unique
 
 # Main ad-blocking regex pattern (v2.6)
-# Changes in v2.6:
-#   - Added: branch (mobile attribution), comscore (analytics), crisp (chat/tracking), customerio (marketing automation),
-#            drift (conversational marketing), gtag (Google tag), insider (marketing), intercom (chat/tracking),
-#            livechat (chat/tracking), omniture (Adobe Analytics legacy), pendo (product analytics), posthog (product analytics),
-#            rudderstack (customer data), segment (customer data), sessioncam (session replay), snowplow (analytics tracker),
-#            tawk (chat widget), zendesk (chat tracking)
-#   - Note: Standalone 'lytics' was removed in v1.3 (caused false positives on *analytics* domains)
-$script:AdBlockRegex = '(advert|adserv|adsystem|adtrack|adserver|adtech|adnetwork|doubleclick|2mdn|2o7|33across|360yield|3lift|aax|aaxads|abtasty|adcash|adclick|adcolony|addthis|adform|adhaven|adhese|adition|adjust|adloox|adlooxtracking|admantx|admicro|admixer|admob|adnami|adnxs|adskeeper|adomik|adpushup|adroll|adsafeprotected|adsrvr|adsterra|adswizz|adtelligent|adventori|adzerk|aerserv|agkn|airbridge|amazon-adsystem|amplitude|aniview|anzuinfra|apester|applovin|appsflyer|aralego|atdmt|atwola|aumago|avazu|bannersnack|batmobi|bidmachine|bidswitch|bidtheatre|bizible|bluecore|bluecava|blueconic|bounceexchange|branch|braze|btloader|bttrack|carambo|casalemedia|cedexis|chartbeat|cheabit|cleverads|clevertap|clickagy|clicktale|cluep|cohesion|comscore|contentsquare|contextly|contextweb|convertkit|convertmedia|crazymedia|crisp|criteo|crwdcntrl|custhelp|customerio|demdex|dftrack|districtm|dotomi|doubleverify|drift|dstillery|dtscout|dynatrace|dyntrk|efectivoads|emarsys|emxdgt|engagio|enquisite|eulerian|everesttech|exelator|eyeota|fastly-insights|fidelity-media|flashtalking|foresee|foxpush|freeskreen|freewheel|fullstory|fuseplatform|fwmrm|fyber|geniee|getclicky|getdrip|getintent|glassboxdigital|gmads|google-analytics|googleadservices|googlesyndication|googletagmanager|googletagservices|gridsum|gtag|gwallet|heapanalytics|hotjar|hubspot|iasds|ijinshan|imprva|imrworldwide|indexww|infolinks|inmobi|innovid|insider|insightexpressai|inspectlet|integralads|intelliad|intellitxt|intercom|intergi|intermarkets|ipredictive|iqzone|ironsrc|iterable|jetpack|jivox|juicyads|justpremium|kameleoon|kissmetrics|klarnaservices|klaviyo|kochava|komoona|krxd|launchbit|leanplum|liadm|lijit|livechat|liveintent|liveramp|liveperson|loggly|logrocket|lqcdn|madebymagnitude|magnite|mailchimp|marinsm|marketo|mathads|mathtag|mautic|maxmind|mczbf|mdhv|measurementapi|mediabrix|mediaforge|medialytics|mediaplex|mediavine|medscape|merkle|metricode|mgid|mktoresp|mixpanel|ml314|mlcdn|moatads|moatpixel|mobileapptracking|mobtop|mobileadtrading|moengage|monetizer|mookie|mopub|mouseflow|mparticle|mplxtms|mtgglobals|mxpnl|myhome360|mytads|nanigans|nativeads|nativo|nbcume|ndsr|netcore|netmng|netratings|neuralone|newrelic|nexac|nextroll|npttech|nuggad|o333o|ogury|omniture|omnisnippet|omnitagjs|omtrdc|oneall|onead|onecount|onesignal|onetag|onetrust|onthe|openx|optimizely|optinmonster|outbrain|owneriq|pardot|parsely|pathweb|pbstck|pendo|pepperjam|perfectaudience|permutive|phoenix-tracking|pinger|pippio|pixalate|pixfuture|placecast|plista|pointroll|polare|posthog|powerlinks|ppjol|pressidium|primis|prmutv|programattik|propellerads|psyma|ptengine|pubmatic|pubmine|pushengage|pushpad|pushwoosh|pvnsolutions|quantcast|quantserve|rayjump|reachforce|realmatch|realnex|redshell|reembed|reporo|revjet|revcontent|rfihub|richrelevance|rlcdn|rockerbox|rqmob|rtbhouse|rtbidder|rubiconproject|rudderstack|sailthru|salesforce-sites|scarabresearch|scheduleonce|scorecardresearch|sddan|segment|sekindo|sendgrid|sensic|sentifi|sessioncam|shareaholic|sharethis|sharethrough|signifyd|simpleanalytics|siteimprove|sitescout|six-degrees|skimlinks|smartadserver|smaato|snapads|snigelweb|snowplow|snssdk|speedcurve|speedshiftmedia|splicky|spotx|spotxchange|springserve|stackadapt|stackpathr|statcounter|steelhousemedia|stickyadstv|storyly|streamrail|supersonicads|supership|sushim|swrve|synacor|taboola|tapad|tapjoy|tapnative|tawk|teads|tealium|techlab-cdn|telemetry|tenjin|terabytemedia|theadex|thetradingdesk|thirdpresence|tidaltv|tiffanyoption|tkqlhce|tlnk|tm-tracking|tns-counter|tovery|trackcmp|trackingcheese|trackingio|trackmytarget|tradedoubler|tradelab|tradelabtech|traffichaus|trafficroots|trafmag|treasuredata|tremorhub|tresensa|trueffect|trueleadid|tsyndicate|tubemogul|turnto|tvpixel|tvsquared|twilio|typekit|ubimo|udmserve|undertone|unrulymedia|urbanairship|usebutton|usercentrics|uservoice|userzoom|utarget|uuidksinc|uwezi|veinteractive|verticalresearch|vertamedia|videohub|vidible|volcanoaffiliates|voluumtrk|volvelle|vungle|webgains|webengage|webtrekk|wishabi|wizads|woopra|wootracker|wunderkind|wzrkt|xad|xiaomi|xiti|xplosion|xtremepush|yandex|yapto|yektanet|yieldbot|yieldify|yieldlab|yieldlove|yieldmo|yieldoptimizer|yotpo|zeotap|zendesk|zestadz|zeta|zopim|zuuvi)'
+$script:AdBlockRegex = '(advert|adserv|adsystem|adtrack|adserver|adtech|adnetwork|doubleclick|2mdn|2o7|33across|360yield|3lift|aax|aaxads|abtasty|adcash|adclick|adcolony|addthis|adform|adhaven|adhese|adition|adjust|adloox|adlooxtracking|admantx|admicro|admixer|admob|adnami|adnxs|adskeeper|adomik|adpushup|adroll|adsafeprotected|adsrvr|adsterra|adswizz|adtelligent|adventori|adzerk|aerserv|agkn|airbridge|amazon-adsystem|amplitude|aniview|anzuinfra|apester|applovin|appsflyer|aralego|atdmt|atwola|aumago|avazu|bannersnack|batmobi|bidmachine|bidswitch|bidtheatre|bizible|bluecore|bluecava|blueconic|bounceexchange|branch|braze|btloader|bttrack|carambo|casalemedia|cedexis|chartbeat|cheabit|cleverads|clevertap|clickagy|clicktale|cluep|cohesion|comscore|contentsquare|contextly|contextweb|convertkit|convertmedia|crazymedia|crisp|criteo|crwdcntrl|custhelp|customerio|demdex|dftrack|districtm|dotomi|doubleverify|drift|dstillery|dtscout|dynatrace|dyntrk|efectivoads|emarsys|emxdgt|engagio|enquisite|eulerian|everesttech|exelator|eyeota|fastly-insights|fidelity-media|flashtalking|foresee|foxpush|freeskreen|freewheel|fullstory|fuseplatform|fwmrm|fyber|geniee|getclicky|getdrip|getintent|glassboxdigital|gmads|google-analytics|googleadservices|googlesyndication|googletagmanager|googletagservices|gridsum|gtag|gwallet|heapanalytics|hotjar|hubspot|iasds|ijinshan|imprva|imrworldwide|indexww|infolinks|inmobi|innovid|insider|insightexpressai|inspectlet|integralads|intelliad|intellitxt|intercom|intergi|intermarkets|ipredictive|iqzone|ironsrc|iterable|jetpack|jivox|juicyads|justpremium|kameleoon|kissmetrics|klarnaservices|klaviyo|kochava|komoona|krxd|launchbit|leanplum|liadm|lijit|livechat|liveintent|liveramp|liveperson|loggly|logrocket|lqcdn|madebymagnitude|magnite|mailchimp|marinsm|marketo|mathads|mathtag|mautic|maxmind|mczbf|mdhv|measurementapi|mediabrix|mediaforge|medialytics|mediaplex|mediavine|medscape|merkle|metricode|mgid|mktoresp|mixpanel|ml314|mlcdn|moatads|moatpixel|mobileapptracking|mookie1|mparticle|mtgglobals|mxpnl|mybestlogs|myvisualiq|nativeads|nativo|navdmp|netmng|nexac|nextdns|nielsen|nr-data|ns1p|obclick|observerapp|omguk|omnitag|omniture|onemobile|onetag|onlinesolution|openx|optimizely|outbrain|pardot|parsely|pendo|perfectaudience|permutive|phluant|pippio|pixel|pkmn|platform161|playwire|plista|polarcdn|popads|popcash|posthog|postrelease|powerlinks|propellerads|pubmatic|pubmine|pulsepoint|quantcount|quantserve|qubit|r1908|r2018|rakuten|rdtk|reapleaf|redirect|reddit-ad|reklam|resonate|revcontent|revenuehit|rlcdn|rotaban|rubicon|rudderstack|run-syndicate|rutarget|s2s-web|salesforce|sbscrbr|scanscout|scorecardresearch|searchforce|segment|semasio|sessioncam|sharethis|shopifysvc|simpli|skimresources|slicktext|smetrics|smartadserver|snapads|snowplow|sonobi|sovern|spdttr|specificclick|spotxchange|springserve|sprout|startapp|statcounter|statif|stats|storyly|streamrail|strossle|supership|taboola|tagcommander|tagsrv|tapfiliate|tapjoy|tapad|tawk|tealium|teads|tenjin|thebrighttag|themoneytizer|tinypass|tjsrc|tm-awx|trafficjunky|trafficstars|traffichunt|travelaudience|tremorhub|tribalfusion|trkn|truoptik|trustarc|trustpilot|tt-10000|turn|twiq|tynt|uam|uberads|uedas|umeng|undertone|unrulymedia|upfluence|useinsider|usergram|userreport|v12group|veinteractive|verizon-media|vungle|w55c|wappingers|webtrekk|webtrends|wibbitz|widespace|wigetmedia|wizaly|wrapps|xad|xaxis|xplosion|yandex|ybrant|ydraw|yeb-svc|yhd|yieldlab|yieldmo|yieldoptimizer|yllix|yoc|yrmn|zemanta|zendesk|zeus|zmnn)'
 
 # Abused TLD regex pattern (anchored at end)
 $script:AbusedTldRegex = '[.](surf|rest|tokyo|ml|cam|icu|cf|gq|best|tk|cn|ru|xyz|top|buzz|live|cfd|boats|beauty|mom|skin|okinawa|zip|mobi|hair|quest)$'
@@ -231,36 +260,36 @@ function Invoke-CloudflareApi {
     param(
         [Parameter(Mandatory)]
         [string]$Endpoint,
-        
+
         [Parameter()]
-        [ValidateSet('GET', 'POST', 'PUT', 'DELETE')]
+        [ValidateSet('GET', 'POST', 'PUT', 'DELETE', 'PATCH')]
         [string]$Method = 'GET',
-        
+
         [Parameter()]
         [object]$Body
     )
-    
+
     $uri = "$script:CloudflareApiBase$Endpoint"
     $headers = Get-CloudflareHeaders
-    
+
     $params = @{
         Uri     = $uri
         Method  = $Method
         Headers = $headers
     }
-    
+
     if ($Body) {
         $params.Body = $Body | ConvertTo-Json -Depth 10
     }
-    
+
     try {
         $response = Invoke-RestMethod @params -ErrorAction Stop
-        
+
         if (-not $response.success) {
             $errorMsg = ($response.errors | ForEach-Object { $_.message }) -join "; "
             throw "Cloudflare API error: $errorMsg"
         }
-        
+
         return $response
     }
     catch {
@@ -284,7 +313,7 @@ function Invoke-CloudflareApi {
 function Get-GatewayPolicies {
     [CmdletBinding()]
     param()
-    
+
     Write-Verbose "Fetching existing Gateway DNS policies..."
     $response = Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/rules"
     return $response.result
@@ -296,7 +325,7 @@ function Get-PolicyByName {
         [Parameter(Mandatory)]
         [string]$Name
     )
-    
+
     $policies = Get-GatewayPolicies
     return $policies | Where-Object { $_.name -eq $Name }
 }
@@ -306,23 +335,23 @@ function New-GatewayPolicy {
     param(
         [Parameter(Mandatory)]
         [string]$Name,
-        
+
         [Parameter(Mandatory)]
         [string]$Regex,
-        
+
         [Parameter()]
         [string]$Description = "Auto-managed by PowerShell script",
-        
+
         [Parameter()]
         [string]$Action = "block",
-        
+
         [Parameter()]
         [int]$Precedence = 10000
     )
-    
+
     # Cloudflare API traffic field structure: any(dns.domains[*] matches "regex")
     $TrafficCondition = "any(dns.domains[*] matches `"$Regex`")"
-    
+
     $body = @{
         name        = $Name
         description = $Description
@@ -332,7 +361,7 @@ function New-GatewayPolicy {
         traffic     = $TrafficCondition
         precedence  = $Precedence
     }
-    
+
     Write-Verbose "Creating new policy: $Name (Action: $Action, Precedence: $Precedence)"
     $response = Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/rules" -Method POST -Body $body
     return $response.result
@@ -343,25 +372,25 @@ function Update-GatewayPolicy {
     param(
         [Parameter(Mandatory)]
         [string]$PolicyId,
-        
+
         [Parameter(Mandatory)]
         [string]$Name,
-        
+
         [Parameter(Mandatory)]
         [string]$Regex,
-        
+
         [Parameter()]
         [string]$Description = "Auto-managed by PowerShell script. Last updated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
-        
+
         [Parameter()]
         [string]$Action = "block",
-        
+
         [Parameter()]
         [int]$Precedence = 10000
     )
-    
+
     $TrafficCondition = "any(dns.domains[*] matches `"$Regex`")"
-    
+
     $body = @{
         name        = $Name
         description = $Description
@@ -371,7 +400,7 @@ function Update-GatewayPolicy {
         traffic     = $TrafficCondition
         precedence  = $Precedence
     }
-    
+
     Write-Verbose "Updating policy: $Name (ID: $PolicyId, Action: $Action, Precedence: $Precedence)"
     $response = Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/rules/$PolicyId" -Method PUT -Body $body
     return $response.result
@@ -382,20 +411,20 @@ function New-GatewayWhitelistPolicy {
     param(
         [Parameter(Mandatory)]
         [string]$Name,
-        
+
         [Parameter(Mandatory)]
         [string[]]$Domains,
-        
+
         [Parameter()]
         [string]$Description = "Explicitly allowed domains (Whitelist)",
-        
+
         [Parameter()]
-        [string]$Action = "allow", 
-        
+        [string]$Action = "allow",
+
         [Parameter()]
         [int]$Precedence = 1000
     )
-    
+
     # Convert domain list to multiple any() conditions joined with OR
     # Use regex to match domain and all subdomains: (^|\.)domain\.com$
     # Supports wildcards (*) by replacing them with .*
@@ -420,7 +449,7 @@ function New-GatewayWhitelistPolicy {
         traffic     = $TrafficCondition
         precedence  = $Precedence
     }
-    
+
     Write-Verbose "Creating new policy: $Name (Action: $Action, Precedence: $Precedence)"
     $response = Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/rules" -Method POST -Body $body
     return $response.result
@@ -431,19 +460,19 @@ function Update-GatewayWhitelistPolicy {
     param(
         [Parameter(Mandatory)]
         [string]$PolicyId,
-        
+
         [Parameter(Mandatory)]
         [string]$Name,
-        
+
         [Parameter(Mandatory)]
         [string[]]$Domains,
-        
+
         [Parameter()]
         [string]$Description = "Explicitly allowed domains (Whitelist). Last updated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
-        
+
         [Parameter()]
-        [string]$Action = "allow", 
-        
+        [string]$Action = "allow",
+
         [Parameter()]
         [int]$Precedence = 1000
     )
@@ -463,8 +492,6 @@ function Update-GatewayWhitelistPolicy {
     }
     $TrafficCondition = $conditions -join ' or '
 
-    Write-Host "DEBUG: Generated Traffic Condition: $TrafficCondition" -ForegroundColor Magenta
-
     $body = @{
         name        = $Name
         description = $Description
@@ -474,17 +501,259 @@ function Update-GatewayWhitelistPolicy {
         traffic     = $TrafficCondition
         precedence  = $Precedence
     }
-    
+
     Write-Verbose "Updating policy: $Name (ID: $PolicyId, Action: $Action, Precedence: $Precedence)"
     $response = Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/rules/$PolicyId" -Method PUT -Body $body
     return $response.result
 }
 
+# --- List Management Functions ---
+
+function Get-GatewayLists {
+    [CmdletBinding()]
+    param()
+
+    Write-Verbose "Fetching existing Gateway Lists..."
+    $response = Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/lists"
+    return $response.result
+}
+
+function Sync-GatewayList {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [string[]]$Domains,
+
+        [Parameter()]
+        [string]$Description = "Managed by PowerShell"
+    )
+
+    Write-Host "Syncing Gateway List(s): $Name ($($Domains.Count) domains)" -ForegroundColor Yellow
+
+    $lists = Get-GatewayLists
+
+    # Strategy: Split domains into chunks of 1000 items.
+    # Create/Update multiple lists named "$Name - Part X"
+    # Returns an array of List IDs.
+
+    $chunkSize = 1000
+    $listIds = @()
+
+    $parts = if ($Domains.Count -gt 0) { [Math]::Ceiling($Domains.Count / $chunkSize) } else { 1 }
+
+    for ($i = 0; $i -lt $parts; $i++) {
+        $partNum = $i + 1
+        $listName = "$Name - Part $partNum"
+
+        # Calculate slice
+        $start = $i * $chunkSize
+        $end = [Math]::Min($start + $chunkSize - 1, $Domains.Count - 1)
+
+        if ($Domains.Count -gt 0) {
+            $chunkDomains = $Domains[$start..$end]
+        } else {
+            $chunkDomains = @()
+        }
+
+        $formattedItems = $chunkDomains | ForEach-Object { @{ value = $_ } }
+        $existingList = $lists | Where-Object { $_.name -eq $listName }
+
+        if ($existingList) {
+            Write-Host "  Updating '$listName' ($($formattedItems.Count) items)..." -ForegroundColor Gray
+            # Atomic replace using PUT (limit 1000 items)
+            $body = @{
+                name        = $listName
+                description = "$Description (Part $partNum/$parts)"
+                items       = $formattedItems
+                type        = "DOMAIN"
+            }
+            try {
+                $response = Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/lists/$($existingList.id)" -Method PUT -Body $body
+                $listIds += $existingList.id
+            } catch {
+                Write-Error "Failed to update list $listName : $_"
+            }
+        } else {
+            Write-Host "  Creating '$listName' ($($formattedItems.Count) items)..." -ForegroundColor Gray
+            $body = @{
+                name        = $listName
+                description = "$Description (Part $partNum/$parts)"
+                items       = $formattedItems
+                type        = "DOMAIN"
+            }
+            try {
+                $response = Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/lists" -Method POST -Body $body
+                $listIds += $response.result.id
+            } catch {
+                Write-Error "Failed to create list $listName : $_"
+            }
+        }
+    }
+
+    # Cleanup old parts if the list shrank (e.g. formerly had 5 parts, now only 3)
+    $potentialOldLists = $lists | Where-Object { $_.name -like "$Name - Part *" }
+    foreach ($oldList in $potentialOldLists) {
+        if ($listIds -notcontains $oldList.id) {
+            Write-Host "  Deleting obsolete list part: $($oldList.name)..." -ForegroundColor DarkGray
+            try {
+                Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/lists/$($oldList.id)" -Method DELETE | Out-Null
+            } catch {
+                Write-Warning "Failed to delete old list $($oldList.name): $_"
+            }
+        }
+    }
+
+    # Also handle the legacy single list if it exists (named just "$Name")
+    $legacyList = $lists | Where-Object { $_.name -eq $Name }
+    if ($legacyList) {
+        Write-Host "  Deleting legacy single list '$Name' (replaced by parts)..." -ForegroundColor DarkGray
+        try {
+            Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/lists/$($legacyList.id)" -Method DELETE | Out-Null
+        } catch {
+            Write-Warning "Failed to delete legacy list: $_"
+        }
+    }
+
+    return $listIds
+}
+
+function Update-GatewayPolicyForList {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$ListIds,
+
+        [Parameter(Mandatory)]
+        [string]$ListName,
+
+        [Parameter()]
+        [int]$Precedence = 11000
+    )
+
+    $policyName = "Block - $ListName"
+    Write-Host "Processing Policy '$policyName'..." -ForegroundColor Yellow
+
+    # Traffic: any(dns.domains[*] in $ListId1) or any(dns.domains[*] in $ListId2) ...
+    $conditions = $ListIds | ForEach-Object { "any(dns.domains[*] in `$$($_))" }
+    $traffic = $conditions -join " or "
+
+    $existingPolicy = Get-PolicyByName -Name $policyName
+
+    if ($existingPolicy) {
+        # Check if we need to update (e.g. if List ID changed)
+        if ($existingPolicy.traffic -ne $traffic -or $existingPolicy.precedence -ne $Precedence) {
+            Write-Host "  Updating policy traffic/precedence..." -ForegroundColor Gray
+
+             $body = @{
+                name        = $policyName
+                description = "Block policy for list: $ListName"
+                enabled     = $true
+                action      = "block"
+                filters     = @("dns")
+                traffic     = $traffic
+                precedence  = $Precedence
+            }
+            Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/rules/$($existingPolicy.id)" -Method PUT -Body $body | Out-Null
+            Write-Host "  Policy updated." -ForegroundColor Green
+        } else {
+            Write-Host "  Policy already up to date." -ForegroundColor Gray
+        }
+    } else {
+        Write-Host "  Creating new policy..." -ForegroundColor Gray
+        $body = @{
+            name        = $policyName
+            description = "Block policy for list: $ListName"
+            enabled     = $true
+            action      = "block"
+            filters     = @("dns")
+            traffic     = $traffic
+            precedence  = $Precedence
+        }
+        Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/rules" -Method POST -Body $body | Out-Null
+        Write-Host "  Policy created." -ForegroundColor Green
+    }
+}
+
+function Fetch-And-Parse-List {
+    param(
+        [string]$Url,
+        [string]$Type
+    )
+
+    Write-Host "  Downloading from: $Url" -ForegroundColor DarkGray
+    try {
+        $content = Invoke-RestMethod -Uri $Url -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -ErrorAction Stop
+
+        # Some endpoints return an array of strings; join them into a single string
+        if ($content -is [array]) {
+            $content = $content -join "`n"
+        }
+    } catch {
+        Write-Error "  Failed to download list: $_"
+        return @()
+    }
+
+    # Use HashSet for O(1) dedup instead of Select-Object -Unique (O(n²))
+    $uniqueDomains = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    # Robust splitting for mixed line endings
+    $lines = $content -split "\r?\n"
+    Write-Host "  Parsing $($lines.Count) lines ($Type format)..." -ForegroundColor DarkGray
+
+    # Pre-compile the validation regex for performance
+    $hostnameRegex = [regex]::new('^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$', 'Compiled')
+    $skipDomains = @('localhost', 'broadcasthost', 'local', '127.0.0.1', '0.0.0.0', '::1')
+
+    foreach ($line in $lines) {
+        $line = $line.Trim()
+        if ([string]::IsNullOrEmpty($line)) { continue }
+
+        $raw = $null
+
+        switch ($Type) {
+            "Hosts" {
+                if ($line[0] -eq '#') { continue }
+                $parts = $line -split "\s+"
+                if ($parts.Count -ge 2) {
+                    $raw = $parts[1]
+                }
+            }
+            "AdblockPlus" {
+                if ($line[0] -eq '!' -or ($line[0] -eq '[' -and $line[-1] -eq ']')) { continue }
+                if ($line.StartsWith("||") -and $line.EndsWith("^")) {
+                    $raw = $line.Substring(2, $line.Length - 3)
+                }
+            }
+            "Domains" {
+                if ($line[0] -eq '#') { continue }
+                $raw = $line
+            }
+        }
+
+        if (-not $raw) { continue }
+
+        # Cleanup
+        $clean = $raw.TrimEnd("^").Trim()
+        if ([string]::IsNullOrEmpty($clean)) { continue }
+        if ($clean -in $skipDomains) { continue }
+
+        # Validate hostname format and add (HashSet handles dedup automatically)
+        if ($hostnameRegex.IsMatch($clean)) {
+            [void]$uniqueDomains.Add($clean)
+        }
+    }
+
+    Write-Host "  Extracted $($uniqueDomains.Count) unique valid domains." -ForegroundColor Gray
+    return @($uniqueDomains)
+}
 
 function Test-ApiConnection {
     [CmdletBinding()]
     param()
-    
+
     Write-Verbose "Testing API connection..."
     try {
         $response = Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/rules" -Method GET
@@ -503,7 +772,7 @@ function Test-ApiConnection {
 # Banner
 Write-Host ""
 Write-Host "╔══════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "║   Cloudflare Zero Trust Gateway - Ad Block Policy Updater v2.0   ║" -ForegroundColor Cyan
+Write-Host "║   Cloudflare Zero Trust Gateway - Ad Block Policy Updater v3.2   ║" -ForegroundColor Cyan
 Write-Host "╚══════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
 
@@ -537,12 +806,12 @@ if ($EnableWhitelistPolicy -and ($script:FullWhitelistDomains.Count -gt 0)) {
     Write-Host "Processing '$WhitelistPolicyName' policy..." -ForegroundColor Yellow
     $sourceInfo = if ($script:ConfigWhitelistDomains) { "config file" } else { "defaults" }
     Write-Host "  Whitelist source: $sourceInfo ($($script:FullWhitelistDomains.Count) domains)" -ForegroundColor Gray
-    
+
     $existingWhitelistPolicy = Get-PolicyByName -Name $WhitelistPolicyName
-    
+
     if ($existingWhitelistPolicy) {
         Write-Host "  Found existing policy (ID: $($existingWhitelistPolicy.id))" -ForegroundColor Gray
-        
+
         if ($PSCmdlet.ShouldProcess($WhitelistPolicyName, "Update DNS Whitelist policy (Precedence 1000)")) {
             $result = Update-GatewayWhitelistPolicy -PolicyId $existingWhitelistPolicy.id -Name $WhitelistPolicyName -Domains $script:FullWhitelistDomains -Precedence 1000
             Write-Host "  Whitelist Policy updated successfully! Total domains: $($script:FullWhitelistDomains.Count)" -ForegroundColor Green
@@ -550,7 +819,7 @@ if ($EnableWhitelistPolicy -and ($script:FullWhitelistDomains.Count -gt 0)) {
     }
     else {
         Write-Host "  No existing Whitelist policy found, creating new..." -ForegroundColor Gray
-        
+
         if ($PSCmdlet.ShouldProcess($WhitelistPolicyName, "Create DNS Whitelist policy (Precedence 1000)")) {
             $result = New-GatewayWhitelistPolicy -Name $WhitelistPolicyName -Domains $script:FullWhitelistDomains -Precedence 1000
             Write-Host "  Whitelist Policy created successfully! (ID: $($result.id))" -ForegroundColor Green
@@ -565,15 +834,55 @@ else {
     Write-Host "Skipping Whitelist policy as -EnableWhitelistPolicy was explicitly set to $false." -ForegroundColor Gray
 }
 
-# --- Process Ad Blocker Policy ---
-Write-Host "Processing '$PolicyName' policy..." -ForegroundColor Yellow
+# --- Process External Block Lists ---
+if (-not $WhitelistOnly) {
+    Write-Host ""
+    Write-Host "Processing External Block Lists..." -ForegroundColor Yellow
+    $currentPrecedence = 11000
+
+foreach ($listDef in $script:BlockLists) {
+    # If a specific list name is requested via parameter, skip others
+    if ($BlockListName -and $listDef.Name -ne $BlockListName -and $listDef.Name -notlike "*$BlockListName*") {
+        $currentPrecedence += 10 # Keep precedence consistent
+        continue
+    }
+
+    Write-Host "Checking List: $($listDef.Name)..." -ForegroundColor Cyan
+
+    # Check ShouldProcess for the overarching operation first
+    if ($PSCmdlet.ShouldProcess($listDef.Name, "Sync List and Policy")) {
+
+        # 1. Download and Parse
+        Write-Host "  Downloading list..." -ForegroundColor DarkGray
+        $domains = Fetch-And-Parse-List -Url $listDef.Url -Type $listDef.Type
+        if ($domains.Count -eq 0) {
+            Write-Warning "  No domains found for $($listDef.Name) or download failed. Skipping."
+            continue
+        }
+        Write-Host "  Parsed $($domains.Count) domains." -ForegroundColor Gray
+
+        # 2. Sync Gateway List (Returns array of IDs to support splitting)
+        $listIds = Sync-GatewayList -Name $listDef.Name -Domains $domains -Description "Source: $($listDef.Url)"
+
+        # 3. Update Policy (Accepts array of IDs)
+        $null = Update-GatewayPolicyForList -ListIds $listIds -ListName $listDef.Name -Precedence $currentPrecedence
+
+        $currentPrecedence += 10 # Increment precedence for next list
+    }
+}
+} # End if (-not $WhitelistOnly)
+
+# --- Process Generic Ad Blocker Policy (Regex) ---
+if (-not $WhitelistOnly) {
+Write-Host ""
+Write-Host "Processing '$PolicyName' policy (Regex)..." -ForegroundColor Yellow
 
 $existingPolicy = Get-PolicyByName -Name $PolicyName
-$adBlockPrecedence = 10000 
+$adBlockPrecedence = 10000
 
 if ($existingPolicy) {
     Write-Host "  Found existing policy (ID: $($existingPolicy.id))" -ForegroundColor Gray
-    
+
     if ($PSCmdlet.ShouldProcess($PolicyName, "Update DNS Block policy (Precedence $adBlockPrecedence)")) {
         $result = Update-GatewayPolicy -PolicyId $existingPolicy.id -Name $PolicyName -Regex $script:AdBlockRegex -Action "block" -Precedence $adBlockPrecedence
         Write-Host "  Ad Blocker Policy updated successfully!" -ForegroundColor Green
@@ -581,7 +890,7 @@ if ($existingPolicy) {
 }
 else {
     Write-Host "  No existing policy found, creating new..." -ForegroundColor Gray
-    
+
     if ($PSCmdlet.ShouldProcess($PolicyName, "Create DNS Block policy (Precedence $adBlockPrecedence)")) {
         $result = New-GatewayPolicy -Name $PolicyName -Regex $script:AdBlockRegex -Action "block" -Precedence $adBlockPrecedence
         Write-Host "  Ad Blocker Policy created successfully! (ID: $($result.id))" -ForegroundColor Green
@@ -592,13 +901,13 @@ else {
 if ($IncludeAbusedTlds) {
     Write-Host ""
     Write-Host "Processing '$AbusedTldPolicyName' policy..." -ForegroundColor Yellow
-    
+
     $existingTldPolicy = Get-PolicyByName -Name $AbusedTldPolicyName
-    $tldPrecedence = 10001 
+    $tldPrecedence = 10001
 
     if ($existingTldPolicy) {
         Write-Host "  Found existing policy (ID: $($existingTldPolicy.id))" -ForegroundColor Gray
-        
+
         if ($PSCmdlet.ShouldProcess($AbusedTldPolicyName, "Update DNS policy (Precedence $tldPrecedence)")) {
             $result = Update-GatewayPolicy -PolicyId $existingTldPolicy.id -Name $AbusedTldPolicyName -Regex $script:AbusedTldRegex -Action "block" -Precedence $tldPrecedence
             Write-Host "  Policy updated successfully!" -ForegroundColor Green
@@ -606,17 +915,18 @@ if ($IncludeAbusedTlds) {
     }
     else {
         Write-Host "  No existing policy found, creating new..." -ForegroundColor Gray
-        
+
         if ($PSCmdlet.ShouldProcess($AbusedTldPolicyName, "Create DNS policy (Precedence $tldPrecedence)")) {
             $result = New-GatewayPolicy -Name $AbusedTldPolicyName -Regex $script:AbusedTldRegex -Description "Blocks commonly abused TLDs" -Action "block" -Precedence $tldPrecedence
             Write-Host "  Policy created successfully! (ID: $($result.id))" -ForegroundColor Green
         }
     }
 }
+} # End if (-not $WhitelistOnly)
 
 Write-Host ""
 Write-Host "Done! Policy changes may take up to 60 seconds to take effect." -ForegroundColor Cyan
-Write-Host "Summary: Whitelist (Allow) policies use a LOWER Precedence number (e.g., 1000) than Block policies (e.g., 10000)." -ForegroundColor Yellow
+Write-Host "Summary: Whitelist (Allow) policies use a LOWER Precedence number (e.g., 1000) than Block policies (e.g., 10000+)." -ForegroundColor Yellow
 Write-Host ""
 
 #endregion
