@@ -1789,6 +1789,265 @@ function Show-DirectUserDialog {
     }
 }
 
+function Test-InfoDialogsSuppressed {
+    <#
+    .SYNOPSIS
+        Checks if informational upgrade dialogs are suppressed for today
+    .OUTPUTS
+        Boolean - $true if suppressed
+    #>
+    try {
+        $userInfo = Get-InteractiveUser
+        if (-not $userInfo) { return $false }
+        $suppressFile = "C:\Users\$($userInfo.Username)\AppData\Local\Temp\SuppressInfoDialogs_$(Get-Date -Format 'yyyy-MM-dd').flag"
+        return (Test-Path $suppressFile)
+    } catch {
+        return $false
+    }
+}
+
+function Show-UpgradeProgressNotification {
+    <#
+    .SYNOPSIS
+        Shows a non-blocking informational progress dialog during silent upgrades
+    .DESCRIPTION
+        Launches a WPF progress dialog as a scheduled task in user context.
+        The dialog polls for a signal file and updates when the upgrade completes.
+        Returns the signal file path immediately without blocking.
+    .PARAMETER AppName
+        Application ID
+    .PARAMETER FriendlyName
+        User-friendly display name
+    .PARAMETER CurrentVersion
+        Current installed version
+    .PARAMETER AvailableVersion
+        Available version for update
+    .OUTPUTS
+        String - path to signal file, or $null on failure
+    #>
+    param(
+        [string]$AppName,
+        [string]$FriendlyName = "",
+        [string]$CurrentVersion = "",
+        [string]$AvailableVersion = ""
+    )
+
+    try {
+        $displayName = if (-not [string]::IsNullOrEmpty($FriendlyName)) { $FriendlyName } else { $AppName }
+        $versionText = ""
+        if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
+            $versionText = "$CurrentVersion &#x2192; $AvailableVersion"
+        }
+
+        Write-Log "Showing informational progress dialog for $displayName" | Out-Null
+
+        $userInfo = Get-InteractiveUser
+        if (-not $userInfo) {
+            Write-Log "No interactive user for progress notification" | Out-Null
+            return $null
+        }
+
+        $progressId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
+        $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
+        $signalFile = Join-Path $userTempPath "UpgradeProgress_$progressId`_Signal.json"
+        $scriptPath = Join-Path $userTempPath "Show-UpgradeProgress_$progressId.ps1"
+
+        # Escape for XAML
+        $escapedName = [System.Security.SecurityElement]::Escape($displayName)
+
+        $scriptContent = @'
+param(
+    [string]$SignalFilePath,
+    [string]$AppDisplayName,
+    [string]$VersionInfo
+)
+
+$logPath = Join-Path $env:TEMP "UpgradeProgress_Debug.log"
+function Write-ProgLog {
+    param([string]$Message)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    "[$ts] $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+
+try {
+    Write-ProgLog "=== UPGRADE PROGRESS DIALOG STARTED ==="
+    Write-ProgLog "AppDisplayName: $AppDisplayName, VersionInfo: $VersionInfo"
+    Write-ProgLog "SignalFilePath: $SignalFilePath"
+
+    # Detect system theme
+    $isDark = $true
+    try {
+        $themeKey = Get-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -ErrorAction Stop
+        $isDark = $themeKey.AppsUseLightTheme -eq 0
+    } catch { }
+
+    if ($isDark) {
+        $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $textColor = "#FFCCCCCC"
+        $shadowOpacity = "0.6"; $closeBtnFg = "#FF888888"
+    } else {
+        $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $textColor = "#FF1B1B1B"
+        $shadowOpacity = "0.25"; $closeBtnFg = "#FF999999"
+    }
+
+    Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+    Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+    Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+
+    $screen = [System.Windows.Forms.Screen]::PrimaryScreen
+    $workArea = $screen.WorkingArea
+
+    $escapedAppName = [System.Security.SecurityElement]::Escape($AppDisplayName)
+    $versionXml = ""
+    if ($VersionInfo) {
+        $versionXml = "<TextBlock Text=`"$VersionInfo`" Foreground=`"#FF888888`" FontSize=`"11`" Margin=`"0,0,0,4`"/>"
+    }
+
+    $xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Updating $escapedAppName" Width="420" MinHeight="120" SizeToContent="Height" WindowStartupLocation="Manual"
+        ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
+    <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
+        <Border.Effect>
+            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/>
+        </Border.Effect>
+        <Grid>
+            <Grid Margin="20,16,20,16">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Name="TitleText" Text="Updating $escapedAppName..." Foreground="$textColor" FontSize="13" FontWeight="SemiBold" Margin="0,0,24,4"/>
+                $versionXml
+                <ProgressBar Grid.Row="2" Name="ProgressBar" IsIndeterminate="True" Height="3" Margin="0,8,0,6" Foreground="#FF0078D4"/>
+                <TextBlock Grid.Row="3" Name="StatusText" Text="Installing update..." Foreground="#FF888888" FontSize="11" HorizontalAlignment="Center"/>
+            </Grid>
+            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0" Background="Transparent" Foreground="$closeBtnFg" BorderThickness="0" FontSize="13" Cursor="Hand" FontFamily="Segoe UI Symbol"/>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+    $window = [Windows.Markup.XamlReader]::Load($reader)
+    $window.Left = $workArea.Right - 440
+    $window.Top = $workArea.Bottom - 160
+
+    # Close button: suppress info dialogs for today and close
+    $closeButton = $window.FindName("CloseButton")
+    if ($closeButton) {
+        $closeButton.Add_Click({
+            Write-ProgLog "Close button clicked - suppressing info dialogs for today"
+            $suppressFile = Join-Path $env:TEMP "SuppressInfoDialogs_$(Get-Date -Format 'yyyy-MM-dd').flag"
+            "suppressed" | Out-File -FilePath $suppressFile -Encoding UTF8
+            $window.Close()
+        })
+    }
+
+    # Poll for signal file
+    $script:progressStartTime = Get-Date
+    $script:pollTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $script:pollTimer.Interval = [TimeSpan]::FromSeconds(2)
+    $script:pollTimer.Add_Tick({
+        if (Test-Path $SignalFilePath) {
+            $script:pollTimer.Stop()
+            Write-ProgLog "Signal received"
+            try {
+                $signalData = Get-Content $SignalFilePath -Raw | ConvertFrom-Json
+                $pBar = $window.FindName("ProgressBar")
+                $sText = $window.FindName("StatusText")
+                $pBar.IsIndeterminate = $false
+                $pBar.Value = 100
+                if ($signalData.Success -eq $true) {
+                    $sText.Text = "Update complete!"
+                } else {
+                    $sText.Text = "Update could not be completed."
+                }
+                # Hide close button during completion display
+                $window.FindName("CloseButton").Visibility = [System.Windows.Visibility]::Collapsed
+            } catch {
+                Write-ProgLog "Error reading signal: $($_.Exception.Message)"
+                $window.FindName("StatusText").Text = "Update complete!"
+            }
+            $script:closeTimer = [System.Windows.Threading.DispatcherTimer]::new()
+            $script:closeTimer.Interval = [TimeSpan]::FromSeconds(3)
+            $script:closeTimer.Add_Tick({
+                $script:closeTimer.Stop()
+                $window.Close()
+            })
+            $script:closeTimer.Start()
+        } elseif (((Get-Date) - $script:progressStartTime).TotalMinutes -gt 5) {
+            $script:pollTimer.Stop()
+            Write-ProgLog "Timeout - closing"
+            $window.Close()
+        }
+    })
+    $script:pollTimer.Start()
+
+    Write-ProgLog "Showing dialog..."
+    $window.Activate()
+    $window.ShowDialog() | Out-Null
+    Write-ProgLog "Dialog closed"
+
+} catch {
+    Write-ProgLog "ERROR: $($_.Exception.Message)"
+}
+Write-ProgLog "=== UPGRADE PROGRESS DIALOG ENDED ==="
+'@
+
+        $scriptContent | Set-Content -Path $scriptPath -Encoding UTF8
+
+        # Build args with encoded display name to avoid quoting issues
+        $encodedName = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($escapedName))
+        $psArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -SignalFilePath `"$signalFile`" -AppDisplayName `"$displayName`" -VersionInfo `"$versionText`""
+        $launch = New-HiddenLaunchAction -PowerShellArguments $psArgs -VbsDirectory $userTempPath -AllowUI
+        if ($launch) {
+            $action = $launch.Action
+        } else {
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -SignalFilePath `"$signalFile`" -AppDisplayName `"$displayName`" -VersionInfo `"$versionText`""
+        }
+
+        $principal = $null
+        foreach ($userFormat in @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")) {
+            try {
+                $principal = New-ScheduledTaskPrincipal -UserId $userFormat -LogonType Interactive -RunLevel Limited
+                break
+            } catch { continue }
+        }
+
+        if ($principal) {
+            $taskName = "UpgradeProgress_$progressId"
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+            $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings
+            Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+            Start-ScheduledTask -TaskName $taskName
+            Write-Log "Launched informational progress dialog (task: $taskName)" | Out-Null
+
+            # Don't block - return signal file path immediately
+            # Cleanup will happen after upgrade completes (caller writes signal, dialog closes)
+            # Schedule async cleanup after a generous timeout
+            Start-Job -ScriptBlock {
+                param($tn, $sp, $vp)
+                Start-Sleep -Seconds 330  # 5.5 min - after dialog's 5-min timeout
+                Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+                Remove-Item $sp -Force -ErrorAction SilentlyContinue
+                if ($vp) { Remove-Item $vp -Force -ErrorAction SilentlyContinue }
+            } -ArgumentList $taskName, $scriptPath, $launch.VbsPath | Out-Null
+
+            return $signalFile
+        } else {
+            Write-Log "Could not create principal for progress notification" | Out-Null
+            return $null
+        }
+
+    } catch {
+        Write-Log "Error in Show-UpgradeProgressNotification: $($_.Exception.Message)" | Out-Null
+        return $null
+    }
+}
+
 function Show-CompletionNotification {
     <#
     .SYNOPSIS
@@ -6085,6 +6344,17 @@ if ($OUTPUT) {
 
                 if ($doUpgrade) {
                     $count++
+                    $infoSignalFile = $null
+
+                    # Show informational progress dialog for silent upgrades (no blocking dialog was shown)
+                    if (-not $dialogResult -and (Test-RunningAsSystem)) {
+                        if (-not (Test-InfoDialogsSuppressed)) {
+                            $infoSignalFile = Show-UpgradeProgressNotification -AppName $okapp.AppID -FriendlyName $okapp.FriendlyName -CurrentVersion $appInfo.CurrentVersion -AvailableVersion $appInfo.AvailableVersion
+                        } else {
+                            Write-Log -Message "Informational dialogs suppressed for today" | Out-Null
+                        }
+                    }
+
                     Write-Log -Message "Starting upgrade for: $($appInfo.AppID)"
 
                     try {
@@ -6189,9 +6459,13 @@ if ($OUTPUT) {
                             $message += "$($appInfo.AppID)|"
 
                             if ($dialogResult -and $dialogResult.ProgressSignalFile) {
-                                # Signal the still-open progress dialog that upgrade is complete
+                                # Signal the deferral dialog's progress mode
                                 @{ Success = $true; Message = "Update complete" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
                                 Write-Log -Message "Wrote completion signal to progress dialog"
+                            } elseif ($infoSignalFile) {
+                                # Signal the informational progress dialog
+                                @{ Success = $true; Message = "Update complete" } | ConvertTo-Json | Out-File -FilePath $infoSignalFile -Encoding UTF8
+                                Write-Log -Message "Signaled informational progress dialog"
                             } elseif (($dialogResult -and ($dialogResult.CloseProcess -or $dialogResult.UserChoice)) -or ($Script:TestMode -and $appInfo.AppID -eq "Test.DemoApp")) {
                                 # Fallback: show separate completion notification
                                 Show-CompletionNotification -AppName $okapp.AppID -FriendlyName $okapp.FriendlyName
@@ -6202,6 +6476,9 @@ if ($OUTPUT) {
                             if ($dialogResult -and $dialogResult.ProgressSignalFile) {
                                 @{ Success = $false; Message = "Update failed" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
                                 Write-Log -Message "Wrote failure signal to progress dialog"
+                            } elseif ($infoSignalFile) {
+                                @{ Success = $false; Message = "Update failed" } | ConvertTo-Json | Out-File -FilePath $infoSignalFile -Encoding UTF8
+                                Write-Log -Message "Signaled informational progress dialog (failure)"
                             }
                         }
                     } catch {
@@ -6209,6 +6486,8 @@ if ($OUTPUT) {
                         $message += "$($appInfo.AppID) (ERROR)|"
                         if ($dialogResult -and $dialogResult.ProgressSignalFile) {
                             @{ Success = $false; Message = "Update error" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                        } elseif ($infoSignalFile) {
+                            @{ Success = $false; Message = "Update error" } | ConvertTo-Json | Out-File -FilePath $infoSignalFile -Encoding UTF8
                         }
                     }
                 }
