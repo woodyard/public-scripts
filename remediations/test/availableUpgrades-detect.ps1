@@ -1099,6 +1099,7 @@ function Invoke-UserContextDetection {
 }
 
 <# Script variables #>
+$Script:TestMode = $true  # TEST MODE: Simulate finding an app update to trigger remediation
 $ScriptTag = "5C" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
@@ -1628,7 +1629,15 @@ if ($OUTPUT) {
             # SYSTEM context main execution - check system apps first, only run user detection if none found
             $systemApps = $contextApps
             # Write-Log -Message "System detection found $($systemApps.Count) apps: $($systemApps -join ', ')"
-            
+
+            # TEST MODE: Simulate finding an app that needs updating
+            if ($Script:TestMode) {
+                Write-Log -Message "TEST MODE: Simulating detected upgrade for Test.DemoApp"
+                Write-Log -Message "[$ScriptTag] Test.DemoApp"
+                Invoke-MarkerFileEmergencyCleanup -Reason "Test mode - simulated detection"
+                exit 1
+            }
+
             # PERFORMANCE OPTIMIZATION: Exit immediately if system apps are found
             if ($systemApps.Count -gt 0) {
                 Write-Log -Message "[$ScriptTag] $($systemApps -join ', ')"

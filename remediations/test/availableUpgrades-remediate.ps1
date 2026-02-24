@@ -4850,6 +4850,7 @@ function Invoke-MarkerFileEmergencyCleanup {
 # ============================================================================
 
 <# Script variables #>
+$Script:TestMode = $true  # TEST MODE: Simulate app update with dialogs and notifications
 $ScriptTag = "8X" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
@@ -5103,6 +5104,30 @@ try {
     Write-Log -Message "Performing marker file cleanup before exit due to whitelist error"
     Invoke-MarkerFileEmergencyCleanup -Reason "Whitelist parsing error"
     exit 1
+}
+
+# TEST MODE: Add a fake test app to the whitelist for simulating the full update flow
+if ($Script:TestMode) {
+    $testApp = [PSCustomObject]@{
+        AppID = "Test.DemoApp"
+        FriendlyName = "Demo Application"
+        SystemContext = $true
+        UserContext = $false
+        BlockingProcess = "notepad"
+        PromptWhenBlocked = $true
+        DefaultTimeoutAction = $false
+        TimeoutSeconds = 120
+        DeferralEnabled = $true
+        MaxDeferralDays = 5
+        DeferralOptions = @(
+            [PSCustomObject]@{ Days = 1; Label = "1 day" },
+            [PSCustomObject]@{ Days = 3; Label = "3 days" },
+            [PSCustomObject]@{ Days = 5; Label = "5 days" }
+        )
+        ForcedUpgradeMessage = "This is a test update that can no longer be deferred."
+    }
+    $whitelistConfig = @($whitelistConfig) + @($testApp)
+    Write-Log -Message "TEST MODE: Added Test.DemoApp to whitelist (blocking process: notepad)"
 }
 
 # Main remediation logic - dual-context architecture
@@ -5540,6 +5565,16 @@ if (Test-RunningAsSystem) {
     }
 }
 
+# TEST MODE: Replace winget output with simulated upgrade data
+if ($Script:TestMode) {
+    Write-Log -Message "TEST MODE: Injecting simulated winget output for Test.DemoApp (1.0.0 -> 2.0.0)"
+    $OUTPUT = @(
+        "Name              Id                Version   Available  Source",
+        "----------------------------------------------------------------",
+        "Demo Application  Test.DemoApp      1.0.0     2.0.0      winget"
+    )
+}
+
 # Parse winget output and process apps
 Write-Log -Message "Starting winget output parsing..."
 $parsingStart = Get-Date
@@ -5790,10 +5825,17 @@ if ($OUTPUT) {
                 if ($doUpgrade) {
                     $count++
                     Write-Log -Message "Starting upgrade for: $($appInfo.AppID)"
-                    
+
                     try {
+                        # TEST MODE: Simulate upgrade instead of running winget
+                        if ($Script:TestMode -and $appInfo.AppID -eq "Test.DemoApp") {
+                            Write-Log -Message "TEST MODE: Simulating upgrade for $($appInfo.AppID) (1.0.0 -> 2.0.0)"
+                            Start-Sleep -Seconds 3
+                            $upgradeOutput = "Successfully installed"
+                            Write-Log -Message "TEST MODE: Simulated upgrade completed"
+                        } else {
                         Write-Log -Message "Executing winget upgrade for: $($appInfo.AppID)"
-                        
+
                         # First attempt: Standard upgrade - use appropriate winget path and scope based on context
                         if ((Test-RunningAsSystem) -and $WingetPath) {
                             $upgradeResult = & .\winget.exe upgrade --silent --accept-source-agreements --id $appInfo.AppID 2>&1
@@ -5804,7 +5846,7 @@ if ($OUTPUT) {
                             Write-Log -Message "Using --scope user for non-admin user context upgrade"
                             $upgradeResult = & winget upgrade --silent --accept-source-agreements --scope user --id $appInfo.AppID 2>&1
                         }
-                        
+
                         $upgradeOutput = $upgradeResult -join "`n"
                         # Extract meaningful lines from winget output for logging
                         $meaningfulLines = @()
@@ -5878,14 +5920,15 @@ if ($OUTPUT) {
                             $upgradeOutput = $upgradeResult -join "`n"
                             Write-Log -Message "Force install completed for $($appInfo.AppID)"
                         }
-                        
+                        } # end else (non-test mode winget upgrade)
+
                         # Evaluate success
                         if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*") {
                             Write-Log -Message "Upgrade completed successfully for: $($appInfo.AppID)"
                             $message += "$($appInfo.AppID)|"
 
-                            # Show completion notification if user was prompted to close a process
-                            if ($dialogResult -and ($dialogResult.CloseProcess -or $dialogResult.UserChoice)) {
+                            # Show completion notification if user was prompted to close a process (or always in test mode)
+                            if (($dialogResult -and ($dialogResult.CloseProcess -or $dialogResult.UserChoice)) -or ($Script:TestMode -and $appInfo.AppID -eq "Test.DemoApp")) {
                                 Show-CompletionNotification -AppName $okapp.AppID -FriendlyName $okapp.FriendlyName
                             }
                         } else {
@@ -5901,9 +5944,11 @@ if ($OUTPUT) {
         }
 
         # If we're in SYSTEM context and processed system apps, check for interactive session before scheduling user context
-        if ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
+        if ($Script:TestMode) {
+            Write-Log -Message "TEST MODE: Skipping user context remediation scheduling (test app is system-only)"
+        } elseif ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
             Write-Log -Message "SYSTEM context processing complete - checking for interactive session"
-            
+
             if (-not (Test-InteractiveSession)) {
                 Write-Log -Message "No interactive session detected - skipping user context remediation"
                 Write-Log -Message "[$ScriptTag] Remediation completed: $count apps processed (system only, no interactive session)"
