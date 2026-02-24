@@ -6484,7 +6484,7 @@ if ($OUTPUT) {
                         
                         # Determine if we can perform the upgrade based on context
                         if ((Test-RunningAsSystem) -or $userIsAdmin) {
-                            Write-Log -Message "Upgrade $($okapp.AppID) in system/admin context"
+                            Write-Log -Message "Upgrade $($okapp.AppID) in $(if (Test-RunningAsSystem) { 'SYSTEM' } else { 'admin user' }) context"
                             $doUpgrade = $true
                             break  # Break out of whitelist loop to proceed with upgrade
                         } elseif (-not (Test-RunningAsSystem)) {
@@ -6635,7 +6635,7 @@ if ($OUTPUT) {
                             }
                         } else {
                             # Log full output for debugging (filter out progress bar characters)
-                            $debugLines = ($upgradeResult | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne "" -and $_ -notmatch '^[\x{2588}\x{2592}\x{2591}\x{2580}-\x{259F}\s\|/\\-]+$' }) -join " | "
+                            $debugLines = ($upgradeResult | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne "" -and $_ -notmatch '^[\u2580-\u259F\s\|/\\-]+$' }) -join " | "
                             Write-Log -Message "Upgrade failed for $($appInfo.AppID) - Exit code: $LASTEXITCODE - Output: $debugLines"
                             $message += "$($appInfo.AppID) (FAILED)|"
                             if ($dialogResult -and $dialogResult.ProgressSignalFile) {
