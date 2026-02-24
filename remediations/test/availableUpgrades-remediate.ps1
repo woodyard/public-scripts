@@ -186,7 +186,9 @@ function New-HiddenLaunchAction {
         [string]$PowerShellArguments,
 
         [Parameter(Mandatory=$true)]
-        [string]$VbsDirectory
+        [string]$VbsDirectory,
+
+        [switch]$AllowUI
     )
 
     try {
@@ -197,9 +199,13 @@ function New-HiddenLaunchAction {
 
         $vbsPath = Join-Path $VbsDirectory "HiddenLaunch_$(Get-Random).vbs"
 
+        # Window style: 0 = SW_HIDE (background tasks), 1 = SW_SHOWNORMAL (allows WPF dialogs to display)
+        # PowerShell's -WindowStyle Hidden still hides the console; style 1 just allows WPF windows to appear
+        $windowStyle = if ($AllowUI) { 1 } else { 0 }
+
         # Escape double quotes for VBS string (VBS uses "" to escape quotes)
         $escapedArgs = $PowerShellArguments.Replace('"', '""')
-        $vbsContent = "CreateObject(""WScript.Shell"").Run ""$escapedArgs"", 0, True"
+        $vbsContent = "CreateObject(""WScript.Shell"").Run ""$escapedArgs"", $windowStyle, True"
 
         $vbsContent | Out-File -FilePath $vbsPath -Encoding ASCII -Force
 
@@ -471,7 +477,7 @@ function New-UserPromptTask {
         # Create hidden launch action using VBS wrapper (no console window flash)
         $psArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`" -Position `"BottomRight`" -TimeoutSeconds $TimeoutSeconds -DebugMode"
         $vbsDir = Split-Path $ResponseFile -Parent
-        $launch = New-HiddenLaunchAction -PowerShellArguments $psArgs -VbsDirectory $vbsDir
+        $launch = New-HiddenLaunchAction -PowerShellArguments $psArgs -VbsDirectory $vbsDir -AllowUI
         if (-not $launch) {
             Write-Log "ERROR: Failed to create hidden launch action - falling back to direct PowerShell" | Out-Null
             $launch = @{
@@ -585,7 +591,7 @@ function New-UserPromptTask {
                     
                     # Create hidden launch action for Azure AD fallback using VBS wrapper
                     $fallbackPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`""
-                    $fallbackLaunch = New-HiddenLaunchAction -PowerShellArguments $fallbackPsArgs -VbsDirectory $vbsDir
+                    $fallbackLaunch = New-HiddenLaunchAction -PowerShellArguments $fallbackPsArgs -VbsDirectory $vbsDir -AllowUI
                     if ($fallbackLaunch) {
                         $fallbackAction = $fallbackLaunch.Action
                     } else {
@@ -2661,7 +2667,7 @@ $countdownTimer.Stop()
         # Create hidden launch action using VBS wrapper (no console window flash)
         $mandatoryPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$mandatoryScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -TimeoutSeconds $TimeoutSeconds"
         $mandatoryVbsDir = Split-Path $responseFile -Parent
-        $mandatoryLaunch = New-HiddenLaunchAction -PowerShellArguments $mandatoryPsArgs -VbsDirectory $mandatoryVbsDir
+        $mandatoryLaunch = New-HiddenLaunchAction -PowerShellArguments $mandatoryPsArgs -VbsDirectory $mandatoryVbsDir -AllowUI
         if ($mandatoryLaunch) {
             $action = $mandatoryLaunch.Action
         } else {
@@ -3737,7 +3743,7 @@ $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding
         # Create hidden launch action using VBS wrapper (no console window flash)
         $deferralPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -DeferralOptionsJson `"$deferralOptionsJson`" -HasBlockingProcess $$HasBlockingProcess -TimeoutSeconds $TimeoutSeconds"
         $deferralVbsDir = Split-Path $responseFile -Parent
-        $deferralLaunch = New-HiddenLaunchAction -PowerShellArguments $deferralPsArgs -VbsDirectory $deferralVbsDir
+        $deferralLaunch = New-HiddenLaunchAction -PowerShellArguments $deferralPsArgs -VbsDirectory $deferralVbsDir -AllowUI
         if ($deferralLaunch) {
             $action = $deferralLaunch.Action
         } else {
