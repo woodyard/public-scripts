@@ -1993,14 +1993,32 @@ function Invoke-SystemCompletionNotification {
         $notificationScriptContent = @"
 param([string]`$AppName)
 
-Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName PresentationCore
-Add-Type -AssemblyName WindowsBase
-Add-Type -AssemblyName System.Windows.Forms
+`$logPath = Join-Path `$env:TEMP "CompletionNotification_Debug.log"
+function Write-NotifLog {
+    param([string]`$Message)
+    `$ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    "[`$ts] `$Message" | Out-File -FilePath `$logPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+}
 
-`$messageText = "`$AppName has been successfully updated."
+try {
+    Write-NotifLog "=== COMPLETION NOTIFICATION STARTED ==="
+    Write-NotifLog "AppName: `$AppName"
+    Write-NotifLog "PID: `$PID, User: `$env:USERNAME"
+    Write-NotifLog "ApartmentState: `$([System.Threading.Thread]::CurrentThread.GetApartmentState())"
 
-`$xaml = @`"
+    Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+    Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+    Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Write-NotifLog "WPF assemblies loaded"
+
+    `$screen = [System.Windows.Forms.Screen]::PrimaryScreen
+    `$workArea = `$screen.WorkingArea
+    Write-NotifLog "Screen: `$(`$workArea.Width)x`$(`$workArea.Height)"
+
+    `$messageText = "`$AppName has been successfully updated."
+
+    `$xaml = @`"
 <Window
     xmlns=`"http://schemas.microsoft.com/winfx/2006/xaml/presentation`"
     xmlns:x=`"http://schemas.microsoft.com/winfx/2006/xaml`"
@@ -2015,19 +2033,6 @@ Add-Type -AssemblyName System.Windows.Forms
     Background=`"Transparent`"
     Topmost=`"True`"
     ShowInTaskbar=`"False`">
-
-    <Window.Triggers>
-        <EventTrigger RoutedEvent=`"Window.Loaded`">
-            <BeginStoryboard>
-                <Storyboard>
-                    <DoubleAnimation Storyboard.TargetProperty=`"Opacity`"
-                                     From=`"0`" To=`"1`" Duration=`"0:0:0.3`"/>
-                    <ThicknessAnimation Storyboard.TargetProperty=`"Margin`"
-                                        From=`"0,50,0,0`" To=`"0,0,0,0`" Duration=`"0:0:0.3`"/>
-                </Storyboard>
-            </BeginStoryboard>
-        </EventTrigger>
-    </Window.Triggers>
 
     <Border Name=`"MainBorder`"
             Background=`"#FF1F1F1F`"
@@ -2049,7 +2054,6 @@ Add-Type -AssemblyName System.Windows.Forms
                 <RowDefinition Height=`"Auto`"/>
             </Grid.RowDefinitions>
 
-            <!-- Icon (info/success indicator) -->
             <Ellipse Grid.Column=`"0`" Grid.RowSpan=`"2`"
                      Width=`"24`" Height=`"24`"
                      Fill=`"#FF107C10`"
@@ -2066,7 +2070,6 @@ Add-Type -AssemblyName System.Windows.Forms
                   VerticalAlignment=`"Top`"
                   Margin=`"0,7,0,0`"/>
 
-            <!-- Title -->
             <TextBlock Grid.Column=`"1`" Grid.Row=`"0`"
                        Text=`"Update Complete`"
                        Foreground=`"White`"
@@ -2075,7 +2078,6 @@ Add-Type -AssemblyName System.Windows.Forms
                        Margin=`"12,0,0,2`"
                        TextWrapping=`"Wrap`"/>
 
-            <!-- Message -->
             <TextBlock Grid.Column=`"1`" Grid.Row=`"1`"
                        Text=`"`$messageText`"
                        Foreground=`"#FFCCCCCC`"
@@ -2083,14 +2085,13 @@ Add-Type -AssemblyName System.Windows.Forms
                        Margin=`"12,0,0,8`"
                        TextWrapping=`"Wrap`"/>
 
-            <!-- Countdown -->
             <TextBlock Grid.Column=`"1`" Grid.Row=`"2`"
                        Foreground=`"#FF888888`"
                        FontSize=`"11`"
                        Margin=`"12,4,0,0`"
                        HorizontalAlignment=`"Right`">
                 <Run Text=`"Closing in `"/>
-                <Run Name=`"CountdownText`" Text=`"5`"/>
+                <Run Name=`"CountdownText`" Text=`"8`"/>
                 <Run Text=`"s`"/>
             </TextBlock>
         </Grid>
@@ -2098,31 +2099,41 @@ Add-Type -AssemblyName System.Windows.Forms
 </Window>
 `"@
 
-`$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]`$xaml)
-`$window = [Windows.Markup.XamlReader]::Load(`$reader)
-`$countdownRun = `$window.FindName("CountdownText")
+    Write-NotifLog "XAML built, parsing..."
+    `$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new(`$xaml))
+    `$window = [Windows.Markup.XamlReader]::Load(`$reader)
+    Write-NotifLog "XAML parsed successfully"
 
-# Position window in bottom-right corner like system notifications
-`$window.Add_Loaded({
-    `$screen = [System.Windows.Forms.Screen]::PrimaryScreen
-    `$window.Left = `$screen.WorkingArea.Right - `$window.ActualWidth - 20
-    `$window.Top = `$screen.WorkingArea.Bottom - `$window.ActualHeight - 20
-})
+    `$countdownRun = `$window.FindName("CountdownText")
 
-`$script:remainingSeconds = 5
-`$timer = New-Object System.Windows.Threading.DispatcherTimer
-`$timer.Interval = [TimeSpan]::FromSeconds(1)
-`$timer.Add_Tick({
-    `$script:remainingSeconds--
-    `$countdownRun.Text = `$script:remainingSeconds.ToString()
-    if (`$script:remainingSeconds -le 0) {
-        `$timer.Stop()
-        `$window.Close()
-    }
-})
-`$timer.Start()
+    # Position bottom-right
+    `$window.Left = `$workArea.Right - 440
+    `$window.Top = `$workArea.Bottom - 180
+    Write-NotifLog "Window positioned at Left=`$(`$window.Left), Top=`$(`$window.Top)"
 
-`$window.ShowDialog() | Out-Null
+    `$script:remainingSeconds = 8
+    `$timer = New-Object System.Windows.Threading.DispatcherTimer
+    `$timer.Interval = [TimeSpan]::FromSeconds(1)
+    `$timer.Add_Tick({
+        `$script:remainingSeconds--
+        `$countdownRun.Text = `$script:remainingSeconds.ToString()
+        if (`$script:remainingSeconds -le 0) {
+            `$timer.Stop()
+            `$window.Close()
+        }
+    })
+    `$timer.Start()
+
+    Write-NotifLog "Showing notification..."
+    `$window.Activate()
+    `$window.ShowDialog() | Out-Null
+    Write-NotifLog "Notification closed"
+
+} catch {
+    Write-NotifLog "FATAL ERROR: `$(`$_.Exception.Message)"
+    Write-NotifLog "Stack trace: `$(`$_.ScriptStackTrace)"
+}
+Write-NotifLog "=== COMPLETION NOTIFICATION ENDED ==="
 "@
 
         $notificationScriptContent | Out-File -FilePath $notificationScriptPath -Encoding UTF8 -Force
@@ -2155,8 +2166,8 @@ Add-Type -AssemblyName System.Windows.Forms
             Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
             Start-ScheduledTask -TaskName $taskName
 
-            # Schedule cleanup of task and script
-            Start-Sleep -Seconds 10
+            # Wait for notification to finish (8s countdown + startup buffer)
+            Start-Sleep -Seconds 15
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
             Remove-Item $notificationScriptPath -Force -ErrorAction SilentlyContinue
             if ($notifLaunch -and $notifLaunch.VbsPath) {
