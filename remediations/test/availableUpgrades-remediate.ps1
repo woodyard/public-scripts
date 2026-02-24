@@ -199,9 +199,9 @@ function New-HiddenLaunchAction {
 
         $vbsPath = Join-Path $VbsDirectory "HiddenLaunch_$(Get-Random).vbs"
 
-        # Window style: 0 = SW_HIDE (background tasks), 1 = SW_SHOWNORMAL (allows WPF dialogs to display)
-        # PowerShell's -WindowStyle Hidden still hides the console; style 1 just allows WPF windows to appear
-        $windowStyle = if ($AllowUI) { 1 } else { 0 }
+        # Always use window style 0 (SW_HIDE) to prevent console flash
+        # WPF dialogs appear independently via Topmost + Activate() regardless of console window style
+        $windowStyle = 0
 
         # Escape double quotes for VBS string (VBS uses "" to escape quotes)
         $escapedArgs = $PowerShellArguments.Replace('"', '""')
