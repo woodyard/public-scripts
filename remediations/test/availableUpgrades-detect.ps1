@@ -932,7 +932,7 @@ function Invoke-UserContextDetection {
             }
             
             # Wait for results with reduced timeout for faster detection
-            $timeout = 30  # Reduced from 60 to 30 seconds
+            $timeout = 90  # Allow time for whitelist download + winget enumeration
             $startTime = Get-Date
             $apps = @()
             
