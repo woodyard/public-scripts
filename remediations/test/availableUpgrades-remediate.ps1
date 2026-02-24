@@ -3011,13 +3011,14 @@ function Get-DeferralStatus {
                 # Find available deferral options that fit within remaining time
                 $availableOptions = @()
                 foreach ($option in $status.DeferralOptions) {
-                    # Fix type comparison error - ensure both values are integers
-                    $optionDays = if ($option -is [hashtable] -and $option.Days) {
+                    # Handle deferral options from JSON (PSCustomObject with Days/Label) or plain integers
+                    $optionDays = if ($option.Days -ne $null) {
                         [int]$option.Days
-                    } elseif ($option -is [hashtable] -and $option.Label -match '\d+') {
-                        [int]($option.Label -replace '\D+', '')
-                    } else {
+                    } elseif ($option -is [int] -or $option -is [long] -or $option -is [double]) {
                         [int]$option
+                    } else {
+                        Write-Log "WARNING: Unrecognized deferral option format: $option" | Out-Null
+                        continue
                     }
                     
                     if ($optionDays -le $daysUntilAdminDeadline) {
