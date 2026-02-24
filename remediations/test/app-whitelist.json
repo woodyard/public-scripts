@@ -445,8 +445,5 @@
         "DeferralEnabled": true,
         "MaxDeferralDays": 5,
         "ForcedUpgradeMessage": "Claude updates can no longer be deferred."
-    },
-    {
-        "AppID":"Romanitho.Winget-AutoUpdate"
     }
 ]
