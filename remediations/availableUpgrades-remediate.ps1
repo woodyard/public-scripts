@@ -166,6 +166,61 @@ function Get-ActiveUserSessions {
 }
 
 
+function New-HiddenLaunchAction {
+    <#
+    .SYNOPSIS
+        Creates a scheduled task action that launches PowerShell without any visible window flash.
+    .DESCRIPTION
+        Uses wscript.exe with a temporary VBS launcher instead of cmd.exe.
+        wscript.exe is a GUI subsystem application and never creates a console window,
+        eliminating the brief window flash that cmd.exe /c start /min causes.
+    .PARAMETER PowerShellArguments
+        The full PowerShell command-line arguments (e.g. "-NoProfile -WindowStyle Hidden -File ...")
+    .PARAMETER VbsDirectory
+        Directory where the temporary VBS launcher file will be created
+    .OUTPUTS
+        Hashtable with Action (ScheduledTaskAction) and VbsPath (for cleanup)
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$PowerShellArguments,
+
+        [Parameter(Mandatory=$true)]
+        [string]$VbsDirectory,
+
+        [switch]$AllowUI
+    )
+
+    try {
+        # Ensure directory exists
+        if (-not (Test-Path $VbsDirectory)) {
+            New-Item -Path $VbsDirectory -ItemType Directory -Force | Out-Null
+        }
+
+        $vbsPath = Join-Path $VbsDirectory "HiddenLaunch_$(Get-Random).vbs"
+
+        # Always use window style 0 (SW_HIDE) to prevent console flash
+        # WPF dialogs appear independently via Topmost + Activate() regardless of console window style
+        $windowStyle = 0
+
+        # Escape double quotes for VBS string (VBS uses "" to escape quotes)
+        $escapedArgs = $PowerShellArguments.Replace('"', '""')
+        $vbsContent = "CreateObject(""WScript.Shell"").Run ""$escapedArgs"", $windowStyle, True"
+
+        $vbsContent | Out-File -FilePath $vbsPath -Encoding ASCII -Force
+
+        Write-Log "Created VBS hidden launcher: $vbsPath" | Out-Null
+
+        return @{
+            Action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument """$vbsPath"""
+            VbsPath = $vbsPath
+        }
+    } catch {
+        Write-Log "ERROR: Failed to create hidden launch action: $($_.Exception.Message)" | Out-Null
+        return $null
+    }
+}
+
 # WPF System User Prompt Functions - Modern replacement for legacy toast notification system
 
 # Global user info cache to prevent redundant expensive CIM/WMI calls
@@ -418,14 +473,22 @@ function New-UserPromptTask {
         
         # Force PowerShell 5.1 for toast notifications - PowerShell 7 cannot access Windows Runtime in scheduled task context
         Write-Log "Forcing PowerShell 5.1 for toast notifications (PowerShell 7 has Windows Runtime limitations in scheduled task context)" | Out-Null
-        $powershellExe = "powershell.exe"
-        
-        # Use hidden console window execution method to prevent visible windows
-        $hiddenArguments = "/c start /min `"`" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`" -Position `"BottomRight`" -TimeoutSeconds $TimeoutSeconds -DebugMode"
-        
-        # Create task action using hidden console window method
-        $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $hiddenArguments
-        
+
+        # Create hidden launch action using VBS wrapper (no console window flash)
+        $psArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`" -Position `"BottomRight`" -TimeoutSeconds $TimeoutSeconds -DebugMode"
+        $vbsDir = Split-Path $ResponseFile -Parent
+        $launch = New-HiddenLaunchAction -PowerShellArguments $psArgs -VbsDirectory $vbsDir -AllowUI
+        if (-not $launch) {
+            Write-Log "ERROR: Failed to create hidden launch action - falling back to direct PowerShell" | Out-Null
+            $launch = @{
+                Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`" -Position `"BottomRight`" -TimeoutSeconds $TimeoutSeconds -DebugMode"
+                VbsPath = $null
+            }
+        }
+        $action = $launch.Action
+        # Track VBS path for cleanup by caller (Invoke-SystemUserPrompt)
+        $Script:LastCreatedVbsPath = $launch.VbsPath
+
         # Create task principal (run as interactive user) - Azure AD aware
         $principal = $null
         $username = $UserInfo.Username
@@ -526,14 +589,21 @@ function New-UserPromptTask {
                     # Create a SYSTEM principal that will launch the script and let it handle user context
                     $fallbackPrincipal = New-ScheduledTaskPrincipal -UserID "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
                     
-                    # Use hidden console window execution method for Azure AD fallback
-                    $fallbackHiddenArguments = "/c start /min `"`" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`""
-                    $fallbackAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $fallbackHiddenArguments
+                    # Create hidden launch action for Azure AD fallback using VBS wrapper
+                    $fallbackPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`""
+                    $fallbackLaunch = New-HiddenLaunchAction -PowerShellArguments $fallbackPsArgs -VbsDirectory $vbsDir -AllowUI
+                    if ($fallbackLaunch) {
+                        $fallbackAction = $fallbackLaunch.Action
+                    } else {
+                        $fallbackAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`""
+                    }
                     
                     $fallbackTask = New-ScheduledTask -Action $fallbackAction -Principal $fallbackPrincipal -Settings $settings -Description "Interactive user prompt for system operations (Azure AD SYSTEM fallback)"
                     
                     $registeredTask = Register-ScheduledTask -TaskName $taskName -InputObject $fallbackTask -Force -ErrorAction Stop
                     Write-Log "Scheduled task created successfully using Azure AD SYSTEM fallback: $taskName" | Out-Null
+                    # Update VBS tracking for fallback path
+                    if ($fallbackLaunch) { $Script:LastCreatedVbsPath = $fallbackLaunch.VbsPath }
                     return $taskName
                     
                 } catch {
@@ -724,7 +794,7 @@ function Invoke-SystemUserPrompt {
             Write-Log "Using shared temp path: $responseFile" | Out-Null
         }
         
-        $userPromptScriptPath = "$env:TEMP\Show-UserPrompt_$promptId.ps1"
+        $userPromptScriptPath = Join-Path $userTempPath "Show-UserPrompt_$promptId.ps1"
         
         # Create the user prompt script content (from the working Show-UserPrompt.ps1)
         $userPromptScriptContent = @'
@@ -1289,10 +1359,13 @@ try {
         
         # Cleanup
         Remove-UserPromptTask -TaskName $createdTaskName
-        
+
         # Clean up temporary files
         Remove-Item $userPromptScriptPath -Force -ErrorAction SilentlyContinue
         Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
+        if ($Script:LastCreatedVbsPath -and (Test-Path $Script:LastCreatedVbsPath)) {
+            Remove-Item $Script:LastCreatedVbsPath -Force -ErrorAction SilentlyContinue
+        }
         
         Write-Log "Process completed with response: $userResponse" | Out-Null
         return $userResponse
@@ -1367,10 +1440,10 @@ function Show-ProcessCloseDialog {
             $deferralChoice = Show-DeferralDialog -AppName $AppName -DeferralStatus $deferralStatus -ProcessName $ProcessName -FriendlyName $friendlyName -CurrentVersion $CurrentVersion -AvailableVersion $AvailableVersion -TimeoutSeconds $TimeoutSeconds
             
             # Record deferral choice if user chose to defer
-            if ($deferralChoice.Action -eq "Defer" -and $deferralChoice.DeferralDays -gt 0) {
-                $deferralRecorded = Set-DeferralChoice -AppID $AppName -DeferralDays $deferralChoice.DeferralDays
+            if ($deferralChoice.Action -eq "Defer") {
+                $deferralRecorded = Set-DeferralChoice -AppID $AppName -AdminHardDeadline $deferralStatus.AdminHardDeadline
                 if ($deferralRecorded) {
-                    Write-Log -Message "Recorded user deferral choice: $($deferralChoice.DeferralDays) days for $AppName" | Out-Null
+                    Write-Log -Message "Recorded user deferral for $AppName (until end of day)" | Out-Null
                 } else {
                     Write-Log -Message "Failed to record deferral choice - proceeding with update" | Out-Null
                     $deferralChoice.Action = "Update"
@@ -1384,6 +1457,7 @@ function Show-ProcessCloseDialog {
                 DeferralDays = $deferralChoice.DeferralDays
                 Action = $deferralChoice.Action
                 UserChoice = ($deferralChoice.Action -eq "Update")
+                ProgressSignalFile = $deferralChoice.ProgressSignalFile
             }
             
         } else {
@@ -1715,6 +1789,484 @@ function Show-DirectUserDialog {
     }
 }
 
+function Test-InfoDialogsSuppressed {
+    <#
+    .SYNOPSIS
+        Checks if informational upgrade dialogs are suppressed for today
+    .OUTPUTS
+        Boolean - $true if suppressed
+    #>
+    try {
+        $userInfo = Get-InteractiveUser
+        if (-not $userInfo) { return $false }
+        $suppressFile = "C:\Users\$($userInfo.Username)\AppData\Local\Temp\SuppressInfoDialogs_$(Get-Date -Format 'yyyy-MM-dd').flag"
+        return (Test-Path $suppressFile)
+    } catch {
+        return $false
+    }
+}
+
+function Show-UpgradeProgressNotification {
+    <#
+    .SYNOPSIS
+        Shows a non-blocking informational progress dialog during silent upgrades
+    .DESCRIPTION
+        Launches a WPF progress dialog as a scheduled task in user context.
+        The dialog polls for a signal file and updates when the upgrade completes.
+        Returns the signal file path immediately without blocking.
+    .PARAMETER AppName
+        Application ID
+    .PARAMETER FriendlyName
+        User-friendly display name
+    .PARAMETER CurrentVersion
+        Current installed version
+    .PARAMETER AvailableVersion
+        Available version for update
+    .OUTPUTS
+        String - path to signal file, or $null on failure
+    #>
+    param(
+        [string]$AppName,
+        [string]$FriendlyName = "",
+        [string]$CurrentVersion = "",
+        [string]$AvailableVersion = ""
+    )
+
+    try {
+        $displayName = if (-not [string]::IsNullOrEmpty($FriendlyName)) { $FriendlyName } else { $AppName }
+        $versionText = ""
+        if (-not [string]::IsNullOrEmpty($CurrentVersion) -and -not [string]::IsNullOrEmpty($AvailableVersion)) {
+            $versionText = "$CurrentVersion &#x2192; $AvailableVersion"
+        }
+
+        Write-Log "Showing informational progress dialog for $displayName" | Out-Null
+
+        $userInfo = Get-InteractiveUser
+        if (-not $userInfo) {
+            Write-Log "No interactive user for progress notification" | Out-Null
+            return $null
+        }
+
+        $progressId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
+        $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
+        $signalFile = Join-Path $userTempPath "UpgradeProgress_$progressId`_Signal.json"
+        $scriptPath = Join-Path $userTempPath "Show-UpgradeProgress_$progressId.ps1"
+
+        # Escape for XAML
+        $escapedName = [System.Security.SecurityElement]::Escape($displayName)
+
+        $scriptContent = @'
+param(
+    [string]$SignalFilePath,
+    [string]$AppDisplayName,
+    [string]$VersionInfo
+)
+
+$logPath = Join-Path $env:TEMP "UpgradeProgress_Debug.log"
+function Write-ProgLog {
+    param([string]$Message)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    "[$ts] $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+
+try {
+    Write-ProgLog "=== UPGRADE PROGRESS DIALOG STARTED ==="
+    Write-ProgLog "AppDisplayName: $AppDisplayName, VersionInfo: $VersionInfo"
+    Write-ProgLog "SignalFilePath: $SignalFilePath"
+
+    # Detect system theme
+    $isDark = $true
+    try {
+        $themeKey = Get-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -ErrorAction Stop
+        $isDark = $themeKey.AppsUseLightTheme -eq 0
+    } catch { }
+
+    if ($isDark) {
+        $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $textColor = "#FFCCCCCC"
+        $shadowOpacity = "0.6"; $closeBtnFg = "#FF888888"
+    } else {
+        $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $textColor = "#FF1B1B1B"
+        $shadowOpacity = "0.25"; $closeBtnFg = "#FF999999"
+    }
+
+    Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+    Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+    Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+
+    $screen = [System.Windows.Forms.Screen]::PrimaryScreen
+    $workArea = $screen.WorkingArea
+
+    $escapedAppName = [System.Security.SecurityElement]::Escape($AppDisplayName)
+    $versionXml = ""
+    if ($VersionInfo) {
+        $versionXml = "<TextBlock Grid.Row=`"1`" Text=`"$VersionInfo`" Foreground=`"#FF888888`" FontSize=`"11`" Margin=`"0,0,0,4`"/>"
+    }
+
+    $xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Updating $escapedAppName" Width="420" MinHeight="120" SizeToContent="Height" WindowStartupLocation="Manual"
+        ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
+    <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
+        <Border.Effect>
+            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/>
+        </Border.Effect>
+        <Grid>
+            <Grid Margin="20,16,20,16">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Name="TitleText" Text="Updating $escapedAppName..." Foreground="$textColor" FontSize="13" FontWeight="SemiBold" Margin="0,0,24,4"/>
+                $versionXml
+                <ProgressBar Grid.Row="2" Name="ProgressBar" IsIndeterminate="True" Height="3" Margin="0,8,0,6" Foreground="#FF0078D4"/>
+                <TextBlock Grid.Row="3" Name="StatusText" Text="Installing update..." Foreground="#FF888888" FontSize="11" HorizontalAlignment="Center"/>
+            </Grid>
+            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0" Background="Transparent" Foreground="$closeBtnFg" BorderThickness="0" FontSize="13" Cursor="Hand" FontFamily="Segoe UI Symbol"/>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+    $window = [Windows.Markup.XamlReader]::Load($reader)
+    $window.Left = $workArea.Right - 440
+    $window.Top = $workArea.Bottom - 160
+
+    # Close button: suppress info dialogs for today and close
+    $closeButton = $window.FindName("CloseButton")
+    if ($closeButton) {
+        $closeButton.Add_Click({
+            Write-ProgLog "Close button clicked - suppressing info dialogs for today"
+            $suppressFile = Join-Path $env:TEMP "SuppressInfoDialogs_$(Get-Date -Format 'yyyy-MM-dd').flag"
+            "suppressed" | Out-File -FilePath $suppressFile -Encoding UTF8
+            $window.Close()
+        })
+    }
+
+    # Poll for signal file and status updates
+    $script:progressStartTime = Get-Date
+    $script:lastStatus = ""
+    $statusFilePath = $SignalFilePath -replace '\.json$', '_Status.txt'
+    $script:pollTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $script:pollTimer.Interval = [TimeSpan]::FromSeconds(2)
+    $script:pollTimer.Add_Tick({
+        # Check for status updates (non-final)
+        if (Test-Path $statusFilePath) {
+            try {
+                $currentStatus = (Get-Content $statusFilePath -Raw).Trim()
+                if ($currentStatus -and $currentStatus -ne $script:lastStatus) {
+                    $script:lastStatus = $currentStatus
+                    $window.FindName("StatusText").Text = $currentStatus
+                    Write-ProgLog "Status updated: $currentStatus"
+                }
+            } catch {}
+        }
+        # Check for final signal (completion/failure)
+        if (Test-Path $SignalFilePath) {
+            $script:pollTimer.Stop()
+            Write-ProgLog "Signal received"
+            try {
+                $signalData = Get-Content $SignalFilePath -Raw | ConvertFrom-Json
+                $pBar = $window.FindName("ProgressBar")
+                $sText = $window.FindName("StatusText")
+                $pBar.IsIndeterminate = $false
+                $pBar.Value = 100
+                if ($signalData.Success -eq $true) {
+                    $sText.Text = "Update complete!"
+                } else {
+                    $sText.Text = "Update could not be completed."
+                }
+                # Hide close button during completion display
+                $window.FindName("CloseButton").Visibility = [System.Windows.Visibility]::Collapsed
+            } catch {
+                Write-ProgLog "Error reading signal: $($_.Exception.Message)"
+                $window.FindName("StatusText").Text = "Update complete!"
+            }
+            $script:closeTimer = [System.Windows.Threading.DispatcherTimer]::new()
+            $script:closeTimer.Interval = [TimeSpan]::FromSeconds(3)
+            $script:closeTimer.Add_Tick({
+                $script:closeTimer.Stop()
+                $window.Close()
+            })
+            $script:closeTimer.Start()
+        } elseif (((Get-Date) - $script:progressStartTime).TotalMinutes -gt 5) {
+            $script:pollTimer.Stop()
+            Write-ProgLog "Timeout - closing"
+            $window.Close()
+        }
+    })
+    $script:pollTimer.Start()
+
+    Write-ProgLog "Showing dialog..."
+    $window.Activate()
+    $window.ShowDialog() | Out-Null
+    Write-ProgLog "Dialog closed"
+
+} catch {
+    Write-ProgLog "ERROR: $($_.Exception.Message)"
+}
+Write-ProgLog "=== UPGRADE PROGRESS DIALOG ENDED ==="
+'@
+
+        $scriptContent | Set-Content -Path $scriptPath -Encoding UTF8
+
+        # Build args with encoded display name to avoid quoting issues
+        $encodedName = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($escapedName))
+        $psArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -SignalFilePath `"$signalFile`" -AppDisplayName `"$displayName`" -VersionInfo `"$versionText`""
+        $launch = New-HiddenLaunchAction -PowerShellArguments $psArgs -VbsDirectory $userTempPath -AllowUI
+        if ($launch) {
+            $action = $launch.Action
+        } else {
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -SignalFilePath `"$signalFile`" -AppDisplayName `"$displayName`" -VersionInfo `"$versionText`""
+        }
+
+        $principal = $null
+        foreach ($userFormat in @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")) {
+            try {
+                $principal = New-ScheduledTaskPrincipal -UserId $userFormat -LogonType Interactive -RunLevel Limited
+                break
+            } catch { continue }
+        }
+
+        if ($principal) {
+            $taskName = "UpgradeProgress_$progressId"
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+            $task = New-ScheduledTask -Action $action -Principal $principal -Settings $settings
+            Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+            Start-ScheduledTask -TaskName $taskName
+            Write-Log "Launched informational progress dialog (task: $taskName)" | Out-Null
+
+            # Don't block - return signal file path immediately
+            # Cleanup will happen after upgrade completes (caller writes signal, dialog closes)
+            # Schedule async cleanup after a generous timeout
+            $statusFile = $signalFile -replace '\.json$', '_Status.txt'
+            Start-Job -ScriptBlock {
+                param($tn, $sp, $vp, $sf, $stf)
+                Start-Sleep -Seconds 330  # 5.5 min - after dialog's 5-min timeout
+                Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+                Remove-Item $sp -Force -ErrorAction SilentlyContinue
+                if ($vp) { Remove-Item $vp -Force -ErrorAction SilentlyContinue }
+                Remove-Item $sf -Force -ErrorAction SilentlyContinue
+                Remove-Item $stf -Force -ErrorAction SilentlyContinue
+            } -ArgumentList $taskName, $scriptPath, $launch.VbsPath, $signalFile, $statusFile | Out-Null
+
+            return $signalFile
+        } else {
+            Write-Log "Could not create principal for progress notification" | Out-Null
+            return $null
+        }
+
+    } catch {
+        Write-Log "Error in Show-UpgradeProgressNotification: $($_.Exception.Message)" | Out-Null
+        return $null
+    }
+}
+
+function Get-AppInstalledScope {
+    <#
+    .SYNOPSIS
+        Detects whether an app is installed per-user or machine-wide by checking the uninstall registry.
+    .DESCRIPTION
+        Checks HKLM (machine) and HKU\<SID> (user) uninstall registry keys for a matching DisplayName.
+        Returns "user", "machine", or "unknown".
+    #>
+    param(
+        [string]$AppID,
+        [string]$FriendlyName
+    )
+
+    try {
+        $foundMachine = $false
+        $foundUser = $false
+
+        # Build search terms from AppID and FriendlyName
+        # AppID like "Microsoft.PowerToys" → search for "PowerToys"
+        $searchName = if ($FriendlyName) { $FriendlyName } else { ($AppID -split '\.')[-1] }
+
+        # Check machine-wide uninstall registry
+        $machineKeys = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        )
+        foreach ($keyPath in $machineKeys) {
+            if (Test-Path $keyPath) {
+                $entries = Get-ChildItem $keyPath -ErrorAction SilentlyContinue |
+                    Get-ItemProperty -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DisplayName -like "*$searchName*" }
+                if ($entries) { $foundMachine = $true; break }
+            }
+        }
+
+        # Check user-scoped uninstall registry (via HKU hive from SYSTEM context)
+        if (Test-RunningAsSystem) {
+            $userInfo = Get-InteractiveUser
+            if ($userInfo -and $userInfo.SID) {
+                $userKey = "Registry::HKU\$($userInfo.SID)\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+                if (Test-Path $userKey) {
+                    $userEntries = Get-ChildItem $userKey -ErrorAction SilentlyContinue |
+                        Get-ItemProperty -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -like "*$searchName*" }
+                    if ($userEntries) { $foundUser = $true }
+                }
+            }
+        }
+
+        if ($foundUser -and -not $foundMachine) {
+            Write-Log "Scope detection for $AppID : user (found in user registry only)" | Out-Null
+            return "user"
+        } elseif ($foundMachine -and -not $foundUser) {
+            Write-Log "Scope detection for $AppID : machine (found in machine registry only)" | Out-Null
+            return "machine"
+        } elseif ($foundMachine -and $foundUser) {
+            Write-Log "Scope detection for $AppID : machine (found in both, preferring machine)" | Out-Null
+            return "machine"
+        } else {
+            Write-Log "Scope detection for $AppID : unknown (not found in registry)" | Out-Null
+            return "unknown"
+        }
+    } catch {
+        Write-Log "Scope detection error for $AppID : $($_.Exception.Message)" | Out-Null
+        return "unknown"
+    }
+}
+
+function Write-InfoDialogStatus {
+    param(
+        [string]$SignalFilePath,
+        [string]$Status
+    )
+    if (-not $SignalFilePath) { return }
+    try {
+        $statusFile = $SignalFilePath -replace '\.json$', '_Status.txt'
+        $Status | Out-File -FilePath $statusFile -Encoding UTF8 -NoNewline
+    } catch {}
+}
+
+function Invoke-WingetWithProgress {
+    <#
+    .SYNOPSIS
+        Runs winget upgrade with real-time download progress monitoring via the winget log file.
+        When no SignalFilePath is provided, falls back to direct execution.
+    #>
+    param(
+        [string]$WingetExe,
+        [string[]]$Arguments,
+        [string]$SignalFilePath,
+        [string]$WorkingDirectory
+    )
+
+    # Direct execution if no progress dialog to update
+    if (-not $SignalFilePath) {
+        if ($WorkingDirectory) {
+            Push-Location $WorkingDirectory
+            try { return & $WingetExe @Arguments 2>&1 }
+            finally { Pop-Location }
+        } else {
+            return & $WingetExe @Arguments 2>&1
+        }
+    }
+
+    $logFile = Join-Path $env:TEMP "winget_progress_$([guid]::NewGuid().ToString('N').Substring(0,8)).log"
+    $outFile = Join-Path $env:TEMP "winget_out_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+    $errFile = Join-Path $env:TEMP "winget_err_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+
+    try {
+        # Build argument string: original args + --log for progress tracking
+        $fullArgs = @($Arguments) + @("--log", $logFile)
+        $argString = $fullArgs -join " "
+
+        $startParams = @{
+            FilePath = $WingetExe
+            ArgumentList = $argString
+            NoNewWindow = $true
+            PassThru = $true
+            RedirectStandardOutput = $outFile
+            RedirectStandardError = $errFile
+        }
+        if ($WorkingDirectory) { $startParams.WorkingDirectory = $WorkingDirectory }
+
+        $proc = Start-Process @startParams
+        Write-Log "Started winget process (PID: $($proc.Id)) with log: $logFile" | Out-Null
+
+        $lastStatus = ""
+        $downloadDetected = $false
+        while (-not $proc.HasExited) {
+            Start-Sleep -Seconds 2
+
+            if (Test-Path $logFile) {
+                try {
+                    # Read log using FileStream with shared read to avoid locking conflicts
+                    $fs = [System.IO.FileStream]::new($logFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                    $reader = [System.IO.StreamReader]::new($fs)
+                    $logText = $reader.ReadToEnd()
+                    $reader.Close()
+                    $fs.Close()
+
+                    if ($logText.Length -gt 0) {
+                        # Match download progress bytes: "12345678 / 98765432"
+                        $progressMatches = [regex]::Matches($logText, '(\d{4,})\s*/\s*(\d{4,})')
+                        if ($progressMatches.Count -gt 0) {
+                            $lastMatch = $progressMatches[$progressMatches.Count - 1]
+                            $downloaded = [long]$lastMatch.Groups[1].Value
+                            $total = [long]$lastMatch.Groups[2].Value
+                            if ($total -gt 10000) {  # sanity check: at least 10KB
+                                $downloadDetected = $true
+                                $dlMB = [math]::Round($downloaded / 1MB, 1)
+                                $totalMB = [math]::Round($total / 1MB, 1)
+                                $status = "Downloading update... $dlMB MB / $totalMB MB"
+                                if ($status -ne $lastStatus) {
+                                    $lastStatus = $status
+                                    Write-InfoDialogStatus -SignalFilePath $SignalFilePath -Status $status
+                                }
+                            }
+                        }
+
+                        # Detect installation phase
+                        if ($logText -match 'Starting package install|Installer started|begin installation') {
+                            $status = "Installing update..."
+                            if ($status -ne $lastStatus) {
+                                $lastStatus = $status
+                                Write-InfoDialogStatus -SignalFilePath $SignalFilePath -Status $status
+                            }
+                        }
+                    }
+                } catch {
+                    # Log file may not be ready yet, ignore
+                }
+            }
+        }
+
+        # Ensure exit code is populated (Start-Process -PassThru requires WaitForExit)
+        $proc.WaitForExit()
+
+        # Read final output (same format as & winget ... 2>&1)
+        $result = @()
+        if (Test-Path $outFile) { $result += Get-Content $outFile -ErrorAction SilentlyContinue }
+        if (Test-Path $errFile) { $result += Get-Content $errFile -ErrorAction SilentlyContinue }
+        Write-Log "Winget process exited with code: $($proc.ExitCode)" | Out-Null
+
+        # Propagate exit code so $LASTEXITCODE reflects winget's result
+        $global:LASTEXITCODE = $proc.ExitCode
+        return $result
+
+    } catch {
+        Write-Log "Error in Invoke-WingetWithProgress: $($_.Exception.Message)" | Out-Null
+        # Fallback to direct execution
+        if ($WorkingDirectory) {
+            Push-Location $WorkingDirectory
+            try { return & $WingetExe @Arguments 2>&1 }
+            finally { Pop-Location }
+        } else {
+            return & $WingetExe @Arguments 2>&1
+        }
+    } finally {
+        Remove-Item $logFile, $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Show-CompletionNotification {
     <#
     .SYNOPSIS
@@ -1913,19 +2465,58 @@ function Invoke-SystemCompletionNotification {
 
         # Create completion notification script
         $notificationId = Get-Random -Minimum 1000 -Maximum 9999
-        $notificationScriptPath = "$env:TEMP\Show-CompletionNotification_$notificationId.ps1"
+        # Use user's temp so scheduled task (running as user) can access the script
+        $notifUserTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
+        $notificationScriptPath = Join-Path $notifUserTempPath "Show-CompletionNotification_$notificationId.ps1"
 
         $notificationScriptContent = @"
 param([string]`$AppName)
 
-Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName PresentationCore
-Add-Type -AssemblyName WindowsBase
-Add-Type -AssemblyName System.Windows.Forms
+`$logPath = Join-Path `$env:TEMP "CompletionNotification_Debug.log"
+function Write-NotifLog {
+    param([string]`$Message)
+    `$ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    "[`$ts] `$Message" | Out-File -FilePath `$logPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+}
 
-`$messageText = "`$AppName has been successfully updated."
+try {
+    Write-NotifLog "=== COMPLETION NOTIFICATION STARTED ==="
+    Write-NotifLog "AppName: `$AppName"
+    Write-NotifLog "PID: `$PID, User: `$env:USERNAME"
+    Write-NotifLog "ApartmentState: `$([System.Threading.Thread]::CurrentThread.GetApartmentState())"
 
-`$xaml = @`"
+    # Detect system light/dark mode
+    `$isDark = `$true
+    try {
+        `$themeKey = Get-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -ErrorAction Stop
+        `$isDark = `$themeKey.AppsUseLightTheme -eq 0
+    } catch { }
+    Write-NotifLog "System theme: `$(if (`$isDark) { 'Dark' } else { 'Light' })"
+
+    # Theme colors
+    if (`$isDark) {
+        `$bgColor = "#FF1F1F1F"; `$borderColor = "#FF323232"
+        `$titleColor = "White"; `$textColor = "#FFCCCCCC"; `$subtleColor = "#FF888888"
+        `$shadowOpacity = "0.6"; `$checkFill = "White"
+    } else {
+        `$bgColor = "#FFF3F3F3"; `$borderColor = "#FFD1D1D1"
+        `$titleColor = "#FF1B1B1B"; `$textColor = "#FF333333"; `$subtleColor = "#FF888888"
+        `$shadowOpacity = "0.25"; `$checkFill = "White"
+    }
+
+    Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+    Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+    Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Write-NotifLog "WPF assemblies loaded"
+
+    `$screen = [System.Windows.Forms.Screen]::PrimaryScreen
+    `$workArea = `$screen.WorkingArea
+    Write-NotifLog "Screen: `$(`$workArea.Width)x`$(`$workArea.Height)"
+
+    `$messageText = "`$AppName has been successfully updated."
+
+    `$xaml = @`"
 <Window
     xmlns=`"http://schemas.microsoft.com/winfx/2006/xaml/presentation`"
     xmlns:x=`"http://schemas.microsoft.com/winfx/2006/xaml`"
@@ -1941,26 +2532,13 @@ Add-Type -AssemblyName System.Windows.Forms
     Topmost=`"True`"
     ShowInTaskbar=`"False`">
 
-    <Window.Triggers>
-        <EventTrigger RoutedEvent=`"Window.Loaded`">
-            <BeginStoryboard>
-                <Storyboard>
-                    <DoubleAnimation Storyboard.TargetProperty=`"Opacity`"
-                                     From=`"0`" To=`"1`" Duration=`"0:0:0.3`"/>
-                    <ThicknessAnimation Storyboard.TargetProperty=`"Margin`"
-                                        From=`"0,50,0,0`" To=`"0,0,0,0`" Duration=`"0:0:0.3`"/>
-                </Storyboard>
-            </BeginStoryboard>
-        </EventTrigger>
-    </Window.Triggers>
-
     <Border Name=`"MainBorder`"
-            Background=`"#FF1F1F1F`"
+            Background=`"`$bgColor`"
             CornerRadius=`"8`"
-            BorderBrush=`"#FF323232`"
+            BorderBrush=`"`$borderColor`"
             BorderThickness=`"1`">
         <Border.Effect>
-            <DropShadowEffect ShadowDepth=`"4`" Direction=`"270`" Color=`"Black`" Opacity=`"0.6`" BlurRadius=`"12`"/>
+            <DropShadowEffect ShadowDepth=`"4`" Direction=`"270`" Color=`"Black`" Opacity=`"`$shadowOpacity`" BlurRadius=`"12`"/>
         </Border.Effect>
 
         <Grid Margin=`"16,12,16,12`">
@@ -1974,7 +2552,6 @@ Add-Type -AssemblyName System.Windows.Forms
                 <RowDefinition Height=`"Auto`"/>
             </Grid.RowDefinitions>
 
-            <!-- Icon (info/success indicator) -->
             <Ellipse Grid.Column=`"0`" Grid.RowSpan=`"2`"
                      Width=`"24`" Height=`"24`"
                      Fill=`"#FF107C10`"
@@ -1983,7 +2560,7 @@ Add-Type -AssemblyName System.Windows.Forms
 
             <Path Grid.Column=`"0`" Grid.RowSpan=`"2`"
                   Data=`"M9,16.17L4.83,12l-1.42,1.41L9,19L21,7l-1.41-1.41L9,16.17z`"
-                  Fill=`"White`"
+                  Fill=`"`$checkFill`"
                   Stretch=`"Uniform`"
                   Width=`"14`"
                   Height=`"14`"
@@ -1991,31 +2568,28 @@ Add-Type -AssemblyName System.Windows.Forms
                   VerticalAlignment=`"Top`"
                   Margin=`"0,7,0,0`"/>
 
-            <!-- Title -->
             <TextBlock Grid.Column=`"1`" Grid.Row=`"0`"
                        Text=`"Update Complete`"
-                       Foreground=`"White`"
+                       Foreground=`"`$titleColor`"
                        FontSize=`"14`"
                        FontWeight=`"SemiBold`"
                        Margin=`"12,0,0,2`"
                        TextWrapping=`"Wrap`"/>
 
-            <!-- Message -->
             <TextBlock Grid.Column=`"1`" Grid.Row=`"1`"
                        Text=`"`$messageText`"
-                       Foreground=`"#FFCCCCCC`"
+                       Foreground=`"`$textColor`"
                        FontSize=`"12`"
                        Margin=`"12,0,0,8`"
                        TextWrapping=`"Wrap`"/>
 
-            <!-- Countdown -->
             <TextBlock Grid.Column=`"1`" Grid.Row=`"2`"
-                       Foreground=`"#FF888888`"
+                       Foreground=`"`$subtleColor`"
                        FontSize=`"11`"
                        Margin=`"12,4,0,0`"
                        HorizontalAlignment=`"Right`">
                 <Run Text=`"Closing in `"/>
-                <Run Name=`"CountdownText`" Text=`"5`"/>
+                <Run Name=`"CountdownText`" Text=`"8`"/>
                 <Run Text=`"s`"/>
             </TextBlock>
         </Grid>
@@ -2023,38 +2597,54 @@ Add-Type -AssemblyName System.Windows.Forms
 </Window>
 `"@
 
-`$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]`$xaml)
-`$window = [Windows.Markup.XamlReader]::Load(`$reader)
-`$countdownRun = `$window.FindName("CountdownText")
+    Write-NotifLog "XAML built, parsing..."
+    `$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new(`$xaml))
+    `$window = [Windows.Markup.XamlReader]::Load(`$reader)
+    Write-NotifLog "XAML parsed successfully"
 
-# Position window in bottom-right corner like system notifications
-`$window.Add_Loaded({
-    `$screen = [System.Windows.Forms.Screen]::PrimaryScreen
-    `$window.Left = `$screen.WorkingArea.Right - `$window.ActualWidth - 20
-    `$window.Top = `$screen.WorkingArea.Bottom - `$window.ActualHeight - 20
-})
+    `$countdownRun = `$window.FindName("CountdownText")
 
-`$script:remainingSeconds = 5
-`$timer = New-Object System.Windows.Threading.DispatcherTimer
-`$timer.Interval = [TimeSpan]::FromSeconds(1)
-`$timer.Add_Tick({
-    `$script:remainingSeconds--
-    `$countdownRun.Text = `$script:remainingSeconds.ToString()
-    if (`$script:remainingSeconds -le 0) {
-        `$timer.Stop()
-        `$window.Close()
-    }
-})
-`$timer.Start()
+    # Position bottom-right
+    `$window.Left = `$workArea.Right - 440
+    `$window.Top = `$workArea.Bottom - 180
+    Write-NotifLog "Window positioned at Left=`$(`$window.Left), Top=`$(`$window.Top)"
 
-`$window.ShowDialog() | Out-Null
+    `$script:remainingSeconds = 8
+    `$timer = New-Object System.Windows.Threading.DispatcherTimer
+    `$timer.Interval = [TimeSpan]::FromSeconds(1)
+    `$timer.Add_Tick({
+        `$script:remainingSeconds--
+        `$countdownRun.Text = `$script:remainingSeconds.ToString()
+        if (`$script:remainingSeconds -le 0) {
+            `$timer.Stop()
+            `$window.Close()
+        }
+    })
+    `$timer.Start()
+
+    Write-NotifLog "Showing notification..."
+    `$window.Activate()
+    `$window.ShowDialog() | Out-Null
+    Write-NotifLog "Notification closed"
+
+} catch {
+    Write-NotifLog "FATAL ERROR: `$(`$_.Exception.Message)"
+    Write-NotifLog "Stack trace: `$(`$_.ScriptStackTrace)"
+}
+Write-NotifLog "=== COMPLETION NOTIFICATION ENDED ==="
 "@
 
         $notificationScriptContent | Out-File -FilePath $notificationScriptPath -Encoding UTF8 -Force
 
         # Create and run scheduled task
         $taskName = "CompletionNotification_$notificationId"
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$notificationScriptPath`" -AppName `"$AppName`""
+        $notifPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$notificationScriptPath`" -AppName `"$AppName`""
+        $notifLaunch = New-HiddenLaunchAction -PowerShellArguments $notifPsArgs -VbsDirectory $notifUserTempPath -AllowUI
+        if ($notifLaunch) {
+            $action = $notifLaunch.Action
+        } else {
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$notificationScriptPath`" -AppName `"$AppName`""
+        }
 
         $principal = $null
         $userFormats = @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")
@@ -2074,10 +2664,13 @@ Add-Type -AssemblyName System.Windows.Forms
             Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
             Start-ScheduledTask -TaskName $taskName
 
-            # Schedule cleanup of task and script
-            Start-Sleep -Seconds 10
+            # Wait for notification to finish (8s countdown + startup buffer)
+            Start-Sleep -Seconds 15
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
             Remove-Item $notificationScriptPath -Force -ErrorAction SilentlyContinue
+            if ($notifLaunch -and $notifLaunch.VbsPath) {
+                Remove-Item $notifLaunch.VbsPath -Force -ErrorAction SilentlyContinue
+            }
         }
 
     } catch {
@@ -2372,7 +2965,7 @@ function Invoke-SystemMandatoryUpdatePrompt {
         }
         
         # Create mandatory prompt script
-        $mandatoryScriptPath = "$env:TEMP\Show-MandatoryPrompt_$promptId.ps1"
+        $mandatoryScriptPath = Join-Path $userTempPath "Show-MandatoryPrompt_$promptId.ps1"
         
         $mandatoryScriptContent = @'
 param(
@@ -2591,11 +3184,15 @@ $countdownTimer.Stop()
         # Create task arguments with encoded parameters
         $encodedQuestion = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Question))
         $encodedTitle = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Title))
-        # Use hidden console window execution method
-        $hiddenArguments = "/c start /min `"`" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$mandatoryScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -TimeoutSeconds $TimeoutSeconds"
-        
-        # Create and register task using hidden console method
-        $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $hiddenArguments
+        # Create hidden launch action using VBS wrapper (no console window flash)
+        $mandatoryPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$mandatoryScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -TimeoutSeconds $TimeoutSeconds"
+        $mandatoryVbsDir = Split-Path $responseFile -Parent
+        $mandatoryLaunch = New-HiddenLaunchAction -PowerShellArguments $mandatoryPsArgs -VbsDirectory $mandatoryVbsDir -AllowUI
+        if ($mandatoryLaunch) {
+            $action = $mandatoryLaunch.Action
+        } else {
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$mandatoryScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -TimeoutSeconds $TimeoutSeconds"
+        }
         
         # Create task principal
         $principal = $null
@@ -2641,7 +3238,8 @@ $countdownTimer.Stop()
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
         Remove-Item $mandatoryScriptPath -Force -ErrorAction SilentlyContinue
         Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
-        
+        if ($mandatoryLaunch.VbsPath) { Remove-Item $mandatoryLaunch.VbsPath -Force -ErrorAction SilentlyContinue }
+
         return "Continue"  # Always continue for mandatory updates
         
     } catch {
@@ -2859,7 +3457,6 @@ function Get-DeferralStatus {
             ReleaseDate = $null
             CanDefer = $false
             ForceUpdate = $false
-            DeferralOptions = if ($WhitelistConfig.DeferralOptions) { $WhitelistConfig.DeferralOptions } else { @() }
             Message = ""
         }
         
@@ -2872,12 +3469,31 @@ function Get-DeferralStatus {
         
         # Get release date for deadline calculations
         $releaseDate = Get-AppReleaseDate -AppID $AppID -Version $AvailableVersion
-        if ($releaseDate) {
-            $status.ReleaseDate = $releaseDate
-            
-            # Calculate admin hard deadline (release date + MaxDeferralDays)
-            $status.AdminHardDeadline = $releaseDate.AddDays($status.MaxDeferralDays)
+
+        if (-not $releaseDate) {
+            # No release date from winget - use FirstDetected date as fallback
+            # This ensures AdminHardDeadline is always calculated
+            if (Test-Path $deferralPath) {
+                $existingData = Get-ItemProperty -Path $deferralPath -ErrorAction SilentlyContinue
+                if ($existingData.FirstDetected) {
+                    $releaseDate = [DateTime]::Parse($existingData.FirstDetected)
+                    Write-Log "Using stored FirstDetected date for ${AppID}: $($releaseDate.ToString('yyyy-MM-dd'))" | Out-Null
+                }
+            }
+            if (-not $releaseDate) {
+                # First time seeing this app - record today as first detected
+                $releaseDate = $now
+                if (-not (Test-Path $deferralPath)) {
+                    New-Item -Path $deferralPath -Force | Out-Null
+                }
+                Set-ItemProperty -Path $deferralPath -Name "FirstDetected" -Value $now.ToString("o")
+                Write-Log "No release date found for ${AppID}, recording first detection date: $($now.ToString('yyyy-MM-dd'))" | Out-Null
+            }
         }
+
+        $status.ReleaseDate = $releaseDate
+        # Calculate admin hard deadline (release/first-detected date + MaxDeferralDays)
+        $status.AdminHardDeadline = $releaseDate.AddDays($status.MaxDeferralDays)
         
         # Check if deferral data exists
         if (Test-Path $deferralPath) {
@@ -2929,28 +3545,8 @@ function Get-DeferralStatus {
             # User can defer if:
             # 1. We haven't reached admin hard deadline
             # 2. There are available deferral options within the remaining time
-            if ($daysUntilAdminDeadline -gt 0 -and $status.DeferralOptions.Count -gt 0) {
-                # Find available deferral options that fit within remaining time
-                $availableOptions = @()
-                foreach ($option in $status.DeferralOptions) {
-                    # Fix type comparison error - ensure both values are integers
-                    $optionDays = if ($option -is [hashtable] -and $option.Days) {
-                        [int]$option.Days
-                    } elseif ($option -is [hashtable] -and $option.Label -match '\d+') {
-                        [int]($option.Label -replace '\D+', '')
-                    } else {
-                        [int]$option
-                    }
-                    
-                    if ($optionDays -le $daysUntilAdminDeadline) {
-                        $availableOptions += $optionDays
-                    }
-                }
-                
-                if ($availableOptions.Count -gt 0) {
-                    $status.CanDefer = $true
-                    $status.DeferralOptions = $availableOptions
-                }
+            if ($daysUntilAdminDeadline -gt 0) {
+                $status.CanDefer = $true
             }
         }
         
@@ -2994,21 +3590,20 @@ function Set-DeferralChoice {
     .SYNOPSIS
         Records a user's deferral choice in the registry
     .DESCRIPTION
-        Saves deferral information including selected timeframe and calculated deadlines
+        Defers until end of today, clamped to the admin hard deadline if provided.
     .PARAMETER AppID
         Application ID
-    .PARAMETER DeferralDays
-        Number of days to defer
+    .PARAMETER AdminHardDeadline
+        Optional admin hard deadline to clamp the deferral to
     .OUTPUTS
         Boolean indicating success
     #>
-    
+
     param(
         [Parameter(Mandatory=$true)]
         [string]$AppID,
-        
-        [Parameter(Mandatory=$true)]
-        [int]$DeferralDays
+
+        [DateTime]$AdminHardDeadline
     )
     
     try {
@@ -3033,16 +3628,16 @@ function Set-DeferralChoice {
             # Use default of 0
         }
         
-        # Calculate new user deadline
-        $userDeadline = $now.AddDays($DeferralDays)
-        
+        # Calculate new user deadline: end of today, clamped to admin hard deadline
+        $endOfDay = $now.Date.AddDays(1).AddSeconds(-1)  # today 23:59:59
+        $userDeadline = if ($AdminHardDeadline -and $endOfDay -gt $AdminHardDeadline) { $AdminHardDeadline } else { $endOfDay }
+
         # Update deferral data
         Set-ItemProperty -Path $deferralPath -Name "DeferralsUsed" -Value ($currentDeferrals + 1) -Force
         Set-ItemProperty -Path $deferralPath -Name "LastDeferralDate" -Value $now.ToString("yyyy-MM-dd HH:mm:ss") -Force
         Set-ItemProperty -Path $deferralPath -Name "UserDeadline" -Value $userDeadline.ToString("yyyy-MM-dd HH:mm:ss") -Force
-        Set-ItemProperty -Path $deferralPath -Name "DeferralDays" -Value $DeferralDays -Force
-        
-        Write-Log "Recorded deferral choice for ${AppID}: ${DeferralDays} days, deadline: $userDeadline" | Out-Null
+
+        Write-Log "Recorded deferral for ${AppID}: deferred until $($userDeadline.ToString('yyyy-MM-dd HH:mm:ss'))$(if ($AdminHardDeadline -and $endOfDay -gt $AdminHardDeadline) { ' (clamped to admin deadline)' })" | Out-Null
         
         return $true
         
@@ -3155,7 +3750,7 @@ function Show-DeferralDialog {
             $title = "Update Available: $displayName"
             
             # Create complex dialog with deferral buttons
-            $deferralChoice = Show-EnhancedDeferralDialog -Question $question -Title $title -DeferralOptions $DeferralStatus.DeferralOptions -HasBlockingProcess $hasBlockingProcess -TimeoutSeconds $TimeoutSeconds
+            $deferralChoice = Show-EnhancedDeferralDialog -Question $question -Title $title -HasBlockingProcess $hasBlockingProcess -TimeoutSeconds $TimeoutSeconds
             
             return $deferralChoice
         }
@@ -3187,21 +3782,18 @@ function Show-EnhancedDeferralDialog {
         
         [Parameter(Mandatory=$true)]
         [string]$Title,
-        
-        [Parameter(Mandatory=$true)]
-        [array]$DeferralOptions,
-        
+
         [bool]$HasBlockingProcess = $false,
         [int]$TimeoutSeconds = 60
     )
-    
+
     try {
         # For system context, use the enhanced scheduled task approach
         if (Test-RunningAsSystem) {
-            return Invoke-SystemDeferralPrompt -Question $Question -Title $Title -DeferralOptions $DeferralOptions -HasBlockingProcess $HasBlockingProcess -TimeoutSeconds $TimeoutSeconds
+            return Invoke-SystemDeferralPrompt -Question $Question -Title $Title -HasBlockingProcess $HasBlockingProcess -TimeoutSeconds $TimeoutSeconds
         } else {
             # Direct user context - simplified approach
-            return Show-DirectDeferralDialog -Question $Question -Title $Title -DeferralOptions $DeferralOptions -HasBlockingProcess $HasBlockingProcess -TimeoutSeconds $TimeoutSeconds
+            return Show-DirectDeferralDialog -Question $Question -Title $Title -HasBlockingProcess $HasBlockingProcess -TimeoutSeconds $TimeoutSeconds
         }
         
     } catch {
@@ -3225,31 +3817,23 @@ function Show-DirectDeferralDialog {
     param(
         [string]$Question,
         [string]$Title,
-        [array]$DeferralOptions,
         [bool]$HasBlockingProcess,
         [int]$TimeoutSeconds = 60
     )
-    
+
     try {
-        Write-Log "Showing direct deferral dialog with options: $($DeferralOptions -join ', ')" | Out-Null
-        
+        Write-Log "Showing direct deferral dialog (single Defer button)" | Out-Null
+
         # Load WPF assemblies
         Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
         Add-Type -AssemblyName PresentationCore -ErrorAction Stop
         Add-Type -AssemblyName WindowsBase -ErrorAction Stop
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        
-        # Build dynamic button XML based on deferral options
-        $buttonXml = ""
-        $buttonCount = 0
-        
-        # Add deferral option buttons
-        foreach ($days in ($DeferralOptions | Sort-Object)) {
-            $buttonText = if ($days -eq 1) { "Defer 1 day" } else { "Defer $days days" }
-            $buttonName = "DeferButton$days"
-            $buttonXml += @"
-                <Button Name="$buttonName"
-                        Content="$buttonText"
+
+        # Build button XML: single Defer button + Update Now button
+        $buttonXml = @"
+                <Button Name="DeferButton"
+                        Content="Defer"
                         Width="100"
                         Height="28"
                         Margin="0,0,8,0"
@@ -3259,7 +3843,7 @@ function Show-DirectDeferralDialog {
                         BorderThickness="1"
                         FontSize="11"
                         Cursor="Hand"
-                        Tag="$days">
+                        Tag="0">
                     <Button.Style>
                         <Style TargetType="Button">
                             <Style.Triggers>
@@ -3271,12 +3855,6 @@ function Show-DirectDeferralDialog {
                         </Style>
                     </Button.Style>
                 </Button>
-"@
-            $buttonCount++
-        }
-        
-        # Add Update Now button
-        $buttonXml += @"
                 <Button Name="UpdateButton"
                         Content="Update Now"
                         Width="100"
@@ -3300,9 +3878,9 @@ function Show-DirectDeferralDialog {
                     </Button.Style>
                 </Button>
 "@
-        
-        # Calculate dialog width based on button count
-        $dialogWidth = [Math]::Max(500, ($buttonCount + 1) * 110 + 100)
+
+        # Fixed dialog width for two buttons
+        $dialogWidth = 500
         
         # Create modern dark-themed XAML
         $xaml = @"
@@ -3419,24 +3997,20 @@ function Show-DirectDeferralDialog {
             $window.Close()
         })
         
-        # Add event handlers for deferral buttons
-        foreach ($days in $DeferralOptions) {
-            $buttonName = "DeferButton$days"
-            $button = $window.FindName($buttonName)
-            if ($button) {
-                $button.Add_Click({
-                    $selectedDays = [int]$this.Tag
-                    Write-Log "User selected deferral: $selectedDays days" | Out-Null
-                    $timer.Stop()
-                    $countdownTimer.Stop()
-                    $script:deferralResult = @{
-                        Action = "Defer"
-                        DeferralDays = $selectedDays
-                        CloseProcess = $false
-                    }
-                    $window.Close()
-                }.GetNewClosure())
-            }
+        # Add event handler for Defer button
+        $deferButton = $window.FindName("DeferButton")
+        if ($deferButton) {
+            $deferButton.Add_Click({
+                Write-Log "User selected deferral (until end of day)" | Out-Null
+                $timer.Stop()
+                $countdownTimer.Stop()
+                $script:deferralResult = @{
+                    Action = "Defer"
+                    DeferralDays = 0
+                    CloseProcess = $false
+                }
+                $window.Close()
+            })
         }
         
         # Add event handler for Update button
@@ -3454,16 +4028,16 @@ function Show-DirectDeferralDialog {
             })
         }
         
-        # Handle window closing without button click
+        # Handle window closing without button click (X = Defer)
         $window.Add_Closing({
             $timer.Stop()
             $countdownTimer.Stop()
             if ($script:deferralResult.Action -eq $null) {
-                Write-Log "Deferral dialog closed without selection - defaulting to update" | Out-Null
+                Write-Log "Deferral dialog closed without selection - defaulting to defer (until end of day)" | Out-Null
                 $script:deferralResult = @{
-                    Action = "Update"
+                    Action = "Defer"
                     DeferralDays = 0
-                    CloseProcess = $true
+                    CloseProcess = $false
                 }
             }
         })
@@ -3515,13 +4089,12 @@ function Invoke-SystemDeferralPrompt {
     param(
         [string]$Question,
         [string]$Title,
-        [array]$DeferralOptions,
         [bool]$HasBlockingProcess,
         [int]$TimeoutSeconds = 60
     )
-    
+
     try {
-        Write-Log "Invoking system deferral prompt with options: $($DeferralOptions -join ', ')" | Out-Null
+        Write-Log "Invoking system deferral prompt (single Defer button)" | Out-Null
         
         # Get interactive user
         $userInfo = Get-InteractiveUser
@@ -3541,112 +4114,242 @@ function Invoke-SystemDeferralPrompt {
             Join-Path "C:\ProgramData\Temp" "DeferralPrompt_$promptId`_Response.json"
         }
         
-        # Create enhanced user prompt script for deferrals
-        $deferralScriptPath = "$env:TEMP\Show-DeferralPrompt_$promptId.ps1"
+        # Create enhanced user prompt script for deferrals (use user temp so scheduled task can access it)
+        $deferralScriptPath = Join-Path $userTempPath "Show-DeferralPrompt_$promptId.ps1"
         
         # Build the script content dynamically
-        $deferralOptionsJson = ($DeferralOptions | ConvertTo-Json -Compress)
-        
         $deferralScriptContent = @'
 param(
     [string]$ResponseFilePath,
     [string]$EncodedQuestion,
     [string]$EncodedTitle,
-    [string]$DeferralOptionsJson,
-    [bool]$HasBlockingProcess = $false,
+    [int]$HasBlockingProcess = 0,
     [int]$TimeoutSeconds = 60,
-    # Legacy parameters for backward compatibility
     [string]$Question = "",
     [string]$Title = ""
 )
 
-# Decode the text parameters if they're base64 encoded, otherwise use legacy parameters
-$actualQuestion = if ($EncodedQuestion) {
-    [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedQuestion))
-} else {
-    $Question
+# Debug logging
+$logPath = Join-Path $env:TEMP "DeferralPrompt_Debug.log"
+function Write-DeferLog {
+    param([string]$Message)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    "[$ts] $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
 }
 
-$actualTitle = if ($EncodedTitle) {
-    [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedTitle))
-} else {
-    $Title
-}
+try {
+    Write-DeferLog "=== DEFERRAL PROMPT SCRIPT STARTED ==="
+    Write-DeferLog "PID: $PID, Session: $((Get-Process -Id $PID).SessionId), User: $env:USERNAME"
+    Write-DeferLog "ResponseFilePath: $ResponseFilePath"
+    Write-DeferLog "HasBlockingProcess: $HasBlockingProcess, TimeoutSeconds: $TimeoutSeconds"
+    Write-DeferLog "ApartmentState: $([System.Threading.Thread]::CurrentThread.GetApartmentState())"
 
-# Parse deferral options
-$deferralOptions = $DeferralOptionsJson | ConvertFrom-Json
+    # Decode parameters
+    $actualQuestion = if ($EncodedQuestion) {
+        [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedQuestion))
+    } else { $Question }
 
-# Load WPF assemblies
-Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName PresentationCore
-Add-Type -AssemblyName WindowsBase
-Add-Type -AssemblyName System.Windows.Forms
+    $actualTitle = if ($EncodedTitle) {
+        [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedTitle))
+    } else { $Title }
 
-# Build dynamic buttons XML
-$buttonXml = ""
-foreach ($days in ($deferralOptions | Sort-Object)) {
-    $buttonText = if ($days -eq 1) { "Defer 1 day" } else { "Defer $days days" }
-    $buttonName = "DeferButton$days"
-    $buttonXml += "<Button Name=`"$buttonName`" Content=`"$buttonText`" Width=`"100`" Height=`"28`" Margin=`"0,0,8,0`" Tag=`"$days`"/>"
-}
-$buttonXml += '<Button Name="UpdateButton" Content="Update Now" Width="100" Height="28" Background="#FF0078D4" Foreground="White" IsDefault="true" Tag="0"/>'
+    Write-DeferLog "Decoded title: $actualTitle"
 
-$dialogWidth = [Math]::Max(500, ($deferralOptions.Count + 1) * 110 + 100)
+    # Detect system light/dark mode
+    $isDark = $true  # default to dark
+    try {
+        $themeKey = Get-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -ErrorAction Stop
+        $isDark = $themeKey.AppsUseLightTheme -eq 0
+    } catch { }
+    Write-DeferLog "System theme: $(if ($isDark) { 'Dark' } else { 'Light' })"
 
-# Use the decoded text in XAML with proper XML escaping
-$escapedQuestion = [System.Security.SecurityElement]::Escape($actualQuestion)
-$escapedTitle = [System.Security.SecurityElement]::Escape($actualTitle)
+    # Theme colors
+    if ($isDark) {
+        $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $textColor = "#FFCCCCCC"
+        $shadowOpacity = "0.6"; $btnBg = ""; $btnFg = ""
+        $closeBtnFg = "#FF888888"; $closeBtnHoverBg = "#FF2A2A2A"
+    } else {
+        $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $textColor = "#FF1B1B1B"
+        $shadowOpacity = "0.25"; $btnBg = ""; $btnFg = ""
+        $closeBtnFg = "#FF999999"; $closeBtnHoverBg = "#FFE0E0E0"
+    }
 
-$xaml = @"
+    # Load WPF assemblies
+    Write-DeferLog "Loading WPF assemblies..."
+    Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+    Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+    Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Write-DeferLog "WPF assemblies loaded"
+
+    # Get screen dimensions for positioning
+    $screen = [System.Windows.Forms.Screen]::PrimaryScreen
+    $workArea = $screen.WorkingArea
+    Write-DeferLog "Screen working area: $($workArea.Width)x$($workArea.Height)"
+
+    # Build buttons XML: single Defer button + Update Now
+    $buttonXml = '<Button Name="DeferButton" Content="Defer" Width="100" Height="28" Margin="0,0,8,0" Tag="0"/>'
+    $buttonXml += '<Button Name="UpdateButton" Content="Update Now" Width="100" Height="28" Background="#FF0078D4" Foreground="White" IsDefault="true" Tag="0"/>'
+    Write-DeferLog "Button XML built: $buttonXml"
+
+    $dialogWidth = 500
+
+    # XML-escape the decoded text and preserve newlines as XML entities
+    $escapedQuestion = [System.Security.SecurityElement]::Escape($actualQuestion) -replace "`n", "&#10;"
+    $escapedTitle = [System.Security.SecurityElement]::Escape($actualTitle)
+
+    $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="$escapedTitle" Width="$dialogWidth" MinHeight="200" SizeToContent="Height" WindowStartupLocation="Manual"
         ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
-    <Border Background="#FF1F1F1F" CornerRadius="8" BorderBrush="#FF323232" BorderThickness="1">
+    <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
         <Border.Effect>
-            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
+            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/>
         </Border.Effect>
-        <Grid Margin="20">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0" Text="$escapedQuestion" Foreground="#FFCCCCCC" TextWrapping="Wrap" Margin="0,0,0,20" FontSize="12"/>
-            <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Center">$buttonXml</StackPanel>
+        <Grid>
+            <Grid Margin="20">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Name="QuestionText" Text="$escapedQuestion" Foreground="$textColor" TextWrapping="Wrap" Margin="0,0,24,20" FontSize="12"/>
+                <StackPanel Grid.Row="1" Name="ButtonPanel" Orientation="Horizontal" HorizontalAlignment="Center">$buttonXml</StackPanel>
+                <StackPanel Grid.Row="2" Name="ProgressPanel" Visibility="Collapsed" HorizontalAlignment="Center" Margin="0,5,0,0">
+                    <ProgressBar Name="ProgressBar" IsIndeterminate="True" Width="300" Height="3" Margin="0,0,0,10" Foreground="#FF0078D4"/>
+                    <TextBlock Name="ProgressText" Text="Updating..." Foreground="$textColor" FontSize="12" HorizontalAlignment="Center"/>
+                </StackPanel>
+            </Grid>
+            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0" Background="Transparent" Foreground="$closeBtnFg" BorderThickness="0" FontSize="13" Cursor="Hand" FontFamily="Segoe UI Symbol" Tag="0"/>
         </Grid>
     </Border>
 </Window>
 "@
 
-$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
-$window = [Windows.Markup.XamlReader]::Load($reader)
+    Write-DeferLog "XAML built, parsing..."
+    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+    $window = [Windows.Markup.XamlReader]::Load($reader)
+    Write-DeferLog "XAML parsed successfully"
 
-$script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
+    # Position window at bottom-right of screen
+    $window.Left = $workArea.Right - $dialogWidth - 20
+    $window.Top = $workArea.Bottom - 250
+    Write-DeferLog "Window positioned at Left=$($window.Left), Top=$($window.Top)"
 
-# Add deferral button handlers
-foreach ($days in $deferralOptions) {
-    $button = $window.FindName("DeferButton$days")
-    if ($button) {
-        $button.Add_Click({
-            $selectedDays = [int]$this.Tag
-            $script:result = @{ Action = "Defer"; DeferralDays = $selectedDays; CloseProcess = $false }
+    $script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
+
+    # Defer button handler
+    $deferButton = $window.FindName("DeferButton")
+    if ($deferButton) {
+        $deferButton.Add_Click({
+            Write-DeferLog "Defer button clicked - deferring until end of day"
+            @{ Action = "Defer"; DeferralDays = 0; CloseProcess = $false } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
             $window.Close()
-        }.GetNewClosure())
+        })
+        Write-DeferLog "Attached click handler for DeferButton"
     }
+
+    # Close button acts as Defer (same behavior)
+    $closeButton = $window.FindName("CloseButton")
+    if ($closeButton) {
+        $closeButton.Add_Click({
+            Write-DeferLog "Close button clicked - deferring until end of day"
+            @{ Action = "Defer"; DeferralDays = 0; CloseProcess = $false } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+            $window.Close()
+        })
+        Write-DeferLog "Attached close button handler (defers until end of day)"
+    }
+
+    $updateButton = $window.FindName("UpdateButton")
+    if ($updateButton) {
+        $updateButton.Add_Click({
+            # Write response immediately so SYSTEM script can proceed with the upgrade
+            Write-DeferLog "Update button clicked, writing response and switching to progress mode"
+            @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+
+            # Switch to progress UI
+            $window.FindName("ButtonPanel").Visibility = [System.Windows.Visibility]::Collapsed
+            $window.FindName("CloseButton").Visibility = [System.Windows.Visibility]::Collapsed
+            $window.FindName("ProgressPanel").Visibility = [System.Windows.Visibility]::Visible
+            $window.FindName("QuestionText").Text = "Closing application and installing update..."
+
+            # Poll for completion signal file
+            $script:signalFilePath = $ResponseFilePath -replace '_Response\.json$', '_Complete.json'
+            $script:progressStartTime = Get-Date
+
+            $script:statusFilePath = $script:signalFilePath -replace '\.json$', '_Status.txt'
+            $script:lastStatus = ""
+            $script:pollTimer = [System.Windows.Threading.DispatcherTimer]::new()
+            $script:pollTimer.Interval = [TimeSpan]::FromSeconds(2)
+            $script:pollTimer.Add_Tick({
+                # Check for status updates
+                if (Test-Path $script:statusFilePath) {
+                    try {
+                        $currentStatus = (Get-Content $script:statusFilePath -Raw).Trim()
+                        if ($currentStatus -and $currentStatus -ne $script:lastStatus) {
+                            $script:lastStatus = $currentStatus
+                            $window.FindName("ProgressText").Text = $currentStatus
+                            Write-DeferLog "Status updated: $currentStatus"
+                        }
+                    } catch {}
+                }
+                # Check for final signal
+                if (Test-Path $script:signalFilePath) {
+                    $script:pollTimer.Stop()
+                    Write-DeferLog "Completion signal received at: $script:signalFilePath"
+                    try {
+                        $signalData = Get-Content $script:signalFilePath -Raw | ConvertFrom-Json
+                        $pBar = $window.FindName("ProgressBar")
+                        $pText = $window.FindName("ProgressText")
+                        $pBar.IsIndeterminate = $false
+                        $pBar.Value = 100
+                        if ($signalData.Success -eq $true) {
+                            $pText.Text = "Update complete!"
+                        } else {
+                            $pText.Text = "Update could not be completed."
+                        }
+                    } catch {
+                        Write-DeferLog "Error reading signal: $($_.Exception.Message)"
+                        $window.FindName("ProgressText").Text = "Update complete!"
+                    }
+                    # Auto-close after 3 seconds
+                    $script:closeTimer = [System.Windows.Threading.DispatcherTimer]::new()
+                    $script:closeTimer.Interval = [TimeSpan]::FromSeconds(3)
+                    $script:closeTimer.Add_Tick({
+                        $script:closeTimer.Stop()
+                        $window.Close()
+                    })
+                    $script:closeTimer.Start()
+                } elseif (((Get-Date) - $script:progressStartTime).TotalMinutes -gt 5) {
+                    $script:pollTimer.Stop()
+                    Write-DeferLog "Progress timeout after 5 minutes - closing dialog"
+                    $window.Close()
+                }
+            })
+            $script:pollTimer.Start()
+            Write-DeferLog "Started polling for completion signal"
+        })
+        Write-DeferLog "Attached click handler for UpdateButton"
+    }
+
+    Write-DeferLog "Showing dialog..."
+    $window.Activate()
+    $window.ShowDialog() | Out-Null
+    Write-DeferLog "Dialog closed"
+
+    # Safety fallback: if no button handler wrote the response file, write default
+    if (-not (Test-Path $ResponseFilePath)) {
+        Write-DeferLog "WARNING: No response file found after dialog close - writing default (Update)"
+        @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+    }
+
+} catch {
+    Write-DeferLog "FATAL ERROR: $($_.Exception.Message)"
+    Write-DeferLog "Stack trace: $($_.ScriptStackTrace)"
+    # Write error response so caller doesn't hang
+    @{ Action = "Error"; DeferralDays = 0; CloseProcess = $false; Error = $_.Exception.Message } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8 -ErrorAction SilentlyContinue
 }
-
-# Add update button handler
-$updateButton = $window.FindName("UpdateButton")
-if ($updateButton) {
-    $updateButton.Add_Click({
-        $script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
-        $window.Close()
-    })
-}
-
-$window.ShowDialog() | Out-Null
-
-# Write response
-$script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+Write-DeferLog "=== DEFERRAL PROMPT SCRIPT ENDED ==="
 '@
 
         Write-Log "Creating deferral prompt script: $deferralScriptPath" | Out-Null
@@ -3662,11 +4365,16 @@ $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding
         # Create task arguments with timeout parameter - ensure proper encoding for text parameters
         $encodedQuestion = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Question))
         $encodedTitle = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Title))
-        # Use hidden console window execution method
-        $hiddenArguments = "/c start /min `"`" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -DeferralOptionsJson `"$deferralOptionsJson`" -HasBlockingProcess $$HasBlockingProcess -TimeoutSeconds $TimeoutSeconds"
-        
-        # Create task using hidden console method
-        $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $hiddenArguments
+        $hasBlockingStr = if ($HasBlockingProcess) { "1" } else { "0" }
+        # Create hidden launch action using VBS wrapper (no console window flash)
+        $deferralPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -HasBlockingProcess $hasBlockingStr -TimeoutSeconds $TimeoutSeconds"
+        $deferralVbsDir = Split-Path $responseFile -Parent
+        $deferralLaunch = New-HiddenLaunchAction -PowerShellArguments $deferralPsArgs -VbsDirectory $deferralVbsDir -AllowUI
+        if ($deferralLaunch) {
+            $action = $deferralLaunch.Action
+        } else {
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -HasBlockingProcess $hasBlockingStr -TimeoutSeconds $TimeoutSeconds"
+        }
         
         # Create task principal using existing user info
         $principal = $null
@@ -3707,6 +4415,39 @@ $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding
         try {
             Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
             Write-Log "Deferral scheduled task started successfully" | Out-Null
+
+            # Diagnostic: check task state after starting
+            Start-Sleep -Seconds 3
+            $taskState = (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue).State
+            $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+            Write-Log "Task state after 3s: $taskState, LastResult: $($taskInfo.LastTaskResult), LastRunTime: $($taskInfo.LastRunTime)" | Out-Null
+
+            # Check if the prompt script file still exists
+            if (Test-Path $deferralScriptPath) {
+                $scriptSize = (Get-Item $deferralScriptPath).Length
+                Write-Log "Deferral script file exists: $deferralScriptPath ($scriptSize bytes)" | Out-Null
+            } else {
+                Write-Log "WARNING: Deferral script file NOT FOUND: $deferralScriptPath" | Out-Null
+            }
+
+            # Check if VBS file still exists
+            if ($deferralLaunch -and $deferralLaunch.VbsPath) {
+                if (Test-Path $deferralLaunch.VbsPath) {
+                    Write-Log "VBS launcher exists: $($deferralLaunch.VbsPath)" | Out-Null
+                } else {
+                    Write-Log "WARNING: VBS launcher NOT FOUND: $($deferralLaunch.VbsPath)" | Out-Null
+                }
+            }
+
+            # Check if debug log from the prompt script was created
+            $debugLogPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp\DeferralPrompt_Debug.log"
+            if (Test-Path $debugLogPath) {
+                $debugContent = Get-Content $debugLogPath -Tail 5 -ErrorAction SilentlyContinue
+                Write-Log "Deferral debug log exists. Last entries:" | Out-Null
+                foreach ($line in $debugContent) { Write-Log "  [PromptLog] $line" | Out-Null }
+            } else {
+                Write-Log "WARNING: No deferral debug log at $debugLogPath - script may not have started" | Out-Null
+            }
         } catch {
             Write-Log "Failed to start deferral scheduled task: $($_.Exception.Message)" | Out-Null
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -3719,7 +4460,8 @@ $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding
         
         # Parse response
         $deferralChoice = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
-        
+        $signalFile = $responseFile -replace '_Response\.json$', '_Complete.json'
+
         if ($response -ne "TIMEOUT" -and (Test-Path $responseFile)) {
             try {
                 $responseData = Get-Content -Path $responseFile -Raw | ConvertFrom-Json
@@ -3733,12 +4475,20 @@ $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding
                 Write-Log "Error parsing deferral response: $($_.Exception.Message)" | Out-Null
             }
         }
-        
-        # Cleanup
+
+        # If user chose Update, the dialog is still showing a progress indicator
+        # Pass the signal file path so the upgrade code can notify the dialog when done
+        if ($deferralChoice.Action -eq "Update") {
+            $deferralChoice.ProgressSignalFile = $signalFile
+            Write-Log "Progress signal file for dialog: $signalFile" | Out-Null
+        }
+
+        # Cleanup task registration and temp files (dialog process keeps running independently)
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
         Remove-Item $deferralScriptPath -Force -ErrorAction SilentlyContinue
         Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
-        
+        if ($deferralLaunch.VbsPath) { Remove-Item $deferralLaunch.VbsPath -Force -ErrorAction SilentlyContinue }
+
         return $deferralChoice
         
     } catch {
@@ -3877,35 +4627,58 @@ function Schedule-UserContextRemediation {
         
         $sourceSize = (Get-Item $Global:CurrentScriptPath).Length
         Write-Log "Source script size: $sourceSize bytes" | Out-Null
-        
-        # Copy with enhanced error handling and verification
-        try {
-            Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force -ErrorAction Stop
-            Write-Log "Copy-Item completed successfully" | Out-Null
-        } catch {
-            Write-Log "ERROR: Copy-Item failed: $($_.Exception.Message)" | Out-Null
-            return $false
+
+        # Detect bootstrapper/wrapper scenario (small file that downloads the real script via iex/irm)
+        if ($sourceSize -lt 1000) {
+            Write-Log "Source appears to be a bootstrapper wrapper ($sourceSize bytes) - downloading full script" | Out-Null
+            try {
+                $bootstrapContent = Get-Content $Global:CurrentScriptPath -Raw
+                if ($bootstrapContent -match 'irm\s+[''"]([^''"]+)[''"]') {
+                    $scriptUrl = $Matches[1]
+                    Write-Log "Extracted download URL from bootstrapper: $scriptUrl" | Out-Null
+                    $fullScript = Invoke-RestMethod -Uri $scriptUrl -ErrorAction Stop
+                    $fullScript | Out-File -FilePath $tempScriptPath -Encoding UTF8 -Force
+                    $scriptSize = (Get-Item $tempScriptPath).Length
+                    Write-Log "Downloaded full script to temp: $scriptSize bytes" | Out-Null
+                } else {
+                    Write-Log "ERROR: Could not extract download URL from bootstrapper content" | Out-Null
+                    return $false
+                }
+            } catch {
+                Write-Log "ERROR: Failed to download full script from bootstrapper URL: $($_.Exception.Message)" | Out-Null
+                return $false
+            }
+        } else {
+            # Copy with enhanced error handling and verification
+            try {
+                Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force -ErrorAction Stop
+                Write-Log "Copy-Item completed successfully" | Out-Null
+            } catch {
+                Write-Log "ERROR: Copy-Item failed: $($_.Exception.Message)" | Out-Null
+                return $false
+            }
         }
-        
+
         # Verify script copy with size validation
         if (Test-Path $tempScriptPath) {
             $scriptSize = (Get-Item $tempScriptPath).Length
-            Write-Log "Temp script exists, size: $scriptSize bytes (source: $sourceSize bytes)" | Out-Null
-            
+            $expectedMinSize = if ($sourceSize -lt 1000) { 1000 } else { $sourceSize }
+            Write-Log "Temp script exists, size: $scriptSize bytes (expected min: $expectedMinSize bytes)" | Out-Null
+
             # Validate copy integrity
-            if ($scriptSize -ne $sourceSize) {
-                Write-Log "ERROR: Script copy size mismatch! Copied: $scriptSize bytes, Expected: $sourceSize bytes" | Out-Null
+            if ($scriptSize -lt $expectedMinSize) {
+                Write-Log "ERROR: Script copy size too small! Got: $scriptSize bytes, Expected min: $expectedMinSize bytes" | Out-Null
                 Write-Log "Attempting second copy operation..." | Out-Null
-                
+
                 # Remove corrupted copy and try again
                 Remove-Item $tempScriptPath -Force -ErrorAction SilentlyContinue
                 Start-Sleep -Milliseconds 500
-                
+
                 try {
                     Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force -ErrorAction Stop
                     $retrySize = (Get-Item $tempScriptPath).Length
                     Write-Log "Retry copy completed, size: $retrySize bytes" | Out-Null
-                    
+
                     if ($retrySize -ne $sourceSize) {
                         Write-Log "ERROR: Retry copy also failed - size still incorrect" | Out-Null
                         return $false
@@ -3921,20 +4694,28 @@ function Schedule-UserContextRemediation {
         }
         
         $scriptPath = $tempScriptPath
-        # Use hidden console window execution method to prevent visible windows
-        $hiddenArguments = "/c start /min `"`" powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`""
-        
+        # Create hidden launch action using VBS wrapper (no console window flash)
+        $remPsArgs = "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`""
+        $remLaunch = New-HiddenLaunchAction -PowerShellArguments $remPsArgs -VbsDirectory $sharedTempPath
+        if (-not $remLaunch) {
+            Write-Log "ERROR: Failed to create hidden launch action - falling back to direct PowerShell" | Out-Null
+            $remLaunch = @{
+                Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`""
+                VbsPath = $null
+            }
+        }
+
         Write-Log "Creating user remediation task: $taskName" | Out-Null
         Write-Log "Script path: $scriptPath" | Out-Null
-        Write-Log "Hidden execution arguments: $hiddenArguments" | Out-Null
+        Write-Log "Launch method: $(if ($remLaunch.VbsPath) { 'VBS hidden launcher' } else { 'Direct PowerShell' })" | Out-Null
         Write-Log "Result file: $resultFile" | Out-Null
-        
+
         try {
-            Write-Log "Creating scheduled task action with hidden console method..." | Out-Null
+            Write-Log "Creating scheduled task action..." | Out-Null
             $taskCreationStart = Get-Date
-            
-            # Create task action using hidden console window method
-            $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $hiddenArguments
+
+            # Use pre-created hidden launch action (VBS wrapper)
+            $action = $remLaunch.Action
             Write-Log "Task action created successfully" | Out-Null
             
             # Create task principal (run as interactive user) - SAME AS DETECTION
@@ -4242,7 +5023,13 @@ function Schedule-UserContextRemediation {
                     Remove-Item $tempScriptPath -Force -ErrorAction SilentlyContinue
                     Write-Log "Removed temporary script copy: $tempScriptPath" | Out-Null
                 }
-                
+
+                # Clean up VBS hidden launcher file
+                if ($remLaunch.VbsPath -and (Test-Path $remLaunch.VbsPath)) {
+                    Remove-Item $remLaunch.VbsPath -Force -ErrorAction SilentlyContinue
+                    Write-Log "Removed VBS hidden launcher: $($remLaunch.VbsPath)" | Out-Null
+                }
+
                 Write-Log "User remediation cleanup completed" | Out-Null
             } catch {
                 Write-Log "Error during cleanup: $($_.Exception.Message)" | Out-Null
@@ -4672,46 +5459,46 @@ function Add-MarkerFileCleanupTrap {
     # PowerShell trap for unexpected errors
     trap {
         Write-Log -Message "Script error trap triggered - performing marker file cleanup"
-        Invoke-MarkerFileEmergencyCleanup -Reason "PowerShell trap"
+        Invoke-MarkerFileCleanup -Reason "PowerShell trap"
         continue
     }
     
     # Register cleanup for normal exit
     Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
         Write-Log -Message "PowerShell exiting - performing marker file cleanup"
-        Invoke-MarkerFileEmergencyCleanup -Reason "PowerShell exit"
+        Invoke-MarkerFileCleanup -Reason "PowerShell exit"
     } | Out-Null
     
     Write-Log -Message "Marker file cleanup traps registered"
 }
 
-function Invoke-MarkerFileEmergencyCleanup {
+function Invoke-MarkerFileCleanup {
     <#
     .SYNOPSIS
-        Emergency cleanup function for marker files during unexpected exits
+        Cleanup function for marker files during script exit
     .DESCRIPTION
         Called by trap handlers to ensure marker files are cleaned up even during errors
     .PARAMETER Reason
         Reason for the emergency cleanup (for logging)
     #>
     param(
-        [string]$Reason = "Emergency cleanup"
+        [string]$Reason = "Cleanup"
     )
-    
+
     try {
-        Write-Log -Message "EMERGENCY: Marker file cleanup triggered ($Reason)"
-        
+        Write-Log -Message "Marker file cleanup triggered ($Reason)"
+
         if ($Global:ActiveMarkerFiles -and $Global:ActiveMarkerFiles.Count -gt 0) {
-            Write-Log -Message "EMERGENCY: Cleaning up $($Global:ActiveMarkerFiles.Count) tracked marker files"
-            
+            Write-Log -Message "Cleaning up $($Global:ActiveMarkerFiles.Count) tracked marker files"
+
             foreach ($markerFile in $Global:ActiveMarkerFiles) {
                 try {
                     if (Test-Path $markerFile) {
                         Remove-Item $markerFile -Force -ErrorAction SilentlyContinue
-                        Write-Log -Message "EMERGENCY: Removed marker file: $markerFile"
+                        Write-Log -Message "Removed marker file: $markerFile"
                     }
                 } catch {
-                    # Silently continue during emergency cleanup
+                    # Silently continue during cleanup
                 }
             }
             
@@ -4729,6 +5516,7 @@ function Invoke-MarkerFileEmergencyCleanup {
 # ============================================================================
 
 <# Script variables #>
+$Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
 $ScriptTag = "8X" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
@@ -4846,7 +5634,7 @@ if (Test-Path $testTriggerFile) {
         }
         
         # Also check for any evidence in temp files that the dialog script actually ran
-        $dialogScripts = Get-ChildItem -Path "$env:TEMP" -Filter "Show-UserPrompt_*.ps1" -ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) }
+        $dialogScripts = Get-ChildItem -Path $userTempPath -Filter "Show-UserPrompt_*.ps1" -ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) }
         if ($dialogScripts.Count -gt 0) {
             Write-Log -Message "Found recent dialog script files - this indicates the dialog system attempted to run"
             $wpfWorked = $true  # Script creation is evidence of system working
@@ -4896,14 +5684,14 @@ if (Test-Path $testTriggerFile) {
         
         Write-Log -Message "WPF test completed - exiting"
         Write-Log -Message "Performing marker file cleanup before exit (WPF test complete)"
-        Invoke-MarkerFileEmergencyCleanup -Reason "WPF test completed"
+        Invoke-MarkerFileCleanup -Reason "WPF test completed"
         exit 0
         
     } catch {
         Write-Log -Message "❌ ERROR: WPF test failed with exception: $($_.Exception.Message)"
         Write-Log -Message "Full exception: $($_.Exception.ToString())"
         Write-Log -Message "Performing marker file cleanup before exit (WPF test error)"
-        Invoke-MarkerFileEmergencyCleanup -Reason "WPF test error"
+        Invoke-MarkerFileCleanup -Reason "WPF test error"
         exit 1
     }
 }
@@ -4912,7 +5700,7 @@ if (Test-Path $testTriggerFile) {
 if (-not (OOBEComplete)) {
     "OOBE"
     Write-Log -Message "OOBE not complete, performing marker file cleanup before exit"
-    Invoke-MarkerFileEmergencyCleanup -Reason "OOBE not complete"
+    Invoke-MarkerFileCleanup -Reason "OOBE not complete"
     Exit 0
 }
 
@@ -4980,8 +5768,25 @@ try {
 } catch {
     Write-Log -Message "Error parsing whitelist JSON: $($_.Exception.Message)"
     Write-Log -Message "Performing marker file cleanup before exit due to whitelist error"
-    Invoke-MarkerFileEmergencyCleanup -Reason "Whitelist parsing error"
+    Invoke-MarkerFileCleanup -Reason "Whitelist parsing error"
     exit 1
+}
+
+# TEST MODE: Add a fake test app to the whitelist for simulating the full update flow
+if ($Script:TestMode) {
+    $testApp = [PSCustomObject]@{
+        AppID = "Test.DemoApp"
+        FriendlyName = "Demo Application"
+        BlockingProcess = "notepad"
+        PromptWhenBlocked = $true
+        DefaultTimeoutAction = $false
+        TimeoutSeconds = 120
+        DeferralEnabled = $true
+        MaxDeferralDays = 5
+        ForcedUpgradeMessage = "This is a test update that can no longer be deferred."
+    }
+    $whitelistConfig = @($whitelistConfig) + @($testApp)
+    Write-Log -Message "TEST MODE: Added Test.DemoApp to whitelist (blocking process: notepad)"
 }
 
 # Main remediation logic - dual-context architecture
@@ -5275,7 +6080,7 @@ if (Test-RunningAsSystem) {
                 }
             }
             Write-Log -Message "Performing marker file cleanup before exit (user context error)"
-            Invoke-MarkerFileEmergencyCleanup -Reason "User context execution error"
+            Invoke-MarkerFileCleanup -Reason "User context execution error"
             exit 1
         }
         
@@ -5340,7 +6145,7 @@ if (Test-RunningAsSystem) {
                     $errorResult | ConvertTo-Json -Depth 3 -Compress | Out-File -FilePath $RemediationResultFile -Encoding UTF8 -Force
                 }
                 Write-Log -Message "Performing marker file cleanup before exit (user context timeout/error)"
-                Invoke-MarkerFileEmergencyCleanup -Reason "User context timeout or error"
+                Invoke-MarkerFileCleanup -Reason "User context timeout or error"
                 exit 1
             }
         }
@@ -5363,7 +6168,7 @@ if (Test-RunningAsSystem) {
                 Write-Log -Message "Error executing winget in system context: $($_.Exception.Message)"
                 Write-Log -Message "Winget execution failed, exiting"
                 Write-Log -Message "Performing marker file cleanup before exit (winget execution failed)"
-                Invoke-MarkerFileEmergencyCleanup -Reason "Winget execution failed in system context"
+                Invoke-MarkerFileCleanup -Reason "Winget execution failed in system context"
                 exit 1
             }
             
@@ -5384,7 +6189,7 @@ if (Test-RunningAsSystem) {
         } else {
             Write-Log -Message "Winget not detected in SYSTEM context"
             Write-Log -Message "Performing marker file cleanup before exit (no winget in system context)"
-            Invoke-MarkerFileEmergencyCleanup -Reason "Winget not detected in SYSTEM context"
+            Invoke-MarkerFileCleanup -Reason "Winget not detected in SYSTEM context"
             exit 0
         }
     }
@@ -5399,7 +6204,7 @@ if (Test-RunningAsSystem) {
         Write-Log -Message "Error executing winget in user context: $($_.Exception.Message)"
         Write-Log -Message "Winget may not be available or properly configured"
         Write-Log -Message "Performing marker file cleanup before exit (winget not available)"
-        Invoke-MarkerFileEmergencyCleanup -Reason "Winget not available or properly configured"
+        Invoke-MarkerFileCleanup -Reason "Winget not available or properly configured"
         exit 1
     }
     
@@ -5417,6 +6222,16 @@ if (Test-RunningAsSystem) {
         Write-Log -Message "First winget run produced invalid output, retrying..."
         $OUTPUT = $(winget upgrade --accept-source-agreements)
     }
+}
+
+# TEST MODE: Replace winget output with simulated upgrade data
+if ($Script:TestMode) {
+    Write-Log -Message "TEST MODE: Injecting simulated winget output for Test.DemoApp (1.0.0 -> 2.0.0)"
+    $OUTPUT = @(
+        "Name              Id                Version   Available  Source",
+        "----------------------------------------------------------------",
+        "Demo Application  Test.DemoApp      1.0.0     2.0.0      winget"
+    )
 }
 
 # Parse winget output and process apps
@@ -5513,15 +6328,24 @@ if ($OUTPUT) {
                         # First, check deferral status if deferrals are enabled
                         if ($okapp.DeferralEnabled -eq $true) {
                             Write-Log -Message "Deferral system enabled for $($okapp.AppID), checking status" | Out-Null
-                            
+
                             $deferralStatus = Get-DeferralStatus -AppID $okapp.AppID -WhitelistConfig $okapp -AvailableVersion $appInfo.AvailableVersion
-                            
-                            if (-not $deferralStatus.ForceUpdate) {
-                                Write-Log -Message "Update for $($okapp.AppID) can be deferred - skipping this run" | Out-Null
-                                Write-Log -Message "Deferral message: $($deferralStatus.Message)" | Out-Null
-                                continue  # Skip this app - user can defer
-                            } else {
+
+                            if ($deferralStatus.ForceUpdate) {
+                                # Past admin hard deadline or user deadline - mandatory update
                                 Write-Log -Message "Update for $($okapp.AppID) is now mandatory: $($deferralStatus.Message)" | Out-Null
+                            } elseif ($deferralStatus.DeferralsUsed -gt 0 -and $deferralStatus.UserDeadline -and (Get-Date) -lt $deferralStatus.UserDeadline) {
+                                # User has an active deferral that hasn't expired yet - skip silently
+                                Write-Log -Message "Update for $($okapp.AppID) has active deferral until $($deferralStatus.UserDeadline.ToString('yyyy-MM-dd HH:mm')) - skipping this run" | Out-Null
+                                Write-Log -Message "Deferral message: $($deferralStatus.Message)" | Out-Null
+                                continue  # Skip this app - user explicitly deferred
+                            } else {
+                                # First detection or expired deferral - fall through to show dialog
+                                if ($deferralStatus.DeferralsUsed -gt 0) {
+                                    Write-Log -Message "Previous deferral for $($okapp.AppID) has expired - showing update dialog" | Out-Null
+                                } else {
+                                    Write-Log -Message "First detection of update for $($okapp.AppID) - showing update dialog" | Out-Null
+                                }
                             }
                         }
                         
@@ -5628,10 +6452,17 @@ if ($OUTPUT) {
                                         Start-Sleep -Seconds 3
                                         
                                         # Verify processes are really stopped
+                                        # Exclude AutoCloseProcesses from check — services like warp-svc auto-restart via SCM
+                                        $autoCloseList2 = @()
+                                        if (-not [string]::IsNullOrEmpty($okapp.AutoCloseProcesses)) {
+                                            $autoCloseList2 = ($okapp.AutoCloseProcesses -split ',') | ForEach-Object { $_.Trim() }
+                                        }
                                         $stillRunning = $false
                                         foreach ($processName in $processesToCheck) {
                                             $processName = $processName.Trim()
+                                            if ($processName -in $autoCloseList2) { continue }
                                             if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
+                                                Write-Log -Message "Process still running after close attempt: $processName"
                                                 $stillRunning = $true
                                                 break
                                             }
@@ -5639,10 +6470,16 @@ if ($OUTPUT) {
                                         
                                         if ($stillRunning) {
                                             Write-Log -Message "Some processes still running after close attempt for $($okapp.AppID), skipping"
+                                            if ($dialogResult.ProgressSignalFile) {
+                                                @{ Success = $false; Message = "Could not close application" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                                            }
                                             continue
                                         }
                                     } else {
                                         Write-Log -Message "Failed to stop blocking processes for $($okapp.AppID), skipping"
+                                        if ($dialogResult.ProgressSignalFile) {
+                                            @{ Success = $false; Message = "Could not close application" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                                        }
                                         continue
                                     }
                                 } else {
@@ -5654,7 +6491,7 @@ if ($OUTPUT) {
                         
                         # Determine if we can perform the upgrade based on context
                         if ((Test-RunningAsSystem) -or $userIsAdmin) {
-                            Write-Log -Message "Upgrade $($okapp.AppID) in system/admin context"
+                            Write-Log -Message "Upgrade $($okapp.AppID) in $(if (Test-RunningAsSystem) { 'SYSTEM' } else { 'admin user' }) context"
                             $doUpgrade = $true
                             break  # Break out of whitelist loop to proceed with upgrade
                         } elseif (-not (Test-RunningAsSystem)) {
@@ -5668,22 +6505,53 @@ if ($OUTPUT) {
 
                 if ($doUpgrade) {
                     $count++
-                    Write-Log -Message "Starting upgrade for: $($appInfo.AppID)"
-                    
-                    try {
-                        Write-Log -Message "Executing winget upgrade for: $($appInfo.AppID)"
-                        
-                        # First attempt: Standard upgrade - use appropriate winget path and scope based on context
-                        if ((Test-RunningAsSystem) -and $WingetPath) {
-                            $upgradeResult = & .\winget.exe upgrade --silent --accept-source-agreements --id $appInfo.AppID 2>&1
-                        } elseif ($userIsAdmin) {
-                            $upgradeResult = & winget upgrade --silent --accept-source-agreements --id $appInfo.AppID 2>&1
+                    $infoSignalFile = $null
+
+                    # Show informational progress dialog when no interactive dialog with built-in progress is active
+                    if ((-not $dialogResult -or -not $dialogResult.ProgressSignalFile) -and (Test-RunningAsSystem)) {
+                        if (-not (Test-InfoDialogsSuppressed)) {
+                            $infoSignalFile = Show-UpgradeProgressNotification -AppName $okapp.AppID -FriendlyName $okapp.FriendlyName -CurrentVersion $appInfo.CurrentVersion -AvailableVersion $appInfo.AvailableVersion
                         } else {
-                            # User context without admin - use user scope
-                            Write-Log -Message "Using --scope user for non-admin user context upgrade"
-                            $upgradeResult = & winget upgrade --silent --accept-source-agreements --scope user --id $appInfo.AppID 2>&1
+                            Write-Log -Message "Informational dialogs suppressed for today" | Out-Null
                         }
-                        
+                    }
+
+                    # Determine the active signal file for status updates (deferral dialog or informational dialog)
+                    $activeSignalFile = if ($dialogResult -and $dialogResult.ProgressSignalFile) { $dialogResult.ProgressSignalFile } elseif ($infoSignalFile) { $infoSignalFile } else { $null }
+
+                    Write-Log -Message "Starting upgrade for: $($appInfo.AppID)"
+
+                    try {
+                        # TEST MODE: Simulate upgrade instead of running winget
+                        if ($Script:TestMode -and $appInfo.AppID -eq "Test.DemoApp") {
+                            Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Downloading update..."
+                            Write-Log -Message "TEST MODE: Simulating upgrade for $($appInfo.AppID) (1.0.0 -> 2.0.0)"
+                            Start-Sleep -Seconds 3
+                            $upgradeOutput = "Successfully installed"
+                            Write-Log -Message "TEST MODE: Simulated upgrade completed"
+                        } else {
+                        Write-Log -Message "Executing winget upgrade for: $($appInfo.AppID)"
+                        Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Downloading update..."
+
+                        # First attempt: Standard upgrade with progress monitoring
+                        $wingetExe = if ((Test-RunningAsSystem) -and $WingetPath) { Join-Path $WingetPath "winget.exe" } else { "winget.exe" }
+                        $wingetDir = if ((Test-RunningAsSystem) -and $WingetPath) { $WingetPath } else { $null }
+                        $wingetArgs = @("upgrade", "--silent", "--accept-source-agreements", "--id", $appInfo.AppID)
+
+                        # Detect installed scope and add --scope flag accordingly
+                        $detectedScope = "unknown"
+                        if ((Test-RunningAsSystem)) {
+                            $detectedScope = Get-AppInstalledScope -AppID $appInfo.AppID -FriendlyName $okapp.FriendlyName
+                            if ($detectedScope -eq "user") {
+                                Write-Log -Message "Using --scope user for $($appInfo.AppID) (detected as user-scoped install)"
+                                $wingetArgs += @("--scope", "user")
+                            }
+                        } elseif (-not $userIsAdmin) {
+                            Write-Log -Message "Using --scope user for non-admin user context upgrade"
+                            $wingetArgs += @("--scope", "user")
+                        }
+                        $upgradeResult = Invoke-WingetWithProgress -WingetExe $wingetExe -Arguments $wingetArgs -SignalFilePath $activeSignalFile -WorkingDirectory $wingetDir
+
                         $upgradeOutput = $upgradeResult -join "`n"
                         # Extract meaningful lines from winget output for logging
                         $meaningfulLines = @()
@@ -5706,16 +6574,15 @@ if ($OUTPUT) {
                         
                         # Handle specific failure cases
                         if ($upgradeOutput -like "*install technology is different*") {
+                            Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Reinstalling application..."
                             Write-Log -Message "Install technology mismatch detected for $($appInfo.AppID). Attempting uninstall and reinstall."
                             
-                            # First uninstall - use appropriate winget path and scope based on context
+                            # First uninstall - use detected scope
+                            $scopeArgs = if ($detectedScope -eq "user" -or (-not (Test-RunningAsSystem) -and -not $userIsAdmin)) { @("--scope", "user") } else { @() }
                             if ((Test-RunningAsSystem) -and $WingetPath) {
-                                $uninstallResult = & .\winget.exe uninstall --silent --id $appInfo.AppID 2>&1
-                            } elseif ($userIsAdmin) {
-                                $uninstallResult = & winget uninstall --silent --id $appInfo.AppID 2>&1
+                                $uninstallResult = & .\winget.exe uninstall --silent @scopeArgs --id $appInfo.AppID 2>&1
                             } else {
-                                # User context without admin - use user scope
-                                $uninstallResult = & winget uninstall --silent --scope user --id $appInfo.AppID 2>&1
+                                $uninstallResult = & winget uninstall --silent @scopeArgs --id $appInfo.AppID 2>&1
                             }
                             
                             $uninstallOutput = $uninstallResult -join "`n"
@@ -5730,59 +6597,81 @@ if ($OUTPUT) {
                             
                             # Then install fresh - use appropriate winget path and scope based on context
                             if ((Test-RunningAsSystem) -and $WingetPath) {
-                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements --id $appInfo.AppID 2>&1
-                            } elseif ($userIsAdmin) {
-                                $upgradeResult = & winget install --silent --accept-source-agreements --id $appInfo.AppID 2>&1
+                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements @scopeArgs --id $appInfo.AppID 2>&1
                             } else {
-                                # User context without admin - use user scope
-                                $upgradeResult = & winget install --silent --accept-source-agreements --scope user --id $appInfo.AppID 2>&1
+                                $upgradeResult = & winget install --silent --accept-source-agreements @scopeArgs --id $appInfo.AppID 2>&1
                             }
                             
                             $upgradeOutput = $upgradeResult -join "`n"
                             Write-Log -Message "Fresh install completed for $($appInfo.AppID)"
                             
                         } elseif ($upgradeOutput -like "*Uninstall failed*") {
+                            Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Retrying installation..."
                             Write-Log -Message "Uninstall failure detected for $($appInfo.AppID). Trying alternative approaches."
                             
-                            # Try install with --force to override - use appropriate winget path and scope based on context
+                            # Try install with --force to override - use detected scope
+                            $scopeArgs = if ($detectedScope -eq "user" -or (-not (Test-RunningAsSystem) -and -not $userIsAdmin)) { @("--scope", "user") } else { @() }
                             if ((Test-RunningAsSystem) -and $WingetPath) {
-                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements --force --id $appInfo.AppID 2>&1
-                            } elseif ($userIsAdmin) {
-                                $upgradeResult = & winget install --silent --accept-source-agreements --force --id $appInfo.AppID 2>&1
+                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements --force @scopeArgs --id $appInfo.AppID 2>&1
                             } else {
-                                # User context without admin - use user scope
-                                $upgradeResult = & winget install --silent --accept-source-agreements --scope user --force --id $appInfo.AppID 2>&1
+                                $upgradeResult = & winget install --silent --accept-source-agreements --force @scopeArgs --id $appInfo.AppID 2>&1
                             }
                             
                             $upgradeOutput = $upgradeResult -join "`n"
                             Write-Log -Message "Force install completed for $($appInfo.AppID)"
                         }
-                        
+                        } # end else (non-test mode winget upgrade)
+
                         # Evaluate success
-                        if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*") {
+                        Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Verifying installation..."
+                        if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*Successfully updated*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*" -or ($LASTEXITCODE -eq 0 -and $upgradeOutput -notlike "*failed*" -and $upgradeOutput -notlike "*error*0x*")) {
                             Write-Log -Message "Upgrade completed successfully for: $($appInfo.AppID)"
                             $message += "$($appInfo.AppID)|"
 
-                            # Show completion notification if user was prompted to close a process
-                            if ($dialogResult -and ($dialogResult.CloseProcess -or $dialogResult.UserChoice)) {
+                            if ($dialogResult -and $dialogResult.ProgressSignalFile) {
+                                # Signal the deferral dialog's progress mode
+                                @{ Success = $true; Message = "Update complete" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                                Write-Log -Message "Wrote completion signal to progress dialog"
+                            } elseif ($infoSignalFile) {
+                                # Signal the informational progress dialog
+                                @{ Success = $true; Message = "Update complete" } | ConvertTo-Json | Out-File -FilePath $infoSignalFile -Encoding UTF8
+                                Write-Log -Message "Signaled informational progress dialog"
+                            } elseif (($dialogResult -and ($dialogResult.CloseProcess -or $dialogResult.UserChoice)) -or ($Script:TestMode -and $appInfo.AppID -eq "Test.DemoApp")) {
+                                # Fallback: show separate completion notification
                                 Show-CompletionNotification -AppName $okapp.AppID -FriendlyName $okapp.FriendlyName
                             }
                         } else {
-                            Write-Log -Message "Upgrade failed for $($appInfo.AppID) - Exit code: $LASTEXITCODE"
+                            # Log full output for debugging (filter out progress bar characters)
+                            $debugLines = ($upgradeResult | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne "" -and $_ -notmatch '^[\u2580-\u259F\s\|/\\-]+$' }) -join " | "
+                            Write-Log -Message "Upgrade failed for $($appInfo.AppID) - Exit code: $LASTEXITCODE - Output: $debugLines"
                             $message += "$($appInfo.AppID) (FAILED)|"
+                            if ($dialogResult -and $dialogResult.ProgressSignalFile) {
+                                @{ Success = $false; Message = "Update failed" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                                Write-Log -Message "Wrote failure signal to progress dialog"
+                            } elseif ($infoSignalFile) {
+                                @{ Success = $false; Message = "Update failed" } | ConvertTo-Json | Out-File -FilePath $infoSignalFile -Encoding UTF8
+                                Write-Log -Message "Signaled informational progress dialog (failure)"
+                            }
                         }
                     } catch {
                         Write-Log -Message "Error upgrading $($appInfo.AppID) : $($_.Exception.Message)"
                         $message += "$($appInfo.AppID) (ERROR)|"
+                        if ($dialogResult -and $dialogResult.ProgressSignalFile) {
+                            @{ Success = $false; Message = "Update error" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                        } elseif ($infoSignalFile) {
+                            @{ Success = $false; Message = "Update error" } | ConvertTo-Json | Out-File -FilePath $infoSignalFile -Encoding UTF8
+                        }
                     }
                 }
             }
         }
 
         # If we're in SYSTEM context and processed system apps, check for interactive session before scheduling user context
-        if ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
+        if ($Script:TestMode) {
+            Write-Log -Message "TEST MODE: Skipping user context remediation scheduling (test app is system-only)"
+        } elseif ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
             Write-Log -Message "SYSTEM context processing complete - checking for interactive session"
-            
+
             if (-not (Test-InteractiveSession)) {
                 Write-Log -Message "No interactive session detected - skipping user context remediation"
                 Write-Log -Message "[$ScriptTag] Remediation completed: $count apps processed (system only, no interactive session)"
@@ -5877,15 +6766,15 @@ if ($OUTPUT) {
         }
         
         Write-Log -Message "Performing final marker file cleanup before script completion"
-        Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (remediation complete)"
+        Invoke-MarkerFileCleanup -Reason "Script completion (remediation complete)"
         exit 0
     }
     Write-Log -Message "[$ScriptTag] No upgrades (0x0000002)"
     Write-Log -Message "Performing final marker file cleanup before script exit (no upgrades)"
-    Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (no upgrades)"
+    Invoke-MarkerFileCleanup -Reason "Script completion (no upgrades)"
     exit 0
 }
 Write-Log -Message "[$ScriptTag] Winget not detected"
 Write-Log -Message "Performing final marker file cleanup before script exit (winget not detected)"
-Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (winget not detected)"
+Invoke-MarkerFileCleanup -Reason "Script completion (winget not detected)"
 exit 0

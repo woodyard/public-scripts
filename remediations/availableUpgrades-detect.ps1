@@ -469,6 +469,55 @@ function Invoke-MarkerFileEmergencyCleanup {
 # END MARKER FILE MANAGEMENT SYSTEM
 # ============================================================================
 
+function New-HiddenLaunchAction {
+    <#
+    .SYNOPSIS
+        Creates a scheduled task action that launches PowerShell without any visible window flash.
+    .DESCRIPTION
+        Uses wscript.exe with a temporary VBS launcher instead of cmd.exe.
+        wscript.exe is a GUI subsystem application and never creates a console window,
+        eliminating the brief window flash that cmd.exe /c start /min causes.
+    .PARAMETER PowerShellArguments
+        The full PowerShell command-line arguments (e.g. "-NoProfile -WindowStyle Hidden -File ...")
+    .PARAMETER VbsDirectory
+        Directory where the temporary VBS launcher file will be created
+    .OUTPUTS
+        Hashtable with Action (ScheduledTaskAction) and VbsPath (for cleanup)
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$PowerShellArguments,
+
+        [Parameter(Mandatory=$true)]
+        [string]$VbsDirectory
+    )
+
+    try {
+        # Ensure directory exists
+        if (-not (Test-Path $VbsDirectory)) {
+            New-Item -Path $VbsDirectory -ItemType Directory -Force | Out-Null
+        }
+
+        $vbsPath = Join-Path $VbsDirectory "HiddenLaunch_$(Get-Random).vbs"
+
+        # Escape double quotes for VBS string (VBS uses "" to escape quotes)
+        $escapedArgs = $PowerShellArguments.Replace('"', '""')
+        $vbsContent = "CreateObject(""WScript.Shell"").Run ""$escapedArgs"", 0, True"
+
+        $vbsContent | Out-File -FilePath $vbsPath -Encoding ASCII -Force
+
+        Write-Log "Created VBS hidden launcher: $vbsPath" -IsDebug
+
+        return @{
+            Action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument """$vbsPath"""
+            VbsPath = $vbsPath
+        }
+    } catch {
+        Write-Log "ERROR: Failed to create hidden launch action: $($_.Exception.Message)"
+        return $null
+    }
+}
+
 function Test-InteractiveSession {
     <#
     .SYNOPSIS
@@ -735,7 +784,32 @@ function Invoke-UserContextDetection {
         $tempScriptPath = Join-Path $sharedTempPath $tempScriptName
         
         Write-Log "Copying script to user-accessible location: $tempScriptPath" | Out-Null
-        Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force
+        $sourceSize = (Get-Item $Global:CurrentScriptPath).Length
+        Write-Log "Source script size: $sourceSize bytes" | Out-Null
+
+        # Detect bootstrapper/wrapper scenario (small file that downloads the real script via iex/irm)
+        if ($sourceSize -lt 1000) {
+            Write-Log "Source appears to be a bootstrapper wrapper ($sourceSize bytes) - downloading full script" | Out-Null
+            try {
+                $bootstrapContent = Get-Content $Global:CurrentScriptPath -Raw
+                if ($bootstrapContent -match 'irm\s+[''"]([^''"]+)[''"]') {
+                    $scriptUrl = $Matches[1]
+                    Write-Log "Extracted download URL from bootstrapper: $scriptUrl" | Out-Null
+                    $fullScript = Invoke-RestMethod -Uri $scriptUrl -ErrorAction Stop
+                    $fullScript | Out-File -FilePath $tempScriptPath -Encoding UTF8 -Force
+                    $dlSize = (Get-Item $tempScriptPath).Length
+                    Write-Log "Downloaded full script to temp: $dlSize bytes" | Out-Null
+                } else {
+                    Write-Log "ERROR: Could not extract download URL from bootstrapper content" | Out-Null
+                    return @()
+                }
+            } catch {
+                Write-Log "ERROR: Failed to download full script from bootstrapper URL: $($_.Exception.Message)" | Out-Null
+                return @()
+            }
+        } else {
+            Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force
+        }
         
         $scriptPath = $tempScriptPath
         
@@ -747,12 +821,20 @@ function Invoke-UserContextDetection {
             Write-Log -Message "ERROR: Failed to create user detection marker file - user detection may not work properly"
         }
         
-        # Use hidden console window execution method to prevent visible windows
-        $hiddenArguments = "/c start /min `"`" powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
-        
+        # Create hidden launch action using VBS wrapper (no console window flash)
+        $psArgs = "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
+        $launch = New-HiddenLaunchAction -PowerShellArguments $psArgs -VbsDirectory $sharedTempPath
+        if (-not $launch) {
+            Write-Log "ERROR: Failed to create hidden launch action - falling back to direct PowerShell"
+            $launch = @{
+                Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
+                VbsPath = $null
+            }
+        }
+
         Write-Log "Creating user detection task: $taskName" | Out-Null
         Write-Log "Script path: $scriptPath" | Out-Null
-        Write-Log "Hidden execution arguments: $hiddenArguments" | Out-Null
+        Write-Log "Launch method: $(if ($launch.VbsPath) { 'VBS hidden launcher' } else { 'Direct PowerShell' })" | Out-Null
         Write-Log "Result file: $resultFile" | Out-Null
         Write-Log "Marker file: $markerFile" | Out-Null
         
@@ -777,8 +859,8 @@ function Invoke-UserContextDetection {
         }
         
         try {
-            # Create task action using hidden console window method
-            $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $hiddenArguments
+            # Use pre-created hidden launch action (VBS wrapper)
+            $action = $launch.Action
             
             # Create task principal (run as interactive user)
             $principal = $null
@@ -850,7 +932,7 @@ function Invoke-UserContextDetection {
             }
             
             # Wait for results with reduced timeout for faster detection
-            $timeout = 30  # Reduced from 60 to 30 seconds
+            $timeout = 90  # Allow time for whitelist download + winget enumeration
             $startTime = Get-Date
             $apps = @()
             
@@ -970,6 +1052,12 @@ function Invoke-UserContextDetection {
                 } else {
                     Write-Log "DEBUG: Temp script not found during cleanup: $tempScriptPath" -IsDebug | Out-Null
                 }
+
+                # Clean up VBS hidden launcher file
+                if ($launch.VbsPath -and (Test-Path $launch.VbsPath)) {
+                    Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue
+                    Write-Log "Removed VBS hidden launcher: $($launch.VbsPath)" -IsDebug | Out-Null
+                }
                 
                 # Clean up marker file using centralized function
                 $markerFileCleanup = "$tempScriptPath.userdetection"
@@ -1011,6 +1099,7 @@ function Invoke-UserContextDetection {
 }
 
 <# Script variables #>
+$Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
 $ScriptTag = "5C" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
@@ -1540,7 +1629,15 @@ if ($OUTPUT) {
             # SYSTEM context main execution - check system apps first, only run user detection if none found
             $systemApps = $contextApps
             # Write-Log -Message "System detection found $($systemApps.Count) apps: $($systemApps -join ', ')"
-            
+
+            # TEST MODE: Simulate finding an app that needs updating
+            if ($Script:TestMode) {
+                Write-Log -Message "TEST MODE: Simulating detected upgrade for Test.DemoApp"
+                Write-Log -Message "[$ScriptTag] Test.DemoApp"
+                Invoke-MarkerFileEmergencyCleanup -Reason "Test mode - simulated detection"
+                exit 1
+            }
+
             # PERFORMANCE OPTIMIZATION: Exit immediately if system apps are found
             if ($systemApps.Count -gt 0) {
                 Write-Log -Message "[$ScriptTag] $($systemApps -join ', ')"
