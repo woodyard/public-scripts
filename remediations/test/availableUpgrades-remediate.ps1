@@ -2129,7 +2129,13 @@ Add-Type -AssemblyName System.Windows.Forms
 
         # Create and run scheduled task
         $taskName = "CompletionNotification_$notificationId"
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$notificationScriptPath`" -AppName `"$AppName`""
+        $notifPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$notificationScriptPath`" -AppName `"$AppName`""
+        $notifLaunch = New-HiddenLaunchAction -PowerShellArguments $notifPsArgs -VbsDirectory $notifUserTempPath -AllowUI
+        if ($notifLaunch) {
+            $action = $notifLaunch.Action
+        } else {
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$notificationScriptPath`" -AppName `"$AppName`""
+        }
 
         $principal = $null
         $userFormats = @($userInfo.FullName, $userInfo.Username, ".\$($userInfo.Username)")
@@ -2153,6 +2159,9 @@ Add-Type -AssemblyName System.Windows.Forms
             Start-Sleep -Seconds 10
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
             Remove-Item $notificationScriptPath -Force -ErrorAction SilentlyContinue
+            if ($notifLaunch -and $notifLaunch.VbsPath) {
+                Remove-Item $notifLaunch.VbsPath -Force -ErrorAction SilentlyContinue
+            }
         }
 
     } catch {
@@ -3701,8 +3710,8 @@ try {
 
     $dialogWidth = [Math]::Max(500, ($deferralOptions.Count + 1) * 110 + 100)
 
-    # XML-escape the decoded text
-    $escapedQuestion = [System.Security.SecurityElement]::Escape($actualQuestion)
+    # XML-escape the decoded text and preserve newlines as XML entities
+    $escapedQuestion = [System.Security.SecurityElement]::Escape($actualQuestion) -replace "`n", "&#10;"
     $escapedTitle = [System.Security.SecurityElement]::Escape($actualTitle)
 
     $xaml = @"
