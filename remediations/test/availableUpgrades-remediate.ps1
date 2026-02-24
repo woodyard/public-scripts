@@ -1900,7 +1900,7 @@ try {
     $escapedAppName = [System.Security.SecurityElement]::Escape($AppDisplayName)
     $versionXml = ""
     if ($VersionInfo) {
-        $versionXml = "<TextBlock Text=`"$VersionInfo`" Foreground=`"#FF888888`" FontSize=`"11`" Margin=`"0,0,0,4`"/>"
+        $versionXml = "<TextBlock Grid.Row=`"1`" Text=`"$VersionInfo`" Foreground=`"#FF888888`" FontSize=`"11`" Margin=`"0,0,0,4`"/>"
     }
 
     $xaml = @"
