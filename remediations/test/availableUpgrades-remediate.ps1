@@ -5673,9 +5673,14 @@ if ($OUTPUT) {
                             $deferralStatus = Get-DeferralStatus -AppID $okapp.AppID -WhitelistConfig $okapp -AvailableVersion $appInfo.AvailableVersion
                             
                             if (-not $deferralStatus.ForceUpdate) {
-                                Write-Log -Message "Update for $($okapp.AppID) can be deferred - skipping this run" | Out-Null
-                                Write-Log -Message "Deferral message: $($deferralStatus.Message)" | Out-Null
-                                continue  # Skip this app - user can defer
+                                # TEST MODE: Don't skip - let it proceed to blocking process check and show dialog
+                                if ($Script:TestMode -and $appInfo.AppID -eq "Test.DemoApp") {
+                                    Write-Log -Message "TEST MODE: Overriding deferral skip - proceeding to show dialog" | Out-Null
+                                } else {
+                                    Write-Log -Message "Update for $($okapp.AppID) can be deferred - skipping this run" | Out-Null
+                                    Write-Log -Message "Deferral message: $($deferralStatus.Message)" | Out-Null
+                                    continue  # Skip this app - user can defer
+                                }
                             } else {
                                 Write-Log -Message "Update for $($okapp.AppID) is now mandatory: $($deferralStatus.Message)" | Out-Null
                             }
