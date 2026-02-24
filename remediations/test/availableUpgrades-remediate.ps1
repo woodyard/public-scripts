@@ -3824,28 +3824,31 @@ try {
     $script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
 
     # Add deferral button handlers
+    # NOTE: Do NOT use .GetNewClosure() - it creates a new module scope that breaks $script:result
+    # The handlers use $this.Tag for the days value, so no closure capture is needed
     foreach ($days in $deferralOptions) {
         $button = $window.FindName("DeferButton$days")
         if ($button) {
             $button.Add_Click({
                 $selectedDays = [int]$this.Tag
                 $script:result = @{ Action = "Defer"; DeferralDays = $selectedDays; CloseProcess = $false }
+                Write-DeferLog "Defer button clicked - deferring $selectedDays day(s)"
                 $window.Close()
-            }.GetNewClosure())
+            })
             Write-DeferLog "Attached click handler for DeferButton$days"
         }
     }
 
     # Close button acts as minimum deferral
-    $minDeferDays = [int]($deferralOptions | Sort-Object | Select-Object -First 1)
+    $script:minDeferDays = [int]($deferralOptions | Sort-Object | Select-Object -First 1)
     $closeButton = $window.FindName("CloseButton")
     if ($closeButton) {
         $closeButton.Add_Click({
-            $script:result = @{ Action = "Defer"; DeferralDays = $minDeferDays; CloseProcess = $false }
-            Write-DeferLog "Close button clicked - deferring $minDeferDays day(s)"
+            $script:result = @{ Action = "Defer"; DeferralDays = $script:minDeferDays; CloseProcess = $false }
+            Write-DeferLog "Close button clicked - deferring $($script:minDeferDays) day(s)"
             $window.Close()
-        }.GetNewClosure())
-        Write-DeferLog "Attached close button handler (defers $minDeferDays day(s))"
+        })
+        Write-DeferLog "Attached close button handler (defers $($script:minDeferDays) day(s))"
     }
 
     $script:responseWritten = $false
