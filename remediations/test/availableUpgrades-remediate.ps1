@@ -1457,6 +1457,7 @@ function Show-ProcessCloseDialog {
                 DeferralDays = $deferralChoice.DeferralDays
                 Action = $deferralChoice.Action
                 UserChoice = ($deferralChoice.Action -eq "Update")
+                ProgressSignalFile = $deferralChoice.ProgressSignalFile
             }
             
         } else {
@@ -3792,9 +3793,14 @@ try {
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0" Text="$escapedQuestion" Foreground="$textColor" TextWrapping="Wrap" Margin="0,0,0,20" FontSize="12"/>
-            <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Center">$buttonXml</StackPanel>
+            <TextBlock Grid.Row="0" Name="QuestionText" Text="$escapedQuestion" Foreground="$textColor" TextWrapping="Wrap" Margin="0,0,0,20" FontSize="12"/>
+            <StackPanel Grid.Row="1" Name="ButtonPanel" Orientation="Horizontal" HorizontalAlignment="Center">$buttonXml</StackPanel>
+            <StackPanel Grid.Row="2" Name="ProgressPanel" Visibility="Collapsed" HorizontalAlignment="Center" Margin="0,5,0,0">
+                <ProgressBar Name="ProgressBar" IsIndeterminate="True" Width="300" Height="3" Margin="0,0,0,10" Foreground="#FF0078D4"/>
+                <TextBlock Name="ProgressText" Text="Updating..." Foreground="$textColor" FontSize="12" HorizontalAlignment="Center"/>
+            </StackPanel>
         </Grid>
     </Border>
 </Window>
@@ -3825,11 +3831,62 @@ try {
         }
     }
 
+    $script:responseWritten = $false
     $updateButton = $window.FindName("UpdateButton")
     if ($updateButton) {
         $updateButton.Add_Click({
+            # Write response immediately so SYSTEM script can proceed with the upgrade
             $script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
-            $window.Close()
+            $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+            $script:responseWritten = $true
+            Write-DeferLog "Response written for Update action, switching to progress mode"
+
+            # Switch to progress UI
+            $window.FindName("ButtonPanel").Visibility = [System.Windows.Visibility]::Collapsed
+            $window.FindName("ProgressPanel").Visibility = [System.Windows.Visibility]::Visible
+            $window.FindName("QuestionText").Text = "Closing application and installing update..."
+
+            # Poll for completion signal file
+            $script:signalFilePath = $ResponseFilePath -replace '_Response\.json$', '_Complete.json'
+            $script:progressStartTime = Get-Date
+
+            $script:pollTimer = [System.Windows.Threading.DispatcherTimer]::new()
+            $script:pollTimer.Interval = [TimeSpan]::FromSeconds(2)
+            $script:pollTimer.Add_Tick({
+                if (Test-Path $script:signalFilePath) {
+                    $script:pollTimer.Stop()
+                    Write-DeferLog "Completion signal received at: $script:signalFilePath"
+                    try {
+                        $signalData = Get-Content $script:signalFilePath -Raw | ConvertFrom-Json
+                        $pBar = $window.FindName("ProgressBar")
+                        $pText = $window.FindName("ProgressText")
+                        $pBar.IsIndeterminate = $false
+                        $pBar.Value = 100
+                        if ($signalData.Success -eq $true) {
+                            $pText.Text = "Update complete!"
+                        } else {
+                            $pText.Text = "Update could not be completed."
+                        }
+                    } catch {
+                        Write-DeferLog "Error reading signal: $($_.Exception.Message)"
+                        $window.FindName("ProgressText").Text = "Update complete!"
+                    }
+                    # Auto-close after 3 seconds
+                    $script:closeTimer = [System.Windows.Threading.DispatcherTimer]::new()
+                    $script:closeTimer.Interval = [TimeSpan]::FromSeconds(3)
+                    $script:closeTimer.Add_Tick({
+                        $script:closeTimer.Stop()
+                        $window.Close()
+                    })
+                    $script:closeTimer.Start()
+                } elseif (((Get-Date) - $script:progressStartTime).TotalMinutes -gt 5) {
+                    $script:pollTimer.Stop()
+                    Write-DeferLog "Progress timeout after 5 minutes - closing dialog"
+                    $window.Close()
+                }
+            })
+            $script:pollTimer.Start()
+            Write-DeferLog "Started polling for completion signal"
         })
         Write-DeferLog "Attached click handler for UpdateButton"
     }
@@ -3839,9 +3896,11 @@ try {
     $window.ShowDialog() | Out-Null
     Write-DeferLog "Dialog closed, result: $($script:result.Action), DeferralDays: $($script:result.DeferralDays)"
 
-    # Write response
-    $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
-    Write-DeferLog "Response written to: $ResponseFilePath"
+    # Write response (only if not already written by Update button's progress mode)
+    if (-not $script:responseWritten) {
+        $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+        Write-DeferLog "Response written to: $ResponseFilePath"
+    }
 
 } catch {
     Write-DeferLog "FATAL ERROR: $($_.Exception.Message)"
@@ -3961,7 +4020,8 @@ Write-DeferLog "=== DEFERRAL PROMPT SCRIPT ENDED ==="
         
         # Parse response
         $deferralChoice = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
-        
+        $signalFile = $responseFile -replace '_Response\.json$', '_Complete.json'
+
         if ($response -ne "TIMEOUT" -and (Test-Path $responseFile)) {
             try {
                 $responseData = Get-Content -Path $responseFile -Raw | ConvertFrom-Json
@@ -3975,8 +4035,15 @@ Write-DeferLog "=== DEFERRAL PROMPT SCRIPT ENDED ==="
                 Write-Log "Error parsing deferral response: $($_.Exception.Message)" | Out-Null
             }
         }
-        
-        # Cleanup
+
+        # If user chose Update, the dialog is still showing a progress indicator
+        # Pass the signal file path so the upgrade code can notify the dialog when done
+        if ($deferralChoice.Action -eq "Update") {
+            $deferralChoice.ProgressSignalFile = $signalFile
+            Write-Log "Progress signal file for dialog: $signalFile" | Out-Null
+        }
+
+        # Cleanup task registration and temp files (dialog process keeps running independently)
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
         Remove-Item $deferralScriptPath -Force -ErrorAction SilentlyContinue
         Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
@@ -5963,10 +6030,16 @@ if ($OUTPUT) {
                                         
                                         if ($stillRunning) {
                                             Write-Log -Message "Some processes still running after close attempt for $($okapp.AppID), skipping"
+                                            if ($dialogResult.ProgressSignalFile) {
+                                                @{ Success = $false; Message = "Could not close application" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                                            }
                                             continue
                                         }
                                     } else {
                                         Write-Log -Message "Failed to stop blocking processes for $($okapp.AppID), skipping"
+                                        if ($dialogResult.ProgressSignalFile) {
+                                            @{ Success = $false; Message = "Could not close application" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                                        }
                                         continue
                                     }
                                 } else {
@@ -6095,17 +6168,28 @@ if ($OUTPUT) {
                             Write-Log -Message "Upgrade completed successfully for: $($appInfo.AppID)"
                             $message += "$($appInfo.AppID)|"
 
-                            # Show completion notification if user was prompted to close a process (or always in test mode)
-                            if (($dialogResult -and ($dialogResult.CloseProcess -or $dialogResult.UserChoice)) -or ($Script:TestMode -and $appInfo.AppID -eq "Test.DemoApp")) {
+                            if ($dialogResult -and $dialogResult.ProgressSignalFile) {
+                                # Signal the still-open progress dialog that upgrade is complete
+                                @{ Success = $true; Message = "Update complete" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                                Write-Log -Message "Wrote completion signal to progress dialog"
+                            } elseif (($dialogResult -and ($dialogResult.CloseProcess -or $dialogResult.UserChoice)) -or ($Script:TestMode -and $appInfo.AppID -eq "Test.DemoApp")) {
+                                # Fallback: show separate completion notification
                                 Show-CompletionNotification -AppName $okapp.AppID -FriendlyName $okapp.FriendlyName
                             }
                         } else {
                             Write-Log -Message "Upgrade failed for $($appInfo.AppID) - Exit code: $LASTEXITCODE"
                             $message += "$($appInfo.AppID) (FAILED)|"
+                            if ($dialogResult -and $dialogResult.ProgressSignalFile) {
+                                @{ Success = $false; Message = "Update failed" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                                Write-Log -Message "Wrote failure signal to progress dialog"
+                            }
                         }
                     } catch {
                         Write-Log -Message "Error upgrading $($appInfo.AppID) : $($_.Exception.Message)"
                         $message += "$($appInfo.AppID) (ERROR)|"
+                        if ($dialogResult -and $dialogResult.ProgressSignalFile) {
+                            @{ Success = $false; Message = "Update error" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                        }
                     }
                 }
             }
