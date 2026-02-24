@@ -2077,6 +2077,122 @@ function Write-InfoDialogStatus {
     } catch {}
 }
 
+function Invoke-WingetWithProgress {
+    <#
+    .SYNOPSIS
+        Runs winget upgrade with real-time download progress monitoring via the winget log file.
+        When no SignalFilePath is provided, falls back to direct execution.
+    #>
+    param(
+        [string]$WingetExe,
+        [string[]]$Arguments,
+        [string]$SignalFilePath,
+        [string]$WorkingDirectory
+    )
+
+    # Direct execution if no progress dialog to update
+    if (-not $SignalFilePath) {
+        if ($WorkingDirectory) {
+            Push-Location $WorkingDirectory
+            try { return & $WingetExe @Arguments 2>&1 }
+            finally { Pop-Location }
+        } else {
+            return & $WingetExe @Arguments 2>&1
+        }
+    }
+
+    $logFile = Join-Path $env:TEMP "winget_progress_$([guid]::NewGuid().ToString('N').Substring(0,8)).log"
+    $outFile = Join-Path $env:TEMP "winget_out_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+    $errFile = Join-Path $env:TEMP "winget_err_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+
+    try {
+        # Build argument string: original args + --log for progress tracking
+        $fullArgs = @($Arguments) + @("--log", $logFile)
+        $argString = $fullArgs -join " "
+
+        $startParams = @{
+            FilePath = $WingetExe
+            ArgumentList = $argString
+            NoNewWindow = $true
+            PassThru = $true
+            RedirectStandardOutput = $outFile
+            RedirectStandardError = $errFile
+        }
+        if ($WorkingDirectory) { $startParams.WorkingDirectory = $WorkingDirectory }
+
+        $proc = Start-Process @startParams
+        Write-Log "Started winget process (PID: $($proc.Id)) with log: $logFile" | Out-Null
+
+        $lastStatus = ""
+        $downloadDetected = $false
+        while (-not $proc.HasExited) {
+            Start-Sleep -Seconds 2
+
+            if (Test-Path $logFile) {
+                try {
+                    # Read log using FileStream with shared read to avoid locking conflicts
+                    $fs = [System.IO.FileStream]::new($logFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                    $reader = [System.IO.StreamReader]::new($fs)
+                    $logText = $reader.ReadToEnd()
+                    $reader.Close()
+                    $fs.Close()
+
+                    if ($logText.Length -gt 0) {
+                        # Match download progress bytes: "12345678 / 98765432"
+                        $progressMatches = [regex]::Matches($logText, '(\d{4,})\s*/\s*(\d{4,})')
+                        if ($progressMatches.Count -gt 0) {
+                            $lastMatch = $progressMatches[$progressMatches.Count - 1]
+                            $downloaded = [long]$lastMatch.Groups[1].Value
+                            $total = [long]$lastMatch.Groups[2].Value
+                            if ($total -gt 10000) {  # sanity check: at least 10KB
+                                $downloadDetected = $true
+                                $dlMB = [math]::Round($downloaded / 1MB, 1)
+                                $totalMB = [math]::Round($total / 1MB, 1)
+                                $status = "Downloading update... $dlMB MB / $totalMB MB"
+                                if ($status -ne $lastStatus) {
+                                    $lastStatus = $status
+                                    Write-InfoDialogStatus -SignalFilePath $SignalFilePath -Status $status
+                                }
+                            }
+                        }
+
+                        # Detect installation phase
+                        if ($logText -match 'Starting package install|Installer started|begin installation') {
+                            $status = "Installing update..."
+                            if ($status -ne $lastStatus) {
+                                $lastStatus = $status
+                                Write-InfoDialogStatus -SignalFilePath $SignalFilePath -Status $status
+                            }
+                        }
+                    }
+                } catch {
+                    # Log file may not be ready yet, ignore
+                }
+            }
+        }
+
+        # Read final output (same format as & winget ... 2>&1)
+        $result = @()
+        if (Test-Path $outFile) { $result += Get-Content $outFile -ErrorAction SilentlyContinue }
+        if (Test-Path $errFile) { $result += Get-Content $errFile -ErrorAction SilentlyContinue }
+        Write-Log "Winget process exited with code: $($proc.ExitCode)" | Out-Null
+        return $result
+
+    } catch {
+        Write-Log "Error in Invoke-WingetWithProgress: $($_.Exception.Message)" | Out-Null
+        # Fallback to direct execution
+        if ($WorkingDirectory) {
+            Push-Location $WorkingDirectory
+            try { return & $WingetExe @Arguments 2>&1 }
+            finally { Pop-Location }
+        } else {
+            return & $WingetExe @Arguments 2>&1
+        }
+    } finally {
+        Remove-Item $logFile, $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Show-CompletionNotification {
     <#
     .SYNOPSIS
@@ -6415,16 +6531,15 @@ if ($OUTPUT) {
                         Write-Log -Message "Executing winget upgrade for: $($appInfo.AppID)"
                         Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Downloading update..."
 
-                        # First attempt: Standard upgrade - use appropriate winget path and scope based on context
-                        if ((Test-RunningAsSystem) -and $WingetPath) {
-                            $upgradeResult = & .\winget.exe upgrade --silent --accept-source-agreements --id $appInfo.AppID 2>&1
-                        } elseif ($userIsAdmin) {
-                            $upgradeResult = & winget upgrade --silent --accept-source-agreements --id $appInfo.AppID 2>&1
-                        } else {
-                            # User context without admin - use user scope
+                        # First attempt: Standard upgrade with progress monitoring
+                        $wingetExe = if ((Test-RunningAsSystem) -and $WingetPath) { "winget.exe" } else { "winget.exe" }
+                        $wingetDir = if ((Test-RunningAsSystem) -and $WingetPath) { $WingetPath } else { $null }
+                        $wingetArgs = @("upgrade", "--silent", "--accept-source-agreements", "--id", $appInfo.AppID)
+                        if (-not (Test-RunningAsSystem) -and -not $userIsAdmin) {
                             Write-Log -Message "Using --scope user for non-admin user context upgrade"
-                            $upgradeResult = & winget upgrade --silent --accept-source-agreements --scope user --id $appInfo.AppID 2>&1
+                            $wingetArgs += @("--scope", "user")
                         }
+                        $upgradeResult = Invoke-WingetWithProgress -WingetExe $wingetExe -Arguments $wingetArgs -SignalFilePath $activeSignalFile -WorkingDirectory $wingetDir
 
                         $upgradeOutput = $upgradeResult -join "`n"
                         # Extract meaningful lines from winget output for logging
