@@ -784,7 +784,32 @@ function Invoke-UserContextDetection {
         $tempScriptPath = Join-Path $sharedTempPath $tempScriptName
         
         Write-Log "Copying script to user-accessible location: $tempScriptPath" | Out-Null
-        Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force
+        $sourceSize = (Get-Item $Global:CurrentScriptPath).Length
+        Write-Log "Source script size: $sourceSize bytes" | Out-Null
+
+        # Detect bootstrapper/wrapper scenario (small file that downloads the real script via iex/irm)
+        if ($sourceSize -lt 1000) {
+            Write-Log "Source appears to be a bootstrapper wrapper ($sourceSize bytes) - downloading full script" | Out-Null
+            try {
+                $bootstrapContent = Get-Content $Global:CurrentScriptPath -Raw
+                if ($bootstrapContent -match 'irm\s+[''"]([^''"]+)[''"]') {
+                    $scriptUrl = $Matches[1]
+                    Write-Log "Extracted download URL from bootstrapper: $scriptUrl" | Out-Null
+                    $fullScript = Invoke-RestMethod -Uri $scriptUrl -ErrorAction Stop
+                    $fullScript | Out-File -FilePath $tempScriptPath -Encoding UTF8 -Force
+                    $dlSize = (Get-Item $tempScriptPath).Length
+                    Write-Log "Downloaded full script to temp: $dlSize bytes" | Out-Null
+                } else {
+                    Write-Log "ERROR: Could not extract download URL from bootstrapper content" | Out-Null
+                    return @()
+                }
+            } catch {
+                Write-Log "ERROR: Failed to download full script from bootstrapper URL: $($_.Exception.Message)" | Out-Null
+                return @()
+            }
+        } else {
+            Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force
+        }
         
         $scriptPath = $tempScriptPath
         

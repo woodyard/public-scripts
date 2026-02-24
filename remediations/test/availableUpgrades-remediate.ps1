@@ -3961,35 +3961,58 @@ function Schedule-UserContextRemediation {
         
         $sourceSize = (Get-Item $Global:CurrentScriptPath).Length
         Write-Log "Source script size: $sourceSize bytes" | Out-Null
-        
-        # Copy with enhanced error handling and verification
-        try {
-            Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force -ErrorAction Stop
-            Write-Log "Copy-Item completed successfully" | Out-Null
-        } catch {
-            Write-Log "ERROR: Copy-Item failed: $($_.Exception.Message)" | Out-Null
-            return $false
+
+        # Detect bootstrapper/wrapper scenario (small file that downloads the real script via iex/irm)
+        if ($sourceSize -lt 1000) {
+            Write-Log "Source appears to be a bootstrapper wrapper ($sourceSize bytes) - downloading full script" | Out-Null
+            try {
+                $bootstrapContent = Get-Content $Global:CurrentScriptPath -Raw
+                if ($bootstrapContent -match 'irm\s+[''"]([^''"]+)[''"]') {
+                    $scriptUrl = $Matches[1]
+                    Write-Log "Extracted download URL from bootstrapper: $scriptUrl" | Out-Null
+                    $fullScript = Invoke-RestMethod -Uri $scriptUrl -ErrorAction Stop
+                    $fullScript | Out-File -FilePath $tempScriptPath -Encoding UTF8 -Force
+                    $scriptSize = (Get-Item $tempScriptPath).Length
+                    Write-Log "Downloaded full script to temp: $scriptSize bytes" | Out-Null
+                } else {
+                    Write-Log "ERROR: Could not extract download URL from bootstrapper content" | Out-Null
+                    return $false
+                }
+            } catch {
+                Write-Log "ERROR: Failed to download full script from bootstrapper URL: $($_.Exception.Message)" | Out-Null
+                return $false
+            }
+        } else {
+            # Copy with enhanced error handling and verification
+            try {
+                Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force -ErrorAction Stop
+                Write-Log "Copy-Item completed successfully" | Out-Null
+            } catch {
+                Write-Log "ERROR: Copy-Item failed: $($_.Exception.Message)" | Out-Null
+                return $false
+            }
         }
-        
+
         # Verify script copy with size validation
         if (Test-Path $tempScriptPath) {
             $scriptSize = (Get-Item $tempScriptPath).Length
-            Write-Log "Temp script exists, size: $scriptSize bytes (source: $sourceSize bytes)" | Out-Null
-            
+            $expectedMinSize = if ($sourceSize -lt 1000) { 1000 } else { $sourceSize }
+            Write-Log "Temp script exists, size: $scriptSize bytes (expected min: $expectedMinSize bytes)" | Out-Null
+
             # Validate copy integrity
-            if ($scriptSize -ne $sourceSize) {
-                Write-Log "ERROR: Script copy size mismatch! Copied: $scriptSize bytes, Expected: $sourceSize bytes" | Out-Null
+            if ($scriptSize -lt $expectedMinSize) {
+                Write-Log "ERROR: Script copy size too small! Got: $scriptSize bytes, Expected min: $expectedMinSize bytes" | Out-Null
                 Write-Log "Attempting second copy operation..." | Out-Null
-                
+
                 # Remove corrupted copy and try again
                 Remove-Item $tempScriptPath -Force -ErrorAction SilentlyContinue
                 Start-Sleep -Milliseconds 500
-                
+
                 try {
                     Copy-Item -Path $Global:CurrentScriptPath -Destination $tempScriptPath -Force -ErrorAction Stop
                     $retrySize = (Get-Item $tempScriptPath).Length
                     Write-Log "Retry copy completed, size: $retrySize bytes" | Out-Null
-                    
+
                     if ($retrySize -ne $sourceSize) {
                         Write-Log "ERROR: Retry copy also failed - size still incorrect" | Out-Null
                         return $false
