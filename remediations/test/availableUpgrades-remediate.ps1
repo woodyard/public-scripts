@@ -2239,11 +2239,17 @@ function Invoke-WingetWithProgress {
             }
         }
 
+        # Ensure exit code is populated (Start-Process -PassThru requires WaitForExit)
+        $proc.WaitForExit()
+
         # Read final output (same format as & winget ... 2>&1)
         $result = @()
         if (Test-Path $outFile) { $result += Get-Content $outFile -ErrorAction SilentlyContinue }
         if (Test-Path $errFile) { $result += Get-Content $errFile -ErrorAction SilentlyContinue }
         Write-Log "Winget process exited with code: $($proc.ExitCode)" | Out-Null
+
+        # Propagate exit code so $LASTEXITCODE reflects winget's result
+        $global:LASTEXITCODE = $proc.ExitCode
         return $result
 
     } catch {
@@ -6611,7 +6617,7 @@ if ($OUTPUT) {
 
                         # Evaluate success
                         Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Verifying installation..."
-                        if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*") {
+                        if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*Successfully updated*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*" -or ($LASTEXITCODE -eq 0 -and $upgradeOutput -notlike "*failed*" -and $upgradeOutput -notlike "*error*0x*")) {
                             Write-Log -Message "Upgrade completed successfully for: $($appInfo.AppID)"
                             $message += "$($appInfo.AppID)|"
 
@@ -6628,7 +6634,9 @@ if ($OUTPUT) {
                                 Show-CompletionNotification -AppName $okapp.AppID -FriendlyName $okapp.FriendlyName
                             }
                         } else {
-                            Write-Log -Message "Upgrade failed for $($appInfo.AppID) - Exit code: $LASTEXITCODE"
+                            # Log full output for debugging (filter out progress bar characters)
+                            $debugLines = ($upgradeResult | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne "" -and $_ -notmatch '^[\x{2588}\x{2592}\x{2591}\x{2580}-\x{259F}\s\|/\\-]+$' }) -join " | "
+                            Write-Log -Message "Upgrade failed for $($appInfo.AppID) - Exit code: $LASTEXITCODE - Output: $debugLines"
                             $message += "$($appInfo.AppID) (FAILED)|"
                             if ($dialogResult -and $dialogResult.ProgressSignalFile) {
                                 @{ Success = $false; Message = "Update failed" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
