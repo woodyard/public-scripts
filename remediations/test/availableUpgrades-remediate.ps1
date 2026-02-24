@@ -2006,6 +2006,25 @@ try {
     Write-NotifLog "PID: `$PID, User: `$env:USERNAME"
     Write-NotifLog "ApartmentState: `$([System.Threading.Thread]::CurrentThread.GetApartmentState())"
 
+    # Detect system light/dark mode
+    `$isDark = `$true
+    try {
+        `$themeKey = Get-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -ErrorAction Stop
+        `$isDark = `$themeKey.AppsUseLightTheme -eq 0
+    } catch { }
+    Write-NotifLog "System theme: `$(if (`$isDark) { 'Dark' } else { 'Light' })"
+
+    # Theme colors
+    if (`$isDark) {
+        `$bgColor = "#FF1F1F1F"; `$borderColor = "#FF323232"
+        `$titleColor = "White"; `$textColor = "#FFCCCCCC"; `$subtleColor = "#FF888888"
+        `$shadowOpacity = "0.6"; `$checkFill = "White"
+    } else {
+        `$bgColor = "#FFF3F3F3"; `$borderColor = "#FFD1D1D1"
+        `$titleColor = "#FF1B1B1B"; `$textColor = "#FF333333"; `$subtleColor = "#FF888888"
+        `$shadowOpacity = "0.25"; `$checkFill = "White"
+    }
+
     Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
     Add-Type -AssemblyName PresentationCore -ErrorAction Stop
     Add-Type -AssemblyName WindowsBase -ErrorAction Stop
@@ -2035,12 +2054,12 @@ try {
     ShowInTaskbar=`"False`">
 
     <Border Name=`"MainBorder`"
-            Background=`"#FF1F1F1F`"
+            Background=`"`$bgColor`"
             CornerRadius=`"8`"
-            BorderBrush=`"#FF323232`"
+            BorderBrush=`"`$borderColor`"
             BorderThickness=`"1`">
         <Border.Effect>
-            <DropShadowEffect ShadowDepth=`"4`" Direction=`"270`" Color=`"Black`" Opacity=`"0.6`" BlurRadius=`"12`"/>
+            <DropShadowEffect ShadowDepth=`"4`" Direction=`"270`" Color=`"Black`" Opacity=`"`$shadowOpacity`" BlurRadius=`"12`"/>
         </Border.Effect>
 
         <Grid Margin=`"16,12,16,12`">
@@ -2062,7 +2081,7 @@ try {
 
             <Path Grid.Column=`"0`" Grid.RowSpan=`"2`"
                   Data=`"M9,16.17L4.83,12l-1.42,1.41L9,19L21,7l-1.41-1.41L9,16.17z`"
-                  Fill=`"White`"
+                  Fill=`"`$checkFill`"
                   Stretch=`"Uniform`"
                   Width=`"14`"
                   Height=`"14`"
@@ -2072,7 +2091,7 @@ try {
 
             <TextBlock Grid.Column=`"1`" Grid.Row=`"0`"
                        Text=`"Update Complete`"
-                       Foreground=`"White`"
+                       Foreground=`"`$titleColor`"
                        FontSize=`"14`"
                        FontWeight=`"SemiBold`"
                        Margin=`"12,0,0,2`"
@@ -2080,13 +2099,13 @@ try {
 
             <TextBlock Grid.Column=`"1`" Grid.Row=`"1`"
                        Text=`"`$messageText`"
-                       Foreground=`"#FFCCCCCC`"
+                       Foreground=`"`$textColor`"
                        FontSize=`"12`"
                        Margin=`"12,0,0,8`"
                        TextWrapping=`"Wrap`"/>
 
             <TextBlock Grid.Column=`"1`" Grid.Row=`"2`"
-                       Foreground=`"#FF888888`"
+                       Foreground=`"`$subtleColor`"
                        FontSize=`"11`"
                        Margin=`"12,4,0,0`"
                        HorizontalAlignment=`"Right`">
@@ -3696,6 +3715,23 @@ try {
     $deferralOptions = $deferralJson | ConvertFrom-Json
     Write-DeferLog "Parsed deferral options: $($deferralOptions -join ', ') (Count: $($deferralOptions.Count))"
 
+    # Detect system light/dark mode
+    $isDark = $true  # default to dark
+    try {
+        $themeKey = Get-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -ErrorAction Stop
+        $isDark = $themeKey.AppsUseLightTheme -eq 0
+    } catch { }
+    Write-DeferLog "System theme: $(if ($isDark) { 'Dark' } else { 'Light' })"
+
+    # Theme colors
+    if ($isDark) {
+        $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $textColor = "#FFCCCCCC"
+        $shadowOpacity = "0.6"; $btnBg = ""; $btnFg = ""
+    } else {
+        $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $textColor = "#FF1B1B1B"
+        $shadowOpacity = "0.25"; $btnBg = ""; $btnFg = ""
+    }
+
     # Load WPF assemblies
     Write-DeferLog "Loading WPF assemblies..."
     Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
@@ -3729,16 +3765,16 @@ try {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="$escapedTitle" Width="$dialogWidth" MinHeight="200" SizeToContent="Height" WindowStartupLocation="Manual"
         ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
-    <Border Background="#FF1F1F1F" CornerRadius="8" BorderBrush="#FF323232" BorderThickness="1">
+    <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
         <Border.Effect>
-            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
+            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/>
         </Border.Effect>
         <Grid Margin="20">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0" Text="$escapedQuestion" Foreground="#FFCCCCCC" TextWrapping="Wrap" Margin="0,0,0,20" FontSize="12"/>
+            <TextBlock Grid.Row="0" Text="$escapedQuestion" Foreground="$textColor" TextWrapping="Wrap" Margin="0,0,0,20" FontSize="12"/>
             <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Center">$buttonXml</StackPanel>
         </Grid>
     </Border>
