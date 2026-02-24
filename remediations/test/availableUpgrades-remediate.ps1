@@ -1946,11 +1946,25 @@ try {
         })
     }
 
-    # Poll for signal file
+    # Poll for signal file and status updates
     $script:progressStartTime = Get-Date
+    $script:lastStatus = ""
+    $statusFilePath = $SignalFilePath -replace '\.json$', '_Status.txt'
     $script:pollTimer = [System.Windows.Threading.DispatcherTimer]::new()
     $script:pollTimer.Interval = [TimeSpan]::FromSeconds(2)
     $script:pollTimer.Add_Tick({
+        # Check for status updates (non-final)
+        if (Test-Path $statusFilePath) {
+            try {
+                $currentStatus = (Get-Content $statusFilePath -Raw).Trim()
+                if ($currentStatus -and $currentStatus -ne $script:lastStatus) {
+                    $script:lastStatus = $currentStatus
+                    $window.FindName("StatusText").Text = $currentStatus
+                    Write-ProgLog "Status updated: $currentStatus"
+                }
+            } catch {}
+        }
+        # Check for final signal (completion/failure)
         if (Test-Path $SignalFilePath) {
             $script:pollTimer.Stop()
             Write-ProgLog "Signal received"
@@ -2028,13 +2042,16 @@ Write-ProgLog "=== UPGRADE PROGRESS DIALOG ENDED ==="
             # Don't block - return signal file path immediately
             # Cleanup will happen after upgrade completes (caller writes signal, dialog closes)
             # Schedule async cleanup after a generous timeout
+            $statusFile = $signalFile -replace '\.json$', '_Status.txt'
             Start-Job -ScriptBlock {
-                param($tn, $sp, $vp)
+                param($tn, $sp, $vp, $sf, $stf)
                 Start-Sleep -Seconds 330  # 5.5 min - after dialog's 5-min timeout
                 Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
                 Remove-Item $sp -Force -ErrorAction SilentlyContinue
                 if ($vp) { Remove-Item $vp -Force -ErrorAction SilentlyContinue }
-            } -ArgumentList $taskName, $scriptPath, $launch.VbsPath | Out-Null
+                Remove-Item $sf -Force -ErrorAction SilentlyContinue
+                Remove-Item $stf -Force -ErrorAction SilentlyContinue
+            } -ArgumentList $taskName, $scriptPath, $launch.VbsPath, $signalFile, $statusFile | Out-Null
 
             return $signalFile
         } else {
@@ -2046,6 +2063,18 @@ Write-ProgLog "=== UPGRADE PROGRESS DIALOG ENDED ==="
         Write-Log "Error in Show-UpgradeProgressNotification: $($_.Exception.Message)" | Out-Null
         return $null
     }
+}
+
+function Write-InfoDialogStatus {
+    param(
+        [string]$SignalFilePath,
+        [string]$Status
+    )
+    if (-not $SignalFilePath) { return }
+    try {
+        $statusFile = $SignalFilePath -replace '\.json$', '_Status.txt'
+        $Status | Out-File -FilePath $statusFile -Encoding UTF8 -NoNewline
+    } catch {}
 }
 
 function Show-CompletionNotification {
@@ -4129,9 +4158,23 @@ try {
             $script:signalFilePath = $ResponseFilePath -replace '_Response\.json$', '_Complete.json'
             $script:progressStartTime = Get-Date
 
+            $script:statusFilePath = $script:signalFilePath -replace '\.json$', '_Status.txt'
+            $script:lastStatus = ""
             $script:pollTimer = [System.Windows.Threading.DispatcherTimer]::new()
             $script:pollTimer.Interval = [TimeSpan]::FromSeconds(2)
             $script:pollTimer.Add_Tick({
+                # Check for status updates
+                if (Test-Path $script:statusFilePath) {
+                    try {
+                        $currentStatus = (Get-Content $script:statusFilePath -Raw).Trim()
+                        if ($currentStatus -and $currentStatus -ne $script:lastStatus) {
+                            $script:lastStatus = $currentStatus
+                            $window.FindName("ProgressText").Text = $currentStatus
+                            Write-DeferLog "Status updated: $currentStatus"
+                        }
+                    } catch {}
+                }
+                # Check for final signal
                 if (Test-Path $script:signalFilePath) {
                     $script:pollTimer.Stop()
                     Write-DeferLog "Completion signal received at: $script:signalFilePath"
@@ -6355,17 +6398,22 @@ if ($OUTPUT) {
                         }
                     }
 
+                    # Determine the active signal file for status updates (deferral dialog or informational dialog)
+                    $activeSignalFile = if ($dialogResult -and $dialogResult.ProgressSignalFile) { $dialogResult.ProgressSignalFile } elseif ($infoSignalFile) { $infoSignalFile } else { $null }
+
                     Write-Log -Message "Starting upgrade for: $($appInfo.AppID)"
 
                     try {
                         # TEST MODE: Simulate upgrade instead of running winget
                         if ($Script:TestMode -and $appInfo.AppID -eq "Test.DemoApp") {
+                            Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Downloading update..."
                             Write-Log -Message "TEST MODE: Simulating upgrade for $($appInfo.AppID) (1.0.0 -> 2.0.0)"
                             Start-Sleep -Seconds 3
                             $upgradeOutput = "Successfully installed"
                             Write-Log -Message "TEST MODE: Simulated upgrade completed"
                         } else {
                         Write-Log -Message "Executing winget upgrade for: $($appInfo.AppID)"
+                        Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Downloading update..."
 
                         # First attempt: Standard upgrade - use appropriate winget path and scope based on context
                         if ((Test-RunningAsSystem) -and $WingetPath) {
@@ -6400,6 +6448,7 @@ if ($OUTPUT) {
                         
                         # Handle specific failure cases
                         if ($upgradeOutput -like "*install technology is different*") {
+                            Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Reinstalling application..."
                             Write-Log -Message "Install technology mismatch detected for $($appInfo.AppID). Attempting uninstall and reinstall."
                             
                             # First uninstall - use appropriate winget path and scope based on context
@@ -6436,6 +6485,7 @@ if ($OUTPUT) {
                             Write-Log -Message "Fresh install completed for $($appInfo.AppID)"
                             
                         } elseif ($upgradeOutput -like "*Uninstall failed*") {
+                            Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Retrying installation..."
                             Write-Log -Message "Uninstall failure detected for $($appInfo.AppID). Trying alternative approaches."
                             
                             # Try install with --force to override - use appropriate winget path and scope based on context
@@ -6454,6 +6504,7 @@ if ($OUTPUT) {
                         } # end else (non-test mode winget upgrade)
 
                         # Evaluate success
+                        Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Verifying installation..."
                         if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*") {
                             Write-Log -Message "Upgrade completed successfully for: $($appInfo.AppID)"
                             $message += "$($appInfo.AppID)|"
