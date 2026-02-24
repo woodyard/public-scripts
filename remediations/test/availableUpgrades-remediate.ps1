@@ -3747,9 +3747,11 @@ try {
     if ($isDark) {
         $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $textColor = "#FFCCCCCC"
         $shadowOpacity = "0.6"; $btnBg = ""; $btnFg = ""
+        $closeBtnFg = "#FF888888"; $closeBtnHoverBg = "#FF2A2A2A"
     } else {
         $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $textColor = "#FF1B1B1B"
         $shadowOpacity = "0.25"; $btnBg = ""; $btnFg = ""
+        $closeBtnFg = "#FF999999"; $closeBtnHoverBg = "#FFE0E0E0"
     }
 
     # Load WPF assemblies
@@ -3789,18 +3791,21 @@ try {
         <Border.Effect>
             <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/>
         </Border.Effect>
-        <Grid Margin="20">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
-            <TextBlock Grid.Row="0" Name="QuestionText" Text="$escapedQuestion" Foreground="$textColor" TextWrapping="Wrap" Margin="0,0,0,20" FontSize="12"/>
-            <StackPanel Grid.Row="1" Name="ButtonPanel" Orientation="Horizontal" HorizontalAlignment="Center">$buttonXml</StackPanel>
-            <StackPanel Grid.Row="2" Name="ProgressPanel" Visibility="Collapsed" HorizontalAlignment="Center" Margin="0,5,0,0">
-                <ProgressBar Name="ProgressBar" IsIndeterminate="True" Width="300" Height="3" Margin="0,0,0,10" Foreground="#FF0078D4"/>
-                <TextBlock Name="ProgressText" Text="Updating..." Foreground="$textColor" FontSize="12" HorizontalAlignment="Center"/>
-            </StackPanel>
+        <Grid>
+            <Grid Margin="20">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Name="QuestionText" Text="$escapedQuestion" Foreground="$textColor" TextWrapping="Wrap" Margin="0,0,24,20" FontSize="12"/>
+                <StackPanel Grid.Row="1" Name="ButtonPanel" Orientation="Horizontal" HorizontalAlignment="Center">$buttonXml</StackPanel>
+                <StackPanel Grid.Row="2" Name="ProgressPanel" Visibility="Collapsed" HorizontalAlignment="Center" Margin="0,5,0,0">
+                    <ProgressBar Name="ProgressBar" IsIndeterminate="True" Width="300" Height="3" Margin="0,0,0,10" Foreground="#FF0078D4"/>
+                    <TextBlock Name="ProgressText" Text="Updating..." Foreground="$textColor" FontSize="12" HorizontalAlignment="Center"/>
+                </StackPanel>
+            </Grid>
+            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0" Background="Transparent" Foreground="$closeBtnFg" BorderThickness="0" FontSize="13" Cursor="Hand" FontFamily="Segoe UI Symbol"/>
         </Grid>
     </Border>
 </Window>
@@ -3831,6 +3836,18 @@ try {
         }
     }
 
+    # Close button acts as minimum deferral
+    $minDeferDays = [int]($deferralOptions | Sort-Object | Select-Object -First 1)
+    $closeButton = $window.FindName("CloseButton")
+    if ($closeButton) {
+        $closeButton.Add_Click({
+            $script:result = @{ Action = "Defer"; DeferralDays = $minDeferDays; CloseProcess = $false }
+            Write-DeferLog "Close button clicked - deferring $minDeferDays day(s)"
+            $window.Close()
+        }.GetNewClosure())
+        Write-DeferLog "Attached close button handler (defers $minDeferDays day(s))"
+    }
+
     $script:responseWritten = $false
     $updateButton = $window.FindName("UpdateButton")
     if ($updateButton) {
@@ -3843,6 +3860,7 @@ try {
 
             # Switch to progress UI
             $window.FindName("ButtonPanel").Visibility = [System.Windows.Visibility]::Collapsed
+            $window.FindName("CloseButton").Visibility = [System.Windows.Visibility]::Collapsed
             $window.FindName("ProgressPanel").Visibility = [System.Windows.Visibility]::Visible
             $window.FindName("QuestionText").Text = "Closing application and installing update..."
 
