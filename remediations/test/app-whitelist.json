@@ -317,6 +317,18 @@
         "AppID": "Cloudflare.cloudflared"
     },
     {
+        "AppID": "Cloudflare.Warp",
+        "FriendlyName": "Cloudflare WARP",
+        "BlockingProcess": "Cloudflare WARP,warp-svc",
+        "AutoCloseProcesses": "warp-svc",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 90,
+        "DeferralEnabled": true,
+        "MaxDeferralDays": 3,
+        "ForcedUpgradeMessage": "Cloudflare WARP updates can no longer be deferred. Your network connection may briefly disconnect during the update."
+    },
+    {
         "AppID": "Microsoft.Bicep"
     },
     {
