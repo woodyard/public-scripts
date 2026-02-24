@@ -2991,12 +2991,31 @@ function Get-DeferralStatus {
         
         # Get release date for deadline calculations
         $releaseDate = Get-AppReleaseDate -AppID $AppID -Version $AvailableVersion
-        if ($releaseDate) {
-            $status.ReleaseDate = $releaseDate
-            
-            # Calculate admin hard deadline (release date + MaxDeferralDays)
-            $status.AdminHardDeadline = $releaseDate.AddDays($status.MaxDeferralDays)
+
+        if (-not $releaseDate) {
+            # No release date from winget - use FirstDetected date as fallback
+            # This ensures AdminHardDeadline is always calculated
+            if (Test-Path $deferralPath) {
+                $existingData = Get-ItemProperty -Path $deferralPath -ErrorAction SilentlyContinue
+                if ($existingData.FirstDetected) {
+                    $releaseDate = [DateTime]::Parse($existingData.FirstDetected)
+                    Write-Log "Using stored FirstDetected date for ${AppID}: $($releaseDate.ToString('yyyy-MM-dd'))" | Out-Null
+                }
+            }
+            if (-not $releaseDate) {
+                # First time seeing this app - record today as first detected
+                $releaseDate = $now
+                if (-not (Test-Path $deferralPath)) {
+                    New-Item -Path $deferralPath -Force | Out-Null
+                }
+                Set-ItemProperty -Path $deferralPath -Name "FirstDetected" -Value $now.ToString("o")
+                Write-Log "No release date found for ${AppID}, recording first detection date: $($now.ToString('yyyy-MM-dd'))" | Out-Null
+            }
         }
+
+        $status.ReleaseDate = $releaseDate
+        # Calculate admin hard deadline (release/first-detected date + MaxDeferralDays)
+        $status.AdminHardDeadline = $releaseDate.AddDays($status.MaxDeferralDays)
         
         # Check if deferral data exists
         if (Test-Path $deferralPath) {
@@ -5809,20 +5828,24 @@ if ($OUTPUT) {
                         # First, check deferral status if deferrals are enabled
                         if ($okapp.DeferralEnabled -eq $true) {
                             Write-Log -Message "Deferral system enabled for $($okapp.AppID), checking status" | Out-Null
-                            
+
                             $deferralStatus = Get-DeferralStatus -AppID $okapp.AppID -WhitelistConfig $okapp -AvailableVersion $appInfo.AvailableVersion
-                            
-                            if (-not $deferralStatus.ForceUpdate) {
-                                # TEST MODE: Don't skip - let it proceed to blocking process check and show dialog
-                                if ($Script:TestMode -and $appInfo.AppID -eq "Test.DemoApp") {
-                                    Write-Log -Message "TEST MODE: Overriding deferral skip - proceeding to show dialog" | Out-Null
-                                } else {
-                                    Write-Log -Message "Update for $($okapp.AppID) can be deferred - skipping this run" | Out-Null
-                                    Write-Log -Message "Deferral message: $($deferralStatus.Message)" | Out-Null
-                                    continue  # Skip this app - user can defer
-                                }
-                            } else {
+
+                            if ($deferralStatus.ForceUpdate) {
+                                # Past admin hard deadline or user deadline - mandatory update
                                 Write-Log -Message "Update for $($okapp.AppID) is now mandatory: $($deferralStatus.Message)" | Out-Null
+                            } elseif ($deferralStatus.DeferralsUsed -gt 0 -and $deferralStatus.UserDeadline -and (Get-Date) -lt $deferralStatus.UserDeadline) {
+                                # User has an active deferral that hasn't expired yet - skip silently
+                                Write-Log -Message "Update for $($okapp.AppID) has active deferral until $($deferralStatus.UserDeadline.ToString('yyyy-MM-dd HH:mm')) - skipping this run" | Out-Null
+                                Write-Log -Message "Deferral message: $($deferralStatus.Message)" | Out-Null
+                                continue  # Skip this app - user explicitly deferred
+                            } else {
+                                # First detection or expired deferral - fall through to show dialog
+                                if ($deferralStatus.DeferralsUsed -gt 0) {
+                                    Write-Log -Message "Previous deferral for $($okapp.AppID) has expired - showing update dialog" | Out-Null
+                                } else {
+                                    Write-Log -Message "First detection of update for $($okapp.AppID) - showing update dialog" | Out-Null
+                                }
                             }
                         }
                         
