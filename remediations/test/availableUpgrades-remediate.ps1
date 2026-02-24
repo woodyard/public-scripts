@@ -3767,6 +3767,9 @@ try {
     $workArea = $screen.WorkingArea
     Write-DeferLog "Screen working area: $($workArea.Width)x$($workArea.Height)"
 
+    # Compute minimum deferral days for close button
+    $minDeferDays = [int]($deferralOptions | Sort-Object | Select-Object -First 1)
+
     # Build dynamic buttons XML
     $buttonXml = ""
     foreach ($days in ($deferralOptions | Sort-Object)) {
@@ -3805,7 +3808,7 @@ try {
                     <TextBlock Name="ProgressText" Text="Updating..." Foreground="$textColor" FontSize="12" HorizontalAlignment="Center"/>
                 </StackPanel>
             </Grid>
-            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0" Background="Transparent" Foreground="$closeBtnFg" BorderThickness="0" FontSize="13" Cursor="Hand" FontFamily="Segoe UI Symbol"/>
+            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0" Background="Transparent" Foreground="$closeBtnFg" BorderThickness="0" FontSize="13" Cursor="Hand" FontFamily="Segoe UI Symbol" Tag="$minDeferDays"/>
         </Grid>
     </Border>
 </Window>
@@ -3823,43 +3826,39 @@ try {
 
     $script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
 
-    # Add deferral button handlers
-    # NOTE: Do NOT use .GetNewClosure() - it creates a new module scope that breaks $script:result
-    # The handlers use $this.Tag for the days value, so no closure capture is needed
+    # All button handlers write the response file directly via $this.Tag and $ResponseFilePath
+    # This avoids any $script: scope issues with .NET event handler invocation
     foreach ($days in $deferralOptions) {
         $button = $window.FindName("DeferButton$days")
         if ($button) {
             $button.Add_Click({
                 $selectedDays = [int]$this.Tag
-                $script:result = @{ Action = "Defer"; DeferralDays = $selectedDays; CloseProcess = $false }
                 Write-DeferLog "Defer button clicked - deferring $selectedDays day(s)"
+                @{ Action = "Defer"; DeferralDays = $selectedDays; CloseProcess = $false } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
                 $window.Close()
             })
             Write-DeferLog "Attached click handler for DeferButton$days"
         }
     }
 
-    # Close button acts as minimum deferral
-    $script:minDeferDays = [int]($deferralOptions | Sort-Object | Select-Object -First 1)
+    # Close button acts as minimum deferral (days stored in Tag attribute)
     $closeButton = $window.FindName("CloseButton")
     if ($closeButton) {
         $closeButton.Add_Click({
-            $script:result = @{ Action = "Defer"; DeferralDays = $script:minDeferDays; CloseProcess = $false }
-            Write-DeferLog "Close button clicked - deferring $($script:minDeferDays) day(s)"
+            $closeDays = [int]$this.Tag
+            Write-DeferLog "Close button clicked - deferring $closeDays day(s)"
+            @{ Action = "Defer"; DeferralDays = $closeDays; CloseProcess = $false } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
             $window.Close()
         })
-        Write-DeferLog "Attached close button handler (defers $($script:minDeferDays) day(s))"
+        Write-DeferLog "Attached close button handler (defers $minDeferDays day(s))"
     }
 
-    $script:responseWritten = $false
     $updateButton = $window.FindName("UpdateButton")
     if ($updateButton) {
         $updateButton.Add_Click({
             # Write response immediately so SYSTEM script can proceed with the upgrade
-            $script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
-            $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
-            $script:responseWritten = $true
-            Write-DeferLog "Response written for Update action, switching to progress mode"
+            Write-DeferLog "Update button clicked, writing response and switching to progress mode"
+            @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
 
             # Switch to progress UI
             $window.FindName("ButtonPanel").Visibility = [System.Windows.Visibility]::Collapsed
@@ -3915,12 +3914,12 @@ try {
     Write-DeferLog "Showing dialog..."
     $window.Activate()
     $window.ShowDialog() | Out-Null
-    Write-DeferLog "Dialog closed, result: $($script:result.Action), DeferralDays: $($script:result.DeferralDays)"
+    Write-DeferLog "Dialog closed"
 
-    # Write response (only if not already written by Update button's progress mode)
-    if (-not $script:responseWritten) {
-        $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
-        Write-DeferLog "Response written to: $ResponseFilePath"
+    # Safety fallback: if no button handler wrote the response file, write default
+    if (-not (Test-Path $ResponseFilePath)) {
+        Write-DeferLog "WARNING: No response file found after dialog close - writing default (Update)"
+        @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
     }
 
 } catch {
