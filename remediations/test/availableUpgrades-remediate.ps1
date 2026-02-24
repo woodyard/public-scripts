@@ -3634,57 +3634,78 @@ param(
     [string]$EncodedQuestion,
     [string]$EncodedTitle,
     [string]$EncodedDeferralOptions,
-    [bool]$HasBlockingProcess = $false,
+    [int]$HasBlockingProcess = 0,
     [int]$TimeoutSeconds = 60,
-    # Legacy parameters for backward compatibility
     [string]$Question = "",
     [string]$Title = "",
     [string]$DeferralOptionsJson = ""
 )
 
-# Decode the text parameters if they're base64 encoded, otherwise use legacy parameters
-$actualQuestion = if ($EncodedQuestion) {
-    [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedQuestion))
-} else {
-    $Question
+# Debug logging
+$logPath = Join-Path $env:TEMP "DeferralPrompt_Debug.log"
+function Write-DeferLog {
+    param([string]$Message)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    "[$ts] $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
 }
 
-$actualTitle = if ($EncodedTitle) {
-    [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedTitle))
-} else {
-    $Title
-}
+try {
+    Write-DeferLog "=== DEFERRAL PROMPT SCRIPT STARTED ==="
+    Write-DeferLog "PID: $PID, Session: $((Get-Process -Id $PID).SessionId), User: $env:USERNAME"
+    Write-DeferLog "ResponseFilePath: $ResponseFilePath"
+    Write-DeferLog "HasBlockingProcess: $HasBlockingProcess, TimeoutSeconds: $TimeoutSeconds"
+    Write-DeferLog "EncodedDeferralOptions present: $([bool]$EncodedDeferralOptions)"
+    Write-DeferLog "ApartmentState: $([System.Threading.Thread]::CurrentThread.GetApartmentState())"
 
-# Parse deferral options - decode from Base64 if encoded, otherwise use legacy raw JSON
-$deferralJson = if ($EncodedDeferralOptions) {
-    [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedDeferralOptions))
-} else {
-    $DeferralOptionsJson
-}
-$deferralOptions = $deferralJson | ConvertFrom-Json
+    # Decode parameters
+    $actualQuestion = if ($EncodedQuestion) {
+        [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedQuestion))
+    } else { $Question }
 
-# Load WPF assemblies
-Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName PresentationCore
-Add-Type -AssemblyName WindowsBase
-Add-Type -AssemblyName System.Windows.Forms
+    $actualTitle = if ($EncodedTitle) {
+        [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedTitle))
+    } else { $Title }
 
-# Build dynamic buttons XML
-$buttonXml = ""
-foreach ($days in ($deferralOptions | Sort-Object)) {
-    $buttonText = if ($days -eq 1) { "Defer 1 day" } else { "Defer $days days" }
-    $buttonName = "DeferButton$days"
-    $buttonXml += "<Button Name=`"$buttonName`" Content=`"$buttonText`" Width=`"100`" Height=`"28`" Margin=`"0,0,8,0`" Tag=`"$days`"/>"
-}
-$buttonXml += '<Button Name="UpdateButton" Content="Update Now" Width="100" Height="28" Background="#FF0078D4" Foreground="White" IsDefault="true" Tag="0"/>'
+    $deferralJson = if ($EncodedDeferralOptions) {
+        [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedDeferralOptions))
+    } else { $DeferralOptionsJson }
 
-$dialogWidth = [Math]::Max(500, ($deferralOptions.Count + 1) * 110 + 100)
+    Write-DeferLog "Decoded title: $actualTitle"
+    Write-DeferLog "Deferral JSON: $deferralJson"
 
-# Use the decoded text in XAML with proper XML escaping
-$escapedQuestion = [System.Security.SecurityElement]::Escape($actualQuestion)
-$escapedTitle = [System.Security.SecurityElement]::Escape($actualTitle)
+    $deferralOptions = $deferralJson | ConvertFrom-Json
+    Write-DeferLog "Parsed deferral options: $($deferralOptions -join ', ') (Count: $($deferralOptions.Count))"
 
-$xaml = @"
+    # Load WPF assemblies
+    Write-DeferLog "Loading WPF assemblies..."
+    Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+    Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+    Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Write-DeferLog "WPF assemblies loaded"
+
+    # Get screen dimensions for positioning
+    $screen = [System.Windows.Forms.Screen]::PrimaryScreen
+    $workArea = $screen.WorkingArea
+    Write-DeferLog "Screen working area: $($workArea.Width)x$($workArea.Height)"
+
+    # Build dynamic buttons XML
+    $buttonXml = ""
+    foreach ($days in ($deferralOptions | Sort-Object)) {
+        $buttonText = if ($days -eq 1) { "Defer 1 day" } else { "Defer $days days" }
+        $buttonName = "DeferButton$days"
+        $buttonXml += "<Button Name=`"$buttonName`" Content=`"$buttonText`" Width=`"100`" Height=`"28`" Margin=`"0,0,8,0`" Tag=`"$days`"/>"
+    }
+    $buttonXml += '<Button Name="UpdateButton" Content="Update Now" Width="100" Height="28" Background="#FF0078D4" Foreground="White" IsDefault="true" Tag="0"/>'
+    Write-DeferLog "Button XML built: $buttonXml"
+
+    $dialogWidth = [Math]::Max(500, ($deferralOptions.Count + 1) * 110 + 100)
+
+    # XML-escape the decoded text
+    $escapedQuestion = [System.Security.SecurityElement]::Escape($actualQuestion)
+    $escapedTitle = [System.Security.SecurityElement]::Escape($actualTitle)
+
+    $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="$escapedTitle" Width="$dialogWidth" MinHeight="200" SizeToContent="Height" WindowStartupLocation="Manual"
         ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
@@ -3704,36 +3725,56 @@ $xaml = @"
 </Window>
 "@
 
-$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
-$window = [Windows.Markup.XamlReader]::Load($reader)
+    Write-DeferLog "XAML built, parsing..."
+    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+    $window = [Windows.Markup.XamlReader]::Load($reader)
+    Write-DeferLog "XAML parsed successfully"
 
-$script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
+    # Position window at bottom-right of screen
+    $window.Left = $workArea.Right - $dialogWidth - 20
+    $window.Top = $workArea.Bottom - 250
+    Write-DeferLog "Window positioned at Left=$($window.Left), Top=$($window.Top)"
 
-# Add deferral button handlers
-foreach ($days in $deferralOptions) {
-    $button = $window.FindName("DeferButton$days")
-    if ($button) {
-        $button.Add_Click({
-            $selectedDays = [int]$this.Tag
-            $script:result = @{ Action = "Defer"; DeferralDays = $selectedDays; CloseProcess = $false }
-            $window.Close()
-        }.GetNewClosure())
+    $script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
+
+    # Add deferral button handlers
+    foreach ($days in $deferralOptions) {
+        $button = $window.FindName("DeferButton$days")
+        if ($button) {
+            $button.Add_Click({
+                $selectedDays = [int]$this.Tag
+                $script:result = @{ Action = "Defer"; DeferralDays = $selectedDays; CloseProcess = $false }
+                $window.Close()
+            }.GetNewClosure())
+            Write-DeferLog "Attached click handler for DeferButton$days"
+        }
     }
+
+    $updateButton = $window.FindName("UpdateButton")
+    if ($updateButton) {
+        $updateButton.Add_Click({
+            $script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
+            $window.Close()
+        })
+        Write-DeferLog "Attached click handler for UpdateButton"
+    }
+
+    Write-DeferLog "Showing dialog..."
+    $window.Activate()
+    $window.ShowDialog() | Out-Null
+    Write-DeferLog "Dialog closed, result: $($script:result.Action), DeferralDays: $($script:result.DeferralDays)"
+
+    # Write response
+    $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+    Write-DeferLog "Response written to: $ResponseFilePath"
+
+} catch {
+    Write-DeferLog "FATAL ERROR: $($_.Exception.Message)"
+    Write-DeferLog "Stack trace: $($_.ScriptStackTrace)"
+    # Write error response so caller doesn't hang
+    @{ Action = "Error"; DeferralDays = 0; CloseProcess = $false; Error = $_.Exception.Message } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8 -ErrorAction SilentlyContinue
 }
-
-# Add update button handler
-$updateButton = $window.FindName("UpdateButton")
-if ($updateButton) {
-    $updateButton.Add_Click({
-        $script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
-        $window.Close()
-    })
-}
-
-$window.ShowDialog() | Out-Null
-
-# Write response
-$script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+Write-DeferLog "=== DEFERRAL PROMPT SCRIPT ENDED ==="
 '@
 
         Write-Log "Creating deferral prompt script: $deferralScriptPath" | Out-Null
