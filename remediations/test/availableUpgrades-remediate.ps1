@@ -794,7 +794,7 @@ function Invoke-SystemUserPrompt {
             Write-Log "Using shared temp path: $responseFile" | Out-Null
         }
         
-        $userPromptScriptPath = "$env:TEMP\Show-UserPrompt_$promptId.ps1"
+        $userPromptScriptPath = Join-Path $userTempPath "Show-UserPrompt_$promptId.ps1"
         
         # Create the user prompt script content (from the working Show-UserPrompt.ps1)
         $userPromptScriptContent = @'
@@ -1986,7 +1986,9 @@ function Invoke-SystemCompletionNotification {
 
         # Create completion notification script
         $notificationId = Get-Random -Minimum 1000 -Maximum 9999
-        $notificationScriptPath = "$env:TEMP\Show-CompletionNotification_$notificationId.ps1"
+        # Use user's temp so scheduled task (running as user) can access the script
+        $notifUserTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
+        $notificationScriptPath = Join-Path $notifUserTempPath "Show-CompletionNotification_$notificationId.ps1"
 
         $notificationScriptContent = @"
 param([string]`$AppName)
@@ -2445,7 +2447,7 @@ function Invoke-SystemMandatoryUpdatePrompt {
         }
         
         # Create mandatory prompt script
-        $mandatoryScriptPath = "$env:TEMP\Show-MandatoryPrompt_$promptId.ps1"
+        $mandatoryScriptPath = Join-Path $userTempPath "Show-MandatoryPrompt_$promptId.ps1"
         
         $mandatoryScriptContent = @'
 param(
@@ -3620,8 +3622,8 @@ function Invoke-SystemDeferralPrompt {
             Join-Path "C:\ProgramData\Temp" "DeferralPrompt_$promptId`_Response.json"
         }
         
-        # Create enhanced user prompt script for deferrals
-        $deferralScriptPath = "$env:TEMP\Show-DeferralPrompt_$promptId.ps1"
+        # Create enhanced user prompt script for deferrals (use user temp so scheduled task can access it)
+        $deferralScriptPath = Join-Path $userTempPath "Show-DeferralPrompt_$promptId.ps1"
         
         # Build the script content dynamically
         $deferralOptionsJson = ($DeferralOptions | ConvertTo-Json -Compress)
@@ -3748,14 +3750,15 @@ $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding
         $encodedQuestion = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Question))
         $encodedTitle = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Title))
         $encodedDeferralOptions = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($deferralOptionsJson))
+        $hasBlockingStr = if ($HasBlockingProcess) { "1" } else { "0" }
         # Create hidden launch action using VBS wrapper (no console window flash)
-        $deferralPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -EncodedDeferralOptions `"$encodedDeferralOptions`" -HasBlockingProcess $$HasBlockingProcess -TimeoutSeconds $TimeoutSeconds"
+        $deferralPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -EncodedDeferralOptions `"$encodedDeferralOptions`" -HasBlockingProcess $hasBlockingStr -TimeoutSeconds $TimeoutSeconds"
         $deferralVbsDir = Split-Path $responseFile -Parent
         $deferralLaunch = New-HiddenLaunchAction -PowerShellArguments $deferralPsArgs -VbsDirectory $deferralVbsDir -AllowUI
         if ($deferralLaunch) {
             $action = $deferralLaunch.Action
         } else {
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -EncodedDeferralOptions `"$encodedDeferralOptions`" -HasBlockingProcess $$HasBlockingProcess -TimeoutSeconds $TimeoutSeconds"
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -EncodedDeferralOptions `"$encodedDeferralOptions`" -HasBlockingProcess $hasBlockingStr -TimeoutSeconds $TimeoutSeconds"
         }
         
         # Create task principal using existing user info
@@ -4975,7 +4978,7 @@ if (Test-Path $testTriggerFile) {
         }
         
         # Also check for any evidence in temp files that the dialog script actually ran
-        $dialogScripts = Get-ChildItem -Path "$env:TEMP" -Filter "Show-UserPrompt_*.ps1" -ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) }
+        $dialogScripts = Get-ChildItem -Path $userTempPath -Filter "Show-UserPrompt_*.ps1" -ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) }
         if ($dialogScripts.Count -gt 0) {
             Write-Log -Message "Found recent dialog script files - this indicates the dialog system attempted to run"
             $wpfWorked = $true  # Script creation is evidence of system working
