@@ -6521,7 +6521,7 @@ if ($OUTPUT) {
                         Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Downloading update..."
 
                         # First attempt: Standard upgrade with progress monitoring
-                        $wingetExe = if ((Test-RunningAsSystem) -and $WingetPath) { "winget.exe" } else { "winget.exe" }
+                        $wingetExe = if ((Test-RunningAsSystem) -and $WingetPath) { Join-Path $WingetPath "winget.exe" } else { "winget.exe" }
                         $wingetDir = if ((Test-RunningAsSystem) -and $WingetPath) { $WingetPath } else { $null }
                         $wingetArgs = @("upgrade", "--silent", "--accept-source-agreements", "--id", $appInfo.AppID)
 
