@@ -3841,6 +3841,39 @@ Write-DeferLog "=== DEFERRAL PROMPT SCRIPT ENDED ==="
         try {
             Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
             Write-Log "Deferral scheduled task started successfully" | Out-Null
+
+            # Diagnostic: check task state after starting
+            Start-Sleep -Seconds 3
+            $taskState = (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue).State
+            $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+            Write-Log "Task state after 3s: $taskState, LastResult: $($taskInfo.LastTaskResult), LastRunTime: $($taskInfo.LastRunTime)" | Out-Null
+
+            # Check if the prompt script file still exists
+            if (Test-Path $deferralScriptPath) {
+                $scriptSize = (Get-Item $deferralScriptPath).Length
+                Write-Log "Deferral script file exists: $deferralScriptPath ($scriptSize bytes)" | Out-Null
+            } else {
+                Write-Log "WARNING: Deferral script file NOT FOUND: $deferralScriptPath" | Out-Null
+            }
+
+            # Check if VBS file still exists
+            if ($deferralLaunch -and $deferralLaunch.VbsPath) {
+                if (Test-Path $deferralLaunch.VbsPath) {
+                    Write-Log "VBS launcher exists: $($deferralLaunch.VbsPath)" | Out-Null
+                } else {
+                    Write-Log "WARNING: VBS launcher NOT FOUND: $($deferralLaunch.VbsPath)" | Out-Null
+                }
+            }
+
+            # Check if debug log from the prompt script was created
+            $debugLogPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp\DeferralPrompt_Debug.log"
+            if (Test-Path $debugLogPath) {
+                $debugContent = Get-Content $debugLogPath -Tail 5 -ErrorAction SilentlyContinue
+                Write-Log "Deferral debug log exists. Last entries:" | Out-Null
+                foreach ($line in $debugContent) { Write-Log "  [PromptLog] $line" | Out-Null }
+            } else {
+                Write-Log "WARNING: No deferral debug log at $debugLogPath - script may not have started" | Out-Null
+            }
         } catch {
             Write-Log "Failed to start deferral scheduled task: $($_.Exception.Message)" | Out-Null
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
