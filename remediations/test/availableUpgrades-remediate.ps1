@@ -5709,7 +5709,7 @@ if (-not (OOBEComplete)) {
 # Fetch whitelist configuration - try local file first, then GitHub, then fallback
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 $localWhitelistPath = Join-Path $scriptPath "app-whitelist.json"
-$whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"
+$whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/test/app-whitelist.json"
 
 $whitelistJSON = $null
 
