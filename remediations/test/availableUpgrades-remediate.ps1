@@ -5843,8 +5843,6 @@ if ($Script:TestMode) {
     $testApp = [PSCustomObject]@{
         AppID = "Test.DemoApp"
         FriendlyName = "Demo Application"
-        SystemContext = $true
-        UserContext = $false
         BlockingProcess = "notepad"
         PromptWhenBlocked = $true
         DefaultTimeoutAction = $false

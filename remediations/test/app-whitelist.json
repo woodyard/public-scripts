@@ -3,9 +3,6 @@
         "AppID": "Mozilla.Firefox",
         "FriendlyName": "Firefox",
         "Disabled": false,
-        "SystemContext": true,
-        "UserContext": true,
-        "UserContextPath": "$Env:LocalAppData\\Mozilla Firefox\\firefox.exe",
         "BlockingProcess": "firefox",
         "PromptWhenBlocked": true,
         "DefaultTimeoutAction": false,
@@ -22,9 +19,6 @@
     {
         "AppID": "Google.Chrome",
         "FriendlyName": "Chrome",
-        "SystemContext": true,
-        "UserContext": true,
-        "UserContextPath": "$Env:LocalAppData\\Google\\Chrome\\Application\\chrome.exe",
         "BlockingProcess": "chrome",
         "PromptWhenBlocked": true,
         "DefaultTimeoutAction": false,
@@ -41,9 +35,6 @@
     {
         "AppID": "Microsoft.VisualStudioCode",
         "FriendlyName": "Visual Studio Code",
-        "SystemContext": true,
-        "UserContext": true,
-        "UserContextPath": "$Env:LocalAppData\\Programs\\Microsoft VS Code\\Code.exe",
         "BlockingProcess": "Code",
         "PromptWhenBlocked": true,
         "DefaultTimeoutAction": false,
@@ -276,8 +267,6 @@
     {
         "AppID": "OpenJS.NodeJS",
         "FriendlyName": "Node.js",
-        "SystemContext": true,
-        "UserContext": true,
         "BlockingProcess": "",
         "PromptWhenBlocked": false,
         "DefaultTimeoutAction": true,
