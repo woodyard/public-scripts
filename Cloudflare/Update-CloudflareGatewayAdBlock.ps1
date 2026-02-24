@@ -184,11 +184,6 @@ $script:BlockLists = @(
         Type = "Domains"
     },
     @{
-        Name = "Anudeep"
-        Url  = "https://raw.githubusercontent.com/anudeepND/blacklist/master/adservers.txt"
-        Type = "Hosts"
-    },
-    @{
         Name = "KADHosts"
         Url  = "https://raw.githubusercontent.com/PolishFiltersTeam/KADhosts/master/KADhosts.txt"
         Type = "Hosts"
@@ -197,11 +192,6 @@ $script:BlockLists = @(
         Name = "NoCoin"
         Url  = "https://raw.githubusercontent.com/hoshsadiq/adblock-nocoin-list/master/hosts.txt"
         Type = "Hosts"
-    },
-    @{
-        Name = "OISD Small"
-        Url  = "https://small.oisd.nl/domains"
-        Type = "Domains"
     },
     @{
         Name = "Peter Lowe"
@@ -544,6 +534,26 @@ function Sync-GatewayList {
 
     $parts = if ($Domains.Count -gt 0) { [Math]::Ceiling($Domains.Count / $chunkSize) } else { 1 }
 
+    # Pre-cleanup: delete obsolete parts BEFORE the create/update loop so freed slots
+    # are available when we need to create new parts (important when near the list cap)
+    $potentialOldLists = $lists | Where-Object { $_.name -like "$Name - Part *" }
+    foreach ($oldList in $potentialOldLists) {
+        # Extract the part number from the name and check if it's beyond the new part count
+        if ($oldList.name -match ' - Part (\d+)$') {
+            $oldPartNum = [int]$Matches[1]
+            if ($oldPartNum -gt $parts) {
+                Write-Host "  Deleting obsolete list part: $($oldList.name)..." -ForegroundColor DarkGray
+                try {
+                    Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/lists/$($oldList.id)" -Method DELETE | Out-Null
+                    # Refresh lists cache to reflect the deletion
+                    $lists = $lists | Where-Object { $_.id -ne $oldList.id }
+                } catch {
+                    Write-Warning "Failed to delete old list $($oldList.name): $_"
+                }
+            }
+        }
+    }
+
     for ($i = 0; $i -lt $parts; $i++) {
         $partNum = $i + 1
         $listName = "$Name - Part $partNum"
@@ -633,14 +643,14 @@ function Update-GatewayPolicyForList {
         [int]$Precedence = 11000
     )
 
-    $policyName = "Block - $ListName"
-    Write-Host "Processing Policy '$policyName'..." -ForegroundColor Yellow
+    $blockListPolicyName = "Block - $ListName"
+    Write-Host "Processing Policy '$blockListPolicyName'..." -ForegroundColor Yellow
 
     # Traffic: any(dns.domains[*] in $ListId1) or any(dns.domains[*] in $ListId2) ...
     $conditions = $ListIds | ForEach-Object { "any(dns.domains[*] in `$$($_))" }
     $traffic = $conditions -join " or "
 
-    $existingPolicy = Get-PolicyByName -Name $policyName
+    $existingPolicy = Get-PolicyByName -Name $blockListPolicyName
 
     if ($existingPolicy) {
         # Check if we need to update (e.g. if List ID changed)
@@ -648,7 +658,7 @@ function Update-GatewayPolicyForList {
             Write-Host "  Updating policy traffic/precedence..." -ForegroundColor Gray
 
              $body = @{
-                name        = $policyName
+                name        = $blockListPolicyName
                 description = "Block policy for list: $ListName"
                 enabled     = $true
                 action      = "block"
@@ -664,7 +674,7 @@ function Update-GatewayPolicyForList {
     } else {
         Write-Host "  Creating new policy..." -ForegroundColor Gray
         $body = @{
-            name        = $policyName
+            name        = $blockListPolicyName
             description = "Block policy for list: $ListName"
             enabled     = $true
             action      = "block"
@@ -703,8 +713,9 @@ function Fetch-And-Parse-List {
     $lines = $content -split "\r?\n"
     Write-Host "  Parsing $($lines.Count) lines ($Type format)..." -ForegroundColor DarkGray
 
-    # Pre-compile the validation regex for performance
-    $hostnameRegex = [regex]::new('^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$', 'Compiled')
+    # Pre-compile the per-label validation regex for performance
+    # Each DNS label must start and end with alphanumeric, and only contain alphanumeric or hyphens
+    $labelRegex = [regex]::new('^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?$', 'Compiled')
     $skipDomains = @('localhost', 'broadcasthost', 'local', '127.0.0.1', '0.0.0.0', '::1')
 
     foreach ($line in $lines) {
@@ -740,8 +751,18 @@ function Fetch-And-Parse-List {
         if ([string]::IsNullOrEmpty($clean)) { continue }
         if ($clean -in $skipDomains) { continue }
 
-        # Validate hostname format and add (HashSet handles dedup automatically)
-        if ($hostnameRegex.IsMatch($clean)) {
+        # Validate each DNS label individually: must start/end with alphanumeric, no leading/trailing hyphens
+        $labels = $clean -split '\.'
+        $valid = $labels.Count -ge 2
+        if ($valid) {
+            foreach ($label in $labels) {
+                if ([string]::IsNullOrEmpty($label) -or -not $labelRegex.IsMatch($label)) {
+                    $valid = $false
+                    break
+                }
+            }
+        }
+        if ($valid) {
             [void]$uniqueDomains.Add($clean)
         }
     }
@@ -838,6 +859,55 @@ else {
 if (-not $WhitelistOnly) {
     Write-Host ""
     Write-Host "Processing External Block Lists..." -ForegroundColor Yellow
+
+    # Cleanup lists and policies on Cloudflare that belong to block lists no longer in config
+    # This frees slots before syncing, preventing "Maximum number of lists reached" errors
+    if (-not $BlockListName) {
+        Write-Host "Checking for obsolete lists to clean up..." -ForegroundColor DarkGray
+        $allGatewayLists = Get-GatewayLists
+        $configuredNames = $script:BlockLists | ForEach-Object { $_.Name }
+
+        # Find base names of removed lists
+        $removedBaseNames = @()
+        foreach ($gwList in $allGatewayLists) {
+            if ($gwList.name -match '^(.+) - Part \d+$') {
+                $baseName = $Matches[1]
+                if ($baseName -notin $configuredNames -and $baseName -notin $removedBaseNames) {
+                    $removedBaseNames += $baseName
+                }
+            }
+        }
+
+        # First delete the associated policies (lists can't be deleted while in use by a policy)
+        foreach ($baseName in $removedBaseNames) {
+            $policyName = "Block - $baseName"
+            $obsoletePolicy = Get-PolicyByName -Name $policyName
+            if ($obsoletePolicy) {
+                Write-Host "  Deleting obsolete policy: $policyName..." -ForegroundColor DarkGray
+                try {
+                    Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/rules/$($obsoletePolicy.id)" -Method DELETE | Out-Null
+                } catch {
+                    Write-Warning "  Failed to delete policy $policyName : $_"
+                }
+            }
+        }
+
+        # Then delete the lists
+        foreach ($gwList in $allGatewayLists) {
+            if ($gwList.name -match '^(.+) - Part \d+$') {
+                $baseName = $Matches[1]
+                if ($baseName -notin $configuredNames) {
+                    Write-Host "  Deleting removed list: $($gwList.name)..." -ForegroundColor DarkGray
+                    try {
+                        Invoke-CloudflareApi -Endpoint "/accounts/$AccountId/gateway/lists/$($gwList.id)" -Method DELETE | Out-Null
+                    } catch {
+                        Write-Warning "  Failed to delete $($gwList.name): $_"
+                    }
+                }
+            }
+        }
+    }
+
     $currentPrecedence = 11000
 
 foreach ($listDef in $script:BlockLists) {
