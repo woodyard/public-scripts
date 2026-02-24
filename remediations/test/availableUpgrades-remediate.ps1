@@ -1440,10 +1440,10 @@ function Show-ProcessCloseDialog {
             $deferralChoice = Show-DeferralDialog -AppName $AppName -DeferralStatus $deferralStatus -ProcessName $ProcessName -FriendlyName $friendlyName -CurrentVersion $CurrentVersion -AvailableVersion $AvailableVersion -TimeoutSeconds $TimeoutSeconds
             
             # Record deferral choice if user chose to defer
-            if ($deferralChoice.Action -eq "Defer" -and $deferralChoice.DeferralDays -gt 0) {
-                $deferralRecorded = Set-DeferralChoice -AppID $AppName -DeferralDays $deferralChoice.DeferralDays
+            if ($deferralChoice.Action -eq "Defer") {
+                $deferralRecorded = Set-DeferralChoice -AppID $AppName -AdminHardDeadline $deferralStatus.AdminHardDeadline
                 if ($deferralRecorded) {
-                    Write-Log -Message "Recorded user deferral choice: $($deferralChoice.DeferralDays) days for $AppName" | Out-Null
+                    Write-Log -Message "Recorded user deferral for $AppName (until end of day)" | Out-Null
                 } else {
                     Write-Log -Message "Failed to record deferral choice - proceeding with update" | Out-Null
                     $deferralChoice.Action = "Update"
@@ -3451,7 +3451,6 @@ function Get-DeferralStatus {
             ReleaseDate = $null
             CanDefer = $false
             ForceUpdate = $false
-            DeferralOptions = if ($WhitelistConfig.DeferralOptions) { $WhitelistConfig.DeferralOptions } else { @() }
             Message = ""
         }
         
@@ -3540,29 +3539,8 @@ function Get-DeferralStatus {
             # User can defer if:
             # 1. We haven't reached admin hard deadline
             # 2. There are available deferral options within the remaining time
-            if ($daysUntilAdminDeadline -gt 0 -and $status.DeferralOptions.Count -gt 0) {
-                # Find available deferral options that fit within remaining time
-                $availableOptions = @()
-                foreach ($option in $status.DeferralOptions) {
-                    # Handle deferral options from JSON (PSCustomObject with Days/Label) or plain integers
-                    $optionDays = if ($option.Days -ne $null) {
-                        [int]$option.Days
-                    } elseif ($option -is [int] -or $option -is [long] -or $option -is [double]) {
-                        [int]$option
-                    } else {
-                        Write-Log "WARNING: Unrecognized deferral option format: $option" | Out-Null
-                        continue
-                    }
-                    
-                    if ($optionDays -le $daysUntilAdminDeadline) {
-                        $availableOptions += $optionDays
-                    }
-                }
-                
-                if ($availableOptions.Count -gt 0) {
-                    $status.CanDefer = $true
-                    $status.DeferralOptions = $availableOptions
-                }
+            if ($daysUntilAdminDeadline -gt 0) {
+                $status.CanDefer = $true
             }
         }
         
@@ -3606,21 +3584,20 @@ function Set-DeferralChoice {
     .SYNOPSIS
         Records a user's deferral choice in the registry
     .DESCRIPTION
-        Saves deferral information including selected timeframe and calculated deadlines
+        Defers until end of today, clamped to the admin hard deadline if provided.
     .PARAMETER AppID
         Application ID
-    .PARAMETER DeferralDays
-        Number of days to defer
+    .PARAMETER AdminHardDeadline
+        Optional admin hard deadline to clamp the deferral to
     .OUTPUTS
         Boolean indicating success
     #>
-    
+
     param(
         [Parameter(Mandatory=$true)]
         [string]$AppID,
-        
-        [Parameter(Mandatory=$true)]
-        [int]$DeferralDays
+
+        [DateTime]$AdminHardDeadline
     )
     
     try {
@@ -3645,16 +3622,16 @@ function Set-DeferralChoice {
             # Use default of 0
         }
         
-        # Calculate new user deadline
-        $userDeadline = $now.AddDays($DeferralDays)
-        
+        # Calculate new user deadline: end of today, clamped to admin hard deadline
+        $endOfDay = $now.Date.AddDays(1).AddSeconds(-1)  # today 23:59:59
+        $userDeadline = if ($AdminHardDeadline -and $endOfDay -gt $AdminHardDeadline) { $AdminHardDeadline } else { $endOfDay }
+
         # Update deferral data
         Set-ItemProperty -Path $deferralPath -Name "DeferralsUsed" -Value ($currentDeferrals + 1) -Force
         Set-ItemProperty -Path $deferralPath -Name "LastDeferralDate" -Value $now.ToString("yyyy-MM-dd HH:mm:ss") -Force
         Set-ItemProperty -Path $deferralPath -Name "UserDeadline" -Value $userDeadline.ToString("yyyy-MM-dd HH:mm:ss") -Force
-        Set-ItemProperty -Path $deferralPath -Name "DeferralDays" -Value $DeferralDays -Force
-        
-        Write-Log "Recorded deferral choice for ${AppID}: ${DeferralDays} days, deadline: $userDeadline" | Out-Null
+
+        Write-Log "Recorded deferral for ${AppID}: deferred until $($userDeadline.ToString('yyyy-MM-dd HH:mm:ss'))$(if ($AdminHardDeadline -and $endOfDay -gt $AdminHardDeadline) { ' (clamped to admin deadline)' })" | Out-Null
         
         return $true
         
@@ -3767,7 +3744,7 @@ function Show-DeferralDialog {
             $title = "Update Available: $displayName"
             
             # Create complex dialog with deferral buttons
-            $deferralChoice = Show-EnhancedDeferralDialog -Question $question -Title $title -DeferralOptions $DeferralStatus.DeferralOptions -HasBlockingProcess $hasBlockingProcess -TimeoutSeconds $TimeoutSeconds
+            $deferralChoice = Show-EnhancedDeferralDialog -Question $question -Title $title -HasBlockingProcess $hasBlockingProcess -TimeoutSeconds $TimeoutSeconds
             
             return $deferralChoice
         }
@@ -3799,21 +3776,18 @@ function Show-EnhancedDeferralDialog {
         
         [Parameter(Mandatory=$true)]
         [string]$Title,
-        
-        [Parameter(Mandatory=$true)]
-        [array]$DeferralOptions,
-        
+
         [bool]$HasBlockingProcess = $false,
         [int]$TimeoutSeconds = 60
     )
-    
+
     try {
         # For system context, use the enhanced scheduled task approach
         if (Test-RunningAsSystem) {
-            return Invoke-SystemDeferralPrompt -Question $Question -Title $Title -DeferralOptions $DeferralOptions -HasBlockingProcess $HasBlockingProcess -TimeoutSeconds $TimeoutSeconds
+            return Invoke-SystemDeferralPrompt -Question $Question -Title $Title -HasBlockingProcess $HasBlockingProcess -TimeoutSeconds $TimeoutSeconds
         } else {
             # Direct user context - simplified approach
-            return Show-DirectDeferralDialog -Question $Question -Title $Title -DeferralOptions $DeferralOptions -HasBlockingProcess $HasBlockingProcess -TimeoutSeconds $TimeoutSeconds
+            return Show-DirectDeferralDialog -Question $Question -Title $Title -HasBlockingProcess $HasBlockingProcess -TimeoutSeconds $TimeoutSeconds
         }
         
     } catch {
@@ -3837,31 +3811,23 @@ function Show-DirectDeferralDialog {
     param(
         [string]$Question,
         [string]$Title,
-        [array]$DeferralOptions,
         [bool]$HasBlockingProcess,
         [int]$TimeoutSeconds = 60
     )
-    
+
     try {
-        Write-Log "Showing direct deferral dialog with options: $($DeferralOptions -join ', ')" | Out-Null
-        
+        Write-Log "Showing direct deferral dialog (single Defer button)" | Out-Null
+
         # Load WPF assemblies
         Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
         Add-Type -AssemblyName PresentationCore -ErrorAction Stop
         Add-Type -AssemblyName WindowsBase -ErrorAction Stop
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        
-        # Build dynamic button XML based on deferral options
-        $buttonXml = ""
-        $buttonCount = 0
-        
-        # Add deferral option buttons
-        foreach ($days in ($DeferralOptions | Sort-Object)) {
-            $buttonText = if ($days -eq 1) { "Defer 1 day" } else { "Defer $days days" }
-            $buttonName = "DeferButton$days"
-            $buttonXml += @"
-                <Button Name="$buttonName"
-                        Content="$buttonText"
+
+        # Build button XML: single Defer button + Update Now button
+        $buttonXml = @"
+                <Button Name="DeferButton"
+                        Content="Defer"
                         Width="100"
                         Height="28"
                         Margin="0,0,8,0"
@@ -3871,7 +3837,7 @@ function Show-DirectDeferralDialog {
                         BorderThickness="1"
                         FontSize="11"
                         Cursor="Hand"
-                        Tag="$days">
+                        Tag="0">
                     <Button.Style>
                         <Style TargetType="Button">
                             <Style.Triggers>
@@ -3883,12 +3849,6 @@ function Show-DirectDeferralDialog {
                         </Style>
                     </Button.Style>
                 </Button>
-"@
-            $buttonCount++
-        }
-        
-        # Add Update Now button
-        $buttonXml += @"
                 <Button Name="UpdateButton"
                         Content="Update Now"
                         Width="100"
@@ -3912,9 +3872,9 @@ function Show-DirectDeferralDialog {
                     </Button.Style>
                 </Button>
 "@
-        
-        # Calculate dialog width based on button count
-        $dialogWidth = [Math]::Max(500, ($buttonCount + 1) * 110 + 100)
+
+        # Fixed dialog width for two buttons
+        $dialogWidth = 500
         
         # Create modern dark-themed XAML
         $xaml = @"
@@ -4031,24 +3991,20 @@ function Show-DirectDeferralDialog {
             $window.Close()
         })
         
-        # Add event handlers for deferral buttons
-        foreach ($days in $DeferralOptions) {
-            $buttonName = "DeferButton$days"
-            $button = $window.FindName($buttonName)
-            if ($button) {
-                $button.Add_Click({
-                    $selectedDays = [int]$this.Tag
-                    Write-Log "User selected deferral: $selectedDays days" | Out-Null
-                    $timer.Stop()
-                    $countdownTimer.Stop()
-                    $script:deferralResult = @{
-                        Action = "Defer"
-                        DeferralDays = $selectedDays
-                        CloseProcess = $false
-                    }
-                    $window.Close()
-                }.GetNewClosure())
-            }
+        # Add event handler for Defer button
+        $deferButton = $window.FindName("DeferButton")
+        if ($deferButton) {
+            $deferButton.Add_Click({
+                Write-Log "User selected deferral (until end of day)" | Out-Null
+                $timer.Stop()
+                $countdownTimer.Stop()
+                $script:deferralResult = @{
+                    Action = "Defer"
+                    DeferralDays = 0
+                    CloseProcess = $false
+                }
+                $window.Close()
+            })
         }
         
         # Add event handler for Update button
@@ -4066,16 +4022,16 @@ function Show-DirectDeferralDialog {
             })
         }
         
-        # Handle window closing without button click
+        # Handle window closing without button click (X = Defer)
         $window.Add_Closing({
             $timer.Stop()
             $countdownTimer.Stop()
             if ($script:deferralResult.Action -eq $null) {
-                Write-Log "Deferral dialog closed without selection - defaulting to update" | Out-Null
+                Write-Log "Deferral dialog closed without selection - defaulting to defer (until end of day)" | Out-Null
                 $script:deferralResult = @{
-                    Action = "Update"
+                    Action = "Defer"
                     DeferralDays = 0
-                    CloseProcess = $true
+                    CloseProcess = $false
                 }
             }
         })
@@ -4127,13 +4083,12 @@ function Invoke-SystemDeferralPrompt {
     param(
         [string]$Question,
         [string]$Title,
-        [array]$DeferralOptions,
         [bool]$HasBlockingProcess,
         [int]$TimeoutSeconds = 60
     )
-    
+
     try {
-        Write-Log "Invoking system deferral prompt with options: $($DeferralOptions -join ', ')" | Out-Null
+        Write-Log "Invoking system deferral prompt (single Defer button)" | Out-Null
         
         # Get interactive user
         $userInfo = Get-InteractiveUser
@@ -4157,19 +4112,15 @@ function Invoke-SystemDeferralPrompt {
         $deferralScriptPath = Join-Path $userTempPath "Show-DeferralPrompt_$promptId.ps1"
         
         # Build the script content dynamically
-        $deferralOptionsJson = ($DeferralOptions | ConvertTo-Json -Compress)
-        
         $deferralScriptContent = @'
 param(
     [string]$ResponseFilePath,
     [string]$EncodedQuestion,
     [string]$EncodedTitle,
-    [string]$EncodedDeferralOptions,
     [int]$HasBlockingProcess = 0,
     [int]$TimeoutSeconds = 60,
     [string]$Question = "",
-    [string]$Title = "",
-    [string]$DeferralOptionsJson = ""
+    [string]$Title = ""
 )
 
 # Debug logging
@@ -4185,7 +4136,6 @@ try {
     Write-DeferLog "PID: $PID, Session: $((Get-Process -Id $PID).SessionId), User: $env:USERNAME"
     Write-DeferLog "ResponseFilePath: $ResponseFilePath"
     Write-DeferLog "HasBlockingProcess: $HasBlockingProcess, TimeoutSeconds: $TimeoutSeconds"
-    Write-DeferLog "EncodedDeferralOptions present: $([bool]$EncodedDeferralOptions)"
     Write-DeferLog "ApartmentState: $([System.Threading.Thread]::CurrentThread.GetApartmentState())"
 
     # Decode parameters
@@ -4197,15 +4147,7 @@ try {
         [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedTitle))
     } else { $Title }
 
-    $deferralJson = if ($EncodedDeferralOptions) {
-        [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedDeferralOptions))
-    } else { $DeferralOptionsJson }
-
     Write-DeferLog "Decoded title: $actualTitle"
-    Write-DeferLog "Deferral JSON: $deferralJson"
-
-    $deferralOptions = $deferralJson | ConvertFrom-Json
-    Write-DeferLog "Parsed deferral options: $($deferralOptions -join ', ') (Count: $($deferralOptions.Count))"
 
     # Detect system light/dark mode
     $isDark = $true  # default to dark
@@ -4239,20 +4181,12 @@ try {
     $workArea = $screen.WorkingArea
     Write-DeferLog "Screen working area: $($workArea.Width)x$($workArea.Height)"
 
-    # Compute minimum deferral days for close button
-    $minDeferDays = [int]($deferralOptions | Sort-Object | Select-Object -First 1)
-
-    # Build dynamic buttons XML
-    $buttonXml = ""
-    foreach ($days in ($deferralOptions | Sort-Object)) {
-        $buttonText = if ($days -eq 1) { "Defer 1 day" } else { "Defer $days days" }
-        $buttonName = "DeferButton$days"
-        $buttonXml += "<Button Name=`"$buttonName`" Content=`"$buttonText`" Width=`"100`" Height=`"28`" Margin=`"0,0,8,0`" Tag=`"$days`"/>"
-    }
+    # Build buttons XML: single Defer button + Update Now
+    $buttonXml = '<Button Name="DeferButton" Content="Defer" Width="100" Height="28" Margin="0,0,8,0" Tag="0"/>'
     $buttonXml += '<Button Name="UpdateButton" Content="Update Now" Width="100" Height="28" Background="#FF0078D4" Foreground="White" IsDefault="true" Tag="0"/>'
     Write-DeferLog "Button XML built: $buttonXml"
 
-    $dialogWidth = [Math]::Max(500, ($deferralOptions.Count + 1) * 110 + 100)
+    $dialogWidth = 500
 
     # XML-escape the decoded text and preserve newlines as XML entities
     $escapedQuestion = [System.Security.SecurityElement]::Escape($actualQuestion) -replace "`n", "&#10;"
@@ -4280,7 +4214,7 @@ try {
                     <TextBlock Name="ProgressText" Text="Updating..." Foreground="$textColor" FontSize="12" HorizontalAlignment="Center"/>
                 </StackPanel>
             </Grid>
-            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0" Background="Transparent" Foreground="$closeBtnFg" BorderThickness="0" FontSize="13" Cursor="Hand" FontFamily="Segoe UI Symbol" Tag="$minDeferDays"/>
+            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0" Background="Transparent" Foreground="$closeBtnFg" BorderThickness="0" FontSize="13" Cursor="Hand" FontFamily="Segoe UI Symbol" Tag="0"/>
         </Grid>
     </Border>
 </Window>
@@ -4298,31 +4232,26 @@ try {
 
     $script:result = @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
 
-    # All button handlers write the response file directly via $this.Tag and $ResponseFilePath
-    # This avoids any $script: scope issues with .NET event handler invocation
-    foreach ($days in $deferralOptions) {
-        $button = $window.FindName("DeferButton$days")
-        if ($button) {
-            $button.Add_Click({
-                $selectedDays = [int]$this.Tag
-                Write-DeferLog "Defer button clicked - deferring $selectedDays day(s)"
-                @{ Action = "Defer"; DeferralDays = $selectedDays; CloseProcess = $false } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
-                $window.Close()
-            })
-            Write-DeferLog "Attached click handler for DeferButton$days"
-        }
+    # Defer button handler
+    $deferButton = $window.FindName("DeferButton")
+    if ($deferButton) {
+        $deferButton.Add_Click({
+            Write-DeferLog "Defer button clicked - deferring until end of day"
+            @{ Action = "Defer"; DeferralDays = 0; CloseProcess = $false } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+            $window.Close()
+        })
+        Write-DeferLog "Attached click handler for DeferButton"
     }
 
-    # Close button acts as minimum deferral (days stored in Tag attribute)
+    # Close button acts as Defer (same behavior)
     $closeButton = $window.FindName("CloseButton")
     if ($closeButton) {
         $closeButton.Add_Click({
-            $closeDays = [int]$this.Tag
-            Write-DeferLog "Close button clicked - deferring $closeDays day(s)"
-            @{ Action = "Defer"; DeferralDays = $closeDays; CloseProcess = $false } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+            Write-DeferLog "Close button clicked - deferring until end of day"
+            @{ Action = "Defer"; DeferralDays = 0; CloseProcess = $false } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
             $window.Close()
         })
-        Write-DeferLog "Attached close button handler (defers $minDeferDays day(s))"
+        Write-DeferLog "Attached close button handler (defers until end of day)"
     }
 
     $updateButton = $window.FindName("UpdateButton")
@@ -4430,16 +4359,15 @@ Write-DeferLog "=== DEFERRAL PROMPT SCRIPT ENDED ==="
         # Create task arguments with timeout parameter - ensure proper encoding for text parameters
         $encodedQuestion = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Question))
         $encodedTitle = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Title))
-        $encodedDeferralOptions = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($deferralOptionsJson))
         $hasBlockingStr = if ($HasBlockingProcess) { "1" } else { "0" }
         # Create hidden launch action using VBS wrapper (no console window flash)
-        $deferralPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -EncodedDeferralOptions `"$encodedDeferralOptions`" -HasBlockingProcess $hasBlockingStr -TimeoutSeconds $TimeoutSeconds"
+        $deferralPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -HasBlockingProcess $hasBlockingStr -TimeoutSeconds $TimeoutSeconds"
         $deferralVbsDir = Split-Path $responseFile -Parent
         $deferralLaunch = New-HiddenLaunchAction -PowerShellArguments $deferralPsArgs -VbsDirectory $deferralVbsDir -AllowUI
         if ($deferralLaunch) {
             $action = $deferralLaunch.Action
         } else {
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -EncodedDeferralOptions `"$encodedDeferralOptions`" -HasBlockingProcess $hasBlockingStr -TimeoutSeconds $TimeoutSeconds"
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -HasBlockingProcess $hasBlockingStr -TimeoutSeconds $TimeoutSeconds"
         }
         
         # Create task principal using existing user info
@@ -5849,11 +5777,6 @@ if ($Script:TestMode) {
         TimeoutSeconds = 120
         DeferralEnabled = $true
         MaxDeferralDays = 5
-        DeferralOptions = @(
-            [PSCustomObject]@{ Days = 1; Label = "1 day" },
-            [PSCustomObject]@{ Days = 3; Label = "3 days" },
-            [PSCustomObject]@{ Days = 5; Label = "5 days" }
-        )
         ForcedUpgradeMessage = "This is a test update that can no longer be deferred."
     }
     $whitelistConfig = @($whitelistConfig) + @($testApp)

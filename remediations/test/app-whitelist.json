@@ -9,11 +9,6 @@
         "TimeoutSeconds": 60,
         "DeferralEnabled": true,
         "MaxDeferralDays": 5,
-        "DeferralOptions": [
-            {"Days": 1, "Label": "1 day"},
-            {"Days": 3, "Label": "3 days"},
-            {"Days": 5, "Label": "5 days"}
-        ],
         "ForcedUpgradeMessage": "Firefox security updates can no longer be deferred."
     },
     {
@@ -25,11 +20,6 @@
         "TimeoutSeconds": 60,
         "DeferralEnabled": true,
         "MaxDeferralDays": 5,
-        "DeferralOptions": [
-            {"Days": 1, "Label": "1 day"},
-            {"Days": 3, "Label": "3 days"},
-            {"Days": 5, "Label": "5 days"}
-        ],
         "ForcedUpgradeMessage": "Chrome security updates can no longer be deferred."
     },
     {
@@ -41,12 +31,6 @@
         "TimeoutSeconds": 60,
         "DeferralEnabled": true,
         "MaxDeferralDays": 14,
-        "DeferralOptions": [
-            {"Days": 1, "Label": "1 day"},
-            {"Days": 3, "Label": "3 days"},
-            {"Days": 7, "Label": "1 week"},
-            {"Days": 14, "Label": "2 weeks"}
-        ],
         "ForcedUpgradeMessage": "VS Code updates are now required for compatibility."
     },
     {
@@ -96,13 +80,7 @@
         "TimeoutSeconds": 180,
         "PromptWhenBlocked": true,
         "DeferralEnabled": true,
-        "MaxDeferralDays": 14,
-        "DeferralOptions": [
-            {"Days": 1, "Label": "1 day"},
-            {"Days": 3, "Label": "3 days"},
-            {"Days": 7, "Label": "1 week"},
-            {"Days": 14, "Label": "2 weeks"}
-        ]
+        "MaxDeferralDays": 14
     },
     {
         "AppID": "7zip.7zip",
@@ -134,11 +112,6 @@
         "TimeoutSeconds": 180,
         "DeferralEnabled": true,
         "MaxDeferralDays": 5,
-        "DeferralOptions": [
-            {"Days": 1, "Label": "1 day"},
-            {"Days": 3, "Label": "3 days"},
-            {"Days": 5, "Label": "5 days"}
-        ],
         "ForcedUpgradeMessage": "1Password updates can no longer be deferred."
     },
     {
@@ -334,10 +307,6 @@
         "TimeoutSeconds": 60,
         "DeferralEnabled": true,
         "MaxDeferralDays": 3,
-        "DeferralOptions": [
-            {"Days": 1, "Label": "1 day"},
-            {"Days": 3, "Label": "3 days"}
-        ],
         "ForcedUpgradeMessage": "Adobe Reader security updates cannot be postponed due to security requirements."
     },
     {
@@ -474,11 +443,6 @@
         "TimeoutSeconds": 60,
         "DeferralEnabled": true,
         "MaxDeferralDays": 5,
-        "DeferralOptions": [
-            {"Days": 1, "Label": "1 day"},
-            {"Days": 3, "Label": "3 days"},
-            {"Days": 5, "Label": "5 days"}
-        ],
         "ForcedUpgradeMessage": "Claude updates can no longer be deferred."
     }
 ]
