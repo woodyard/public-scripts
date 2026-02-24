@@ -6452,10 +6452,17 @@ if ($OUTPUT) {
                                         Start-Sleep -Seconds 3
                                         
                                         # Verify processes are really stopped
+                                        # Exclude AutoCloseProcesses from check — services like warp-svc auto-restart via SCM
+                                        $autoCloseList2 = @()
+                                        if (-not [string]::IsNullOrEmpty($okapp.AutoCloseProcesses)) {
+                                            $autoCloseList2 = ($okapp.AutoCloseProcesses -split ',') | ForEach-Object { $_.Trim() }
+                                        }
                                         $stillRunning = $false
                                         foreach ($processName in $processesToCheck) {
                                             $processName = $processName.Trim()
+                                            if ($processName -in $autoCloseList2) { continue }
                                             if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
+                                                Write-Log -Message "Process still running after close attempt: $processName"
                                                 $stillRunning = $true
                                                 break
                                             }
