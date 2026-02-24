@@ -4933,46 +4933,46 @@ function Add-MarkerFileCleanupTrap {
     # PowerShell trap for unexpected errors
     trap {
         Write-Log -Message "Script error trap triggered - performing marker file cleanup"
-        Invoke-MarkerFileEmergencyCleanup -Reason "PowerShell trap"
+        Invoke-MarkerFileCleanup -Reason "PowerShell trap"
         continue
     }
     
     # Register cleanup for normal exit
     Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
         Write-Log -Message "PowerShell exiting - performing marker file cleanup"
-        Invoke-MarkerFileEmergencyCleanup -Reason "PowerShell exit"
+        Invoke-MarkerFileCleanup -Reason "PowerShell exit"
     } | Out-Null
     
     Write-Log -Message "Marker file cleanup traps registered"
 }
 
-function Invoke-MarkerFileEmergencyCleanup {
+function Invoke-MarkerFileCleanup {
     <#
     .SYNOPSIS
-        Emergency cleanup function for marker files during unexpected exits
+        Cleanup function for marker files during script exit
     .DESCRIPTION
         Called by trap handlers to ensure marker files are cleaned up even during errors
     .PARAMETER Reason
         Reason for the emergency cleanup (for logging)
     #>
     param(
-        [string]$Reason = "Emergency cleanup"
+        [string]$Reason = "Cleanup"
     )
-    
+
     try {
-        Write-Log -Message "EMERGENCY: Marker file cleanup triggered ($Reason)"
-        
+        Write-Log -Message "Marker file cleanup triggered ($Reason)"
+
         if ($Global:ActiveMarkerFiles -and $Global:ActiveMarkerFiles.Count -gt 0) {
-            Write-Log -Message "EMERGENCY: Cleaning up $($Global:ActiveMarkerFiles.Count) tracked marker files"
-            
+            Write-Log -Message "Cleaning up $($Global:ActiveMarkerFiles.Count) tracked marker files"
+
             foreach ($markerFile in $Global:ActiveMarkerFiles) {
                 try {
                     if (Test-Path $markerFile) {
                         Remove-Item $markerFile -Force -ErrorAction SilentlyContinue
-                        Write-Log -Message "EMERGENCY: Removed marker file: $markerFile"
+                        Write-Log -Message "Removed marker file: $markerFile"
                     }
                 } catch {
-                    # Silently continue during emergency cleanup
+                    # Silently continue during cleanup
                 }
             }
             
@@ -5158,14 +5158,14 @@ if (Test-Path $testTriggerFile) {
         
         Write-Log -Message "WPF test completed - exiting"
         Write-Log -Message "Performing marker file cleanup before exit (WPF test complete)"
-        Invoke-MarkerFileEmergencyCleanup -Reason "WPF test completed"
+        Invoke-MarkerFileCleanup -Reason "WPF test completed"
         exit 0
         
     } catch {
         Write-Log -Message "❌ ERROR: WPF test failed with exception: $($_.Exception.Message)"
         Write-Log -Message "Full exception: $($_.Exception.ToString())"
         Write-Log -Message "Performing marker file cleanup before exit (WPF test error)"
-        Invoke-MarkerFileEmergencyCleanup -Reason "WPF test error"
+        Invoke-MarkerFileCleanup -Reason "WPF test error"
         exit 1
     }
 }
@@ -5174,7 +5174,7 @@ if (Test-Path $testTriggerFile) {
 if (-not (OOBEComplete)) {
     "OOBE"
     Write-Log -Message "OOBE not complete, performing marker file cleanup before exit"
-    Invoke-MarkerFileEmergencyCleanup -Reason "OOBE not complete"
+    Invoke-MarkerFileCleanup -Reason "OOBE not complete"
     Exit 0
 }
 
@@ -5242,7 +5242,7 @@ try {
 } catch {
     Write-Log -Message "Error parsing whitelist JSON: $($_.Exception.Message)"
     Write-Log -Message "Performing marker file cleanup before exit due to whitelist error"
-    Invoke-MarkerFileEmergencyCleanup -Reason "Whitelist parsing error"
+    Invoke-MarkerFileCleanup -Reason "Whitelist parsing error"
     exit 1
 }
 
@@ -5561,7 +5561,7 @@ if (Test-RunningAsSystem) {
                 }
             }
             Write-Log -Message "Performing marker file cleanup before exit (user context error)"
-            Invoke-MarkerFileEmergencyCleanup -Reason "User context execution error"
+            Invoke-MarkerFileCleanup -Reason "User context execution error"
             exit 1
         }
         
@@ -5626,7 +5626,7 @@ if (Test-RunningAsSystem) {
                     $errorResult | ConvertTo-Json -Depth 3 -Compress | Out-File -FilePath $RemediationResultFile -Encoding UTF8 -Force
                 }
                 Write-Log -Message "Performing marker file cleanup before exit (user context timeout/error)"
-                Invoke-MarkerFileEmergencyCleanup -Reason "User context timeout or error"
+                Invoke-MarkerFileCleanup -Reason "User context timeout or error"
                 exit 1
             }
         }
@@ -5649,7 +5649,7 @@ if (Test-RunningAsSystem) {
                 Write-Log -Message "Error executing winget in system context: $($_.Exception.Message)"
                 Write-Log -Message "Winget execution failed, exiting"
                 Write-Log -Message "Performing marker file cleanup before exit (winget execution failed)"
-                Invoke-MarkerFileEmergencyCleanup -Reason "Winget execution failed in system context"
+                Invoke-MarkerFileCleanup -Reason "Winget execution failed in system context"
                 exit 1
             }
             
@@ -5670,7 +5670,7 @@ if (Test-RunningAsSystem) {
         } else {
             Write-Log -Message "Winget not detected in SYSTEM context"
             Write-Log -Message "Performing marker file cleanup before exit (no winget in system context)"
-            Invoke-MarkerFileEmergencyCleanup -Reason "Winget not detected in SYSTEM context"
+            Invoke-MarkerFileCleanup -Reason "Winget not detected in SYSTEM context"
             exit 0
         }
     }
@@ -5685,7 +5685,7 @@ if (Test-RunningAsSystem) {
         Write-Log -Message "Error executing winget in user context: $($_.Exception.Message)"
         Write-Log -Message "Winget may not be available or properly configured"
         Write-Log -Message "Performing marker file cleanup before exit (winget not available)"
-        Invoke-MarkerFileEmergencyCleanup -Reason "Winget not available or properly configured"
+        Invoke-MarkerFileCleanup -Reason "Winget not available or properly configured"
         exit 1
     }
     
@@ -6188,15 +6188,15 @@ if ($OUTPUT) {
         }
         
         Write-Log -Message "Performing final marker file cleanup before script completion"
-        Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (remediation complete)"
+        Invoke-MarkerFileCleanup -Reason "Script completion (remediation complete)"
         exit 0
     }
     Write-Log -Message "[$ScriptTag] No upgrades (0x0000002)"
     Write-Log -Message "Performing final marker file cleanup before script exit (no upgrades)"
-    Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (no upgrades)"
+    Invoke-MarkerFileCleanup -Reason "Script completion (no upgrades)"
     exit 0
 }
 Write-Log -Message "[$ScriptTag] Winget not detected"
 Write-Log -Message "Performing final marker file cleanup before script exit (winget not detected)"
-Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (winget not detected)"
+Invoke-MarkerFileCleanup -Reason "Script completion (winget not detected)"
 exit 0
