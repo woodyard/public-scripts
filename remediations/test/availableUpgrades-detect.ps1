@@ -1099,7 +1099,7 @@ function Invoke-UserContextDetection {
 }
 
 <# Script variables #>
-$Script:TestMode = $true  # TEST MODE: Simulate finding an app update to trigger remediation
+$Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
 $ScriptTag = "5C" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year

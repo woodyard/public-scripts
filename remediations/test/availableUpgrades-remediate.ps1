@@ -4990,7 +4990,7 @@ function Invoke-MarkerFileCleanup {
 # ============================================================================
 
 <# Script variables #>
-$Script:TestMode = $true  # TEST MODE: Simulate app update with dialogs and notifications
+$Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
 $ScriptTag = "8X" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
