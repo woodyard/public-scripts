@@ -3631,12 +3631,13 @@ param(
     [string]$ResponseFilePath,
     [string]$EncodedQuestion,
     [string]$EncodedTitle,
-    [string]$DeferralOptionsJson,
+    [string]$EncodedDeferralOptions,
     [bool]$HasBlockingProcess = $false,
     [int]$TimeoutSeconds = 60,
     # Legacy parameters for backward compatibility
     [string]$Question = "",
-    [string]$Title = ""
+    [string]$Title = "",
+    [string]$DeferralOptionsJson = ""
 )
 
 # Decode the text parameters if they're base64 encoded, otherwise use legacy parameters
@@ -3652,8 +3653,13 @@ $actualTitle = if ($EncodedTitle) {
     $Title
 }
 
-# Parse deferral options
-$deferralOptions = $DeferralOptionsJson | ConvertFrom-Json
+# Parse deferral options - decode from Base64 if encoded, otherwise use legacy raw JSON
+$deferralJson = if ($EncodedDeferralOptions) {
+    [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedDeferralOptions))
+} else {
+    $DeferralOptionsJson
+}
+$deferralOptions = $deferralJson | ConvertFrom-Json
 
 # Load WPF assemblies
 Add-Type -AssemblyName PresentationFramework
@@ -3741,14 +3747,15 @@ $script:result | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding
         # Create task arguments with timeout parameter - ensure proper encoding for text parameters
         $encodedQuestion = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Question))
         $encodedTitle = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Title))
+        $encodedDeferralOptions = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($deferralOptionsJson))
         # Create hidden launch action using VBS wrapper (no console window flash)
-        $deferralPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -DeferralOptionsJson `"$deferralOptionsJson`" -HasBlockingProcess $$HasBlockingProcess -TimeoutSeconds $TimeoutSeconds"
+        $deferralPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -EncodedDeferralOptions `"$encodedDeferralOptions`" -HasBlockingProcess $$HasBlockingProcess -TimeoutSeconds $TimeoutSeconds"
         $deferralVbsDir = Split-Path $responseFile -Parent
         $deferralLaunch = New-HiddenLaunchAction -PowerShellArguments $deferralPsArgs -VbsDirectory $deferralVbsDir -AllowUI
         if ($deferralLaunch) {
             $action = $deferralLaunch.Action
         } else {
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -DeferralOptionsJson `"$deferralOptionsJson`" -HasBlockingProcess $$HasBlockingProcess -TimeoutSeconds $TimeoutSeconds"
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$deferralScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -EncodedDeferralOptions `"$encodedDeferralOptions`" -HasBlockingProcess $$HasBlockingProcess -TimeoutSeconds $TimeoutSeconds"
         }
         
         # Create task principal using existing user info
