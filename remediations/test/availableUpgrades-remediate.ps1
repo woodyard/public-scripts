@@ -2065,6 +2065,74 @@ Write-ProgLog "=== UPGRADE PROGRESS DIALOG ENDED ==="
     }
 }
 
+function Get-AppInstalledScope {
+    <#
+    .SYNOPSIS
+        Detects whether an app is installed per-user or machine-wide by checking the uninstall registry.
+    .DESCRIPTION
+        Checks HKLM (machine) and HKU\<SID> (user) uninstall registry keys for a matching DisplayName.
+        Returns "user", "machine", or "unknown".
+    #>
+    param(
+        [string]$AppID,
+        [string]$FriendlyName
+    )
+
+    try {
+        $foundMachine = $false
+        $foundUser = $false
+
+        # Build search terms from AppID and FriendlyName
+        # AppID like "Microsoft.PowerToys" → search for "PowerToys"
+        $searchName = if ($FriendlyName) { $FriendlyName } else { ($AppID -split '\.')[-1] }
+
+        # Check machine-wide uninstall registry
+        $machineKeys = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        )
+        foreach ($keyPath in $machineKeys) {
+            if (Test-Path $keyPath) {
+                $entries = Get-ChildItem $keyPath -ErrorAction SilentlyContinue |
+                    Get-ItemProperty -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DisplayName -like "*$searchName*" }
+                if ($entries) { $foundMachine = $true; break }
+            }
+        }
+
+        # Check user-scoped uninstall registry (via HKU hive from SYSTEM context)
+        if (Test-RunningAsSystem) {
+            $userInfo = Get-InteractiveUser
+            if ($userInfo -and $userInfo.SID) {
+                $userKey = "Registry::HKU\$($userInfo.SID)\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+                if (Test-Path $userKey) {
+                    $userEntries = Get-ChildItem $userKey -ErrorAction SilentlyContinue |
+                        Get-ItemProperty -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -like "*$searchName*" }
+                    if ($userEntries) { $foundUser = $true }
+                }
+            }
+        }
+
+        if ($foundUser -and -not $foundMachine) {
+            Write-Log "Scope detection for $AppID : user (found in user registry only)" | Out-Null
+            return "user"
+        } elseif ($foundMachine -and -not $foundUser) {
+            Write-Log "Scope detection for $AppID : machine (found in machine registry only)" | Out-Null
+            return "machine"
+        } elseif ($foundMachine -and $foundUser) {
+            Write-Log "Scope detection for $AppID : machine (found in both, preferring machine)" | Out-Null
+            return "machine"
+        } else {
+            Write-Log "Scope detection for $AppID : unknown (not found in registry)" | Out-Null
+            return "unknown"
+        }
+    } catch {
+        Write-Log "Scope detection error for $AppID : $($_.Exception.Message)" | Out-Null
+        return "unknown"
+    }
+}
+
 function Write-InfoDialogStatus {
     param(
         [string]$SignalFilePath,
@@ -6535,7 +6603,16 @@ if ($OUTPUT) {
                         $wingetExe = if ((Test-RunningAsSystem) -and $WingetPath) { "winget.exe" } else { "winget.exe" }
                         $wingetDir = if ((Test-RunningAsSystem) -and $WingetPath) { $WingetPath } else { $null }
                         $wingetArgs = @("upgrade", "--silent", "--accept-source-agreements", "--id", $appInfo.AppID)
-                        if (-not (Test-RunningAsSystem) -and -not $userIsAdmin) {
+
+                        # Detect installed scope and add --scope flag accordingly
+                        $detectedScope = "unknown"
+                        if ((Test-RunningAsSystem)) {
+                            $detectedScope = Get-AppInstalledScope -AppID $appInfo.AppID -FriendlyName $okapp.FriendlyName
+                            if ($detectedScope -eq "user") {
+                                Write-Log -Message "Using --scope user for $($appInfo.AppID) (detected as user-scoped install)"
+                                $wingetArgs += @("--scope", "user")
+                            }
+                        } elseif (-not $userIsAdmin) {
                             Write-Log -Message "Using --scope user for non-admin user context upgrade"
                             $wingetArgs += @("--scope", "user")
                         }
@@ -6566,14 +6643,12 @@ if ($OUTPUT) {
                             Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Reinstalling application..."
                             Write-Log -Message "Install technology mismatch detected for $($appInfo.AppID). Attempting uninstall and reinstall."
                             
-                            # First uninstall - use appropriate winget path and scope based on context
+                            # First uninstall - use detected scope
+                            $scopeArgs = if ($detectedScope -eq "user" -or (-not (Test-RunningAsSystem) -and -not $userIsAdmin)) { @("--scope", "user") } else { @() }
                             if ((Test-RunningAsSystem) -and $WingetPath) {
-                                $uninstallResult = & .\winget.exe uninstall --silent --id $appInfo.AppID 2>&1
-                            } elseif ($userIsAdmin) {
-                                $uninstallResult = & winget uninstall --silent --id $appInfo.AppID 2>&1
+                                $uninstallResult = & .\winget.exe uninstall --silent @scopeArgs --id $appInfo.AppID 2>&1
                             } else {
-                                # User context without admin - use user scope
-                                $uninstallResult = & winget uninstall --silent --scope user --id $appInfo.AppID 2>&1
+                                $uninstallResult = & winget uninstall --silent @scopeArgs --id $appInfo.AppID 2>&1
                             }
                             
                             $uninstallOutput = $uninstallResult -join "`n"
@@ -6588,12 +6663,9 @@ if ($OUTPUT) {
                             
                             # Then install fresh - use appropriate winget path and scope based on context
                             if ((Test-RunningAsSystem) -and $WingetPath) {
-                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements --id $appInfo.AppID 2>&1
-                            } elseif ($userIsAdmin) {
-                                $upgradeResult = & winget install --silent --accept-source-agreements --id $appInfo.AppID 2>&1
+                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements @scopeArgs --id $appInfo.AppID 2>&1
                             } else {
-                                # User context without admin - use user scope
-                                $upgradeResult = & winget install --silent --accept-source-agreements --scope user --id $appInfo.AppID 2>&1
+                                $upgradeResult = & winget install --silent --accept-source-agreements @scopeArgs --id $appInfo.AppID 2>&1
                             }
                             
                             $upgradeOutput = $upgradeResult -join "`n"
@@ -6603,14 +6675,12 @@ if ($OUTPUT) {
                             Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Retrying installation..."
                             Write-Log -Message "Uninstall failure detected for $($appInfo.AppID). Trying alternative approaches."
                             
-                            # Try install with --force to override - use appropriate winget path and scope based on context
+                            # Try install with --force to override - use detected scope
+                            $scopeArgs = if ($detectedScope -eq "user" -or (-not (Test-RunningAsSystem) -and -not $userIsAdmin)) { @("--scope", "user") } else { @() }
                             if ((Test-RunningAsSystem) -and $WingetPath) {
-                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements --force --id $appInfo.AppID 2>&1
-                            } elseif ($userIsAdmin) {
-                                $upgradeResult = & winget install --silent --accept-source-agreements --force --id $appInfo.AppID 2>&1
+                                $upgradeResult = & .\winget.exe install --silent --accept-source-agreements --force @scopeArgs --id $appInfo.AppID 2>&1
                             } else {
-                                # User context without admin - use user scope
-                                $upgradeResult = & winget install --silent --accept-source-agreements --scope user --force --id $appInfo.AppID 2>&1
+                                $upgradeResult = & winget install --silent --accept-source-agreements --force @scopeArgs --id $appInfo.AppID 2>&1
                             }
                             
                             $upgradeOutput = $upgradeResult -join "`n"

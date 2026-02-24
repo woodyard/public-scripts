@@ -131,6 +131,7 @@
         "AppID": "Microsoft.PowerToys",
         "FriendlyName": "PowerToys",
         "BlockingProcess": "PowerToys",
+        "PromptWhenBlocked": true,
         "DefaultTimeoutAction": true
     },
     {
