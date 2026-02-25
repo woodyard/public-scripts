@@ -12,7 +12,7 @@
         "ForcedUpgradeMessage": "Firefox security updates can no longer be deferred."
     },
     {
-        "AppID": "Google.Chrome",
+        "AppID": "Google.Chrome*",
         "FriendlyName": "Chrome",
         "BlockingProcess": "chrome",
         "PromptWhenBlocked": true,
@@ -298,7 +298,7 @@
         "TimeoutSeconds": 75
     },
     {
-        "AppID": "Adobe.Acrobat.Reader.64-bit",
+        "AppID": "Adobe.Acrobat.Reader*",
         "FriendlyName": "Adobe Acrobat Reader",
         "Disabled": true,
         "BlockingProcess": "AcroRd32,Acrobat,AcroBroker,AdobeARM,AdobeCollabSync",
@@ -345,7 +345,7 @@
         "AppID": "TrackerSoftware.PDF-XChangeEditor"
     },
     {
-        "AppID": "Microsoft.VCLibs.Desktop.14"
+        "AppID": "Microsoft.VCLibs.Desktop.*"
     },
     {
         "AppID": "Microsoft.AzureDataStudio",
@@ -394,10 +394,7 @@
         "AppID": "Python.Launcher"
     },
     {
-        "AppID": "Microsoft.VCRedist.2015+.x64"
-    },
-    {
-        "AppID": "Microsoft.VCRedist.2015+.arm64"
+        "AppID": "Microsoft.VCRedist.*"
     },
     {
         "AppID": "TeamViewer.TeamViewer.Host",
@@ -427,7 +424,7 @@
         "BlockingProcess": "PAD.Console.Host,PAD.Robot.Service"
     },
     {
-        "AppID": "Microsoft.DotNet.Runtime.8"
+        "AppID": "Microsoft.DotNet.Runtime.*"
     },
     {
         "AppID": "Microsoft.PowerShell",
@@ -440,11 +437,11 @@
         "DefaultTimeoutAction": true
     },
     {
-        "AppID": "Microsoft.DotNet.SDK.8",
+        "AppID": "Microsoft.DotNet.SDK.*",
         "FriendlyName": ".NET 8 SDK"
     },
     {
-        "AppID": "Microsoft.DotNet.DesktopRuntime.8",
+        "AppID": "Microsoft.DotNet.DesktopRuntime.*",
         "FriendlyName": ".NET 8 Desktop Runtime"
     },
     {

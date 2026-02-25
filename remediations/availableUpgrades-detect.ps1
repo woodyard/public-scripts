@@ -1423,7 +1423,7 @@ if ($OUTPUT) {
             if ($app -ne "") {
                 $doUpgrade = $false
                 foreach ($okapp in $whitelistConfig) {
-                    if ($app -eq $okapp.AppID) {
+                    if ($app -like $okapp.AppID) {
                         # FAST DEFERRAL CHECK - Only check existing registry data (no expensive winget queries)
                         if ($okapp.DeferralEnabled -eq $true) {
                             $deferralPath = "HKLM:\SOFTWARE\WingetUpgradeManager\Deferrals\$app"

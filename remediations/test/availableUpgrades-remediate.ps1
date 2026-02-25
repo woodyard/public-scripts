@@ -6322,7 +6322,7 @@ if ($OUTPUT) {
             if ($appInfo.AppID -ne "") {
                 $doUpgrade = $false
                 foreach ($okapp in $whitelistConfig) {
-                    if ($appInfo.AppID -eq $okapp.AppID) {
+                    if ($appInfo.AppID -like $okapp.AppID) {
                         Write-Log -Message "Processing whitelisted app: $($okapp.AppID)" | Out-Null
                         
                         # First, check deferral status if deferrals are enabled
