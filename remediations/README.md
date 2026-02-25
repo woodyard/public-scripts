@@ -28,15 +28,15 @@ Intune Remediation Policy
 
 ## Files
 
-| File | Purpose |
-|------|---------|
-| `availableUpgrades-detect.ps1` | Main detection script (whitelist-based, dual-context) |
-| `availableUpgrades-remediate.ps1` | Main remediation script (upgrades apps, shows user prompts) |
-| `availableUpgrades-detect-all.ps1` | Alternative detection script (exclude-list approach, simpler) |
-| `app-whitelist.json` | Centralized whitelist configuration for all managed apps |
-| `available-detect.ps1` | Wrapper: downloads and runs the detect script from GitHub |
-| `available-remediate.ps1` | Wrapper: downloads and runs the remediate script from GitHub |
-| `available-detect-all.ps1` | Wrapper: downloads and runs the detect-all script from GitHub |
+| File | Version | Tag | Purpose |
+|------|---------|-----|---------|
+| `availableUpgrades-detect.ps1` | 5.25 | 5D | Main detection script (whitelist-based, dual-context) |
+| `availableUpgrades-remediate.ps1` | 8.6 | 8X | Main remediation script (upgrades apps, shows user prompts) |
+| `availableUpgrades-detect-all.ps1` | - | - | Alternative detection script (exclude-list approach, simpler) |
+| `app-whitelist.json` | - | - | Centralized whitelist configuration for all managed apps |
+| `available-detect.ps1` | - | - | Wrapper: downloads and runs the detect script from GitHub |
+| `available-remediate.ps1` | - | - | Wrapper: downloads and runs the remediate script from GitHub |
+| `available-detect-all.ps1` | - | - | Wrapper: downloads and runs the detect-all script from GitHub |
 
 ## Intune Deployment
 
@@ -138,7 +138,11 @@ Intune remediations run as SYSTEM, but some apps are installed per-user (e.g. VS
 1. **System context** (default): The script runs `winget upgrade` as SYSTEM to detect/upgrade machine-wide installations.
 2. **User context** (scheduled task): The script creates a temporary scheduled task that runs as the logged-in user with `--scope user` to detect/upgrade user-scoped installations.
 
-Communication between contexts uses JSON files in shared temp directories (`C:\ProgramData\Temp`). Marker files (`.userdetection`) coordinate the handoff and are cleaned up automatically.
+Communication between contexts uses JSON files in shared temp directories (`C:\ProgramData\Temp`). Marker files (`.userdetection`) coordinate the handoff and are managed by a centralized marker file management system that handles creation, tracking, orphan cleanup, and emergency cleanup on script exit.
+
+### Hidden Task Execution
+
+User-context scheduled tasks are launched via a temporary VBS wrapper (`wscript.exe`) instead of `cmd.exe`. Since `wscript.exe` is a GUI subsystem application, it never creates a console window, eliminating the brief window flash that users would otherwise see during detection and remediation.
 
 ### Interactive Session Checks
 
@@ -216,7 +220,15 @@ Logs are written to both the console (for Intune visibility) and to files:
 
 Log files are named with the pattern `{ScriptName}-{dd-MM-yy_HH-mm}.log` and are automatically cleaned up after 1 month.
 
-Each log line includes a script tag (e.g. `5C`, `8X`) for version tracking across Intune log output.
+Each log line includes a script tag (e.g. `5D`, `8X`) for version tracking across Intune log output.
+
+When apps have been deferred by the user, the detection script outputs an additional line:
+
+```
+[5D] Deferred: Mozilla.Firefox (until 28.02.2026 14:30)
+```
+
+This makes postponed updates visible in the Intune remediation output without requiring log file analysis.
 
 ## OOBE / Autopilot Safety
 
@@ -231,6 +243,14 @@ Resolve-Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_*64__
 ```
 
 The first `winget upgrade` call is validated for output quality. If the output is invalid (winget initialization noise), the command is retried automatically.
+
+## Bootstrapper Detection
+
+When running via wrapper scripts, the main scripts detect that the source file is a small bootstrapper (< 1 KB) and automatically download the full script from the URL embedded in the wrapper before creating user-context scheduled tasks. This ensures scheduled tasks always execute the complete script logic.
+
+## Test Environment
+
+The `test/` subdirectory contains development versions of the scripts that point to test-path URLs. To promote test to production, copy the scripts to the parent directory and update internal URLs from `remediations/test/` to `remediations/`.
 
 ## Install Technology Mismatch Handling
 

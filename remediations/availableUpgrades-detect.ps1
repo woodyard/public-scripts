@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.24
-    Tag: 5C
+    Version: 5.25
+    Tag: 5D
     
     Version History:
     1.0 - Initial version
@@ -71,7 +71,8 @@
     5.22 - CRITICAL FIX: Implemented marker file workaround for scheduled task parameter passing issues - uses file-based communication to ensure user detection tasks always execute correct code path and create JSON result files
     5.23 - ENHANCEMENT: Implemented comprehensive marker file management system with centralized cleanup functions, orphaned file detection, and emergency cleanup handlers to prevent accumulation of .userdetection files; Added hidden console window execution method using cmd.exe with /min flag to eliminate visible console windows during scheduled task execution
     5.24 - PERFORMANCE OPTIMIZATION: Implemented user info caching to eliminate redundant WMI calls, enhanced scheduled task execution with -NoProfile flag for better reliability, eliminated double marker file initialization
-    
+    5.25 - ENHANCEMENT: Detection output now reports deferred apps with their deadline in the script tag message, providing visibility into postponed updates in Intune logs
+
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
     1 - Upgrades available (triggers remediation)
@@ -1100,7 +1101,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "5C" # Update this tag for each script version
+$ScriptTag = "5D" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -1416,6 +1417,7 @@ if ($OUTPUT) {
         Write-Log -Message "DEBUG: Total apps found in winget output: $($LIST.Count)" -IsDebug
 
         $contextApps = @()
+        $deferredApps = @()
 
         foreach ($app in $LIST) {
             if ($app -ne "") {
@@ -1434,6 +1436,7 @@ if ($OUTPUT) {
                                     if ($deferralData -and $deferralData.UserDeadline) {
                                         $userDeadline = [DateTime]::Parse($deferralData.UserDeadline)
                                         if ($now -lt $userDeadline) {
+                                            $deferredApps += "$($okapp.AppID) (until $($userDeadline.ToString('dd.MM.yyyy HH:mm')))"
                                             Write-Log -Message "Skipping $($okapp.AppID) - user has deferred until $userDeadline"
                                             continue  # Skip this app - still deferred
                                         } else {
@@ -1641,6 +1644,9 @@ if ($OUTPUT) {
             # PERFORMANCE OPTIMIZATION: Exit immediately if system apps are found
             if ($systemApps.Count -gt 0) {
                 Write-Log -Message "[$ScriptTag] $($systemApps -join ', ')"
+                if ($deferredApps.Count -gt 0) {
+                    Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
+                }
                 Write-Log -Message "Performing marker file cleanup before exit (system apps found)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "System apps found, triggering remediation"
                 exit 1  # Trigger remediation immediately
@@ -1649,6 +1655,9 @@ if ($OUTPUT) {
             # Only run user detection if no system apps were found AND interactive session exists
             Write-Log -Message "No system apps found - checking for interactive session before user context detection"
             if (-not (Test-InteractiveSession)) {
+                if ($deferredApps.Count -gt 0) {
+                    Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
+                }
                 Write-Log -Message "[$ScriptTag] No interactive session detected - skipping user context detection"
                 Write-Log -Message "[$ScriptTag] No upgrades available in any context (no system apps, no interactive session)"
                 Write-Log -Message "Performing marker file cleanup before exit (no interactive session)" -IsDebug
@@ -1664,10 +1673,16 @@ if ($OUTPUT) {
             
             if ($userApps.Count -gt 0) {
                 Write-Log -Message "[$ScriptTag] $($userApps -join ', ')"
+                if ($deferredApps.Count -gt 0) {
+                    Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
+                }
                 Write-Log -Message "Performing marker file cleanup before exit (user apps found)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "User apps found, triggering remediation"
                 exit 1  # Trigger remediation
             } else {
+                if ($deferredApps.Count -gt 0) {
+                    Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
+                }
                 Write-Log -Message "[$ScriptTag] No upgrades available in any context"
                 Write-Log -Message "Performing marker file cleanup before exit (no upgrades found)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "No upgrades available in any context"
@@ -1680,10 +1695,16 @@ if ($OUTPUT) {
             # Direct user context execution
             if ($contextApps.Count -gt 0) {
                 Write-Log -Message "[$ScriptTag] $($contextApps -join ', ')"
+                if ($deferredApps.Count -gt 0) {
+                    Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
+                }
                 Write-Log -Message "Performing marker file cleanup before exit (direct user context apps found)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "Direct user context apps found"
                 exit 1  # Trigger remediation
             } else {
+                if ($deferredApps.Count -gt 0) {
+                    Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
+                }
                 Write-Log -Message "[$ScriptTag] No user context upgrades available"
                 Write-Log -Message "Performing marker file cleanup before exit (no user context upgrades)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "No user context upgrades available"
