@@ -5790,8 +5790,9 @@ if ($Script:TestMode) {
 }
 
 # Main remediation logic - dual-context architecture
-if (Test-RunningAsSystem) {
-    if ($UserRemediationOnly) {
+# Check UserRemediationOnly FIRST - this flag means we're a scheduled user remediation task,
+# regardless of whether Test-RunningAsSystem is true (the task may run as the user's principal)
+if ($UserRemediationOnly) {
         # DIAGNOSTIC: Log immediate execution proof before any other operations
         try {
             $debugInfo = @(
@@ -6151,8 +6152,8 @@ if (Test-RunningAsSystem) {
         }
         
         Write-Log -Message "User context remediation - processing user-scoped apps only"
-        
-    } else {
+
+} elseif (Test-RunningAsSystem) {
         # SYSTEM context main execution - process system apps and schedule user remediation
         Write-Log -Message "SYSTEM context - processing system apps and scheduling user remediation"
         
@@ -6192,7 +6193,6 @@ if (Test-RunningAsSystem) {
             Invoke-MarkerFileCleanup -Reason "Winget not detected in SYSTEM context"
             exit 0
         }
-    }
 } else {
     # User context execution - process user apps only
     Write-Log -Message "USER context - processing user-scoped apps"
