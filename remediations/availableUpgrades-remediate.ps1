@@ -6624,7 +6624,7 @@ if ($OUTPUT) {
 
                         # Evaluate success
                         Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Verifying installation..."
-                        if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*Successfully updated*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*" -or ($LASTEXITCODE -eq 0 -and $upgradeOutput -notlike "*failed*" -and $upgradeOutput -notlike "*error*0x*")) {
+                        if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*Successfully updated*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*" -or ($null -ne $LASTEXITCODE -and $LASTEXITCODE -eq 0 -and $upgradeOutput -notlike "*failed*" -and $upgradeOutput -notlike "*error*0x*")) {
                             Write-Log -Message "Upgrade completed successfully for: $($appInfo.AppID)"
                             $message += "$($appInfo.AppID)|"
 
