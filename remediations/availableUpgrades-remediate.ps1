@@ -2211,45 +2211,45 @@ function Invoke-WingetWithProgress {
         while (-not $proc.HasExited) {
             Start-Sleep -Seconds 2
 
-            if (Test-Path $logFile) {
+            if (Test-Path $outFile) {
                 try {
-                    # Read log using FileStream with shared read to avoid locking conflicts
-                    $fs = [System.IO.FileStream]::new($logFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                    # Read stdout using FileStream with shared read to avoid locking conflicts
+                    $fs = [System.IO.FileStream]::new($outFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
                     $reader = [System.IO.StreamReader]::new($fs)
-                    $logText = $reader.ReadToEnd()
+                    $outText = $reader.ReadToEnd()
                     $reader.Close()
                     $fs.Close()
 
-                    if ($logText.Length -gt 0) {
-                        # Match download progress bytes: "12345678 / 98765432"
-                        $progressMatches = [regex]::Matches($logText, '(\d{4,})\s*/\s*(\d{4,})')
+                    if ($outText.Length -gt 0) {
+                        # Match winget stdout progress: "1024 KB / 6.31 MB" or "2.00 MB / 6.31 MB"
+                        $progressMatches = [regex]::Matches($outText, '([\d.]+)\s*(KB|MB)\s*/\s*([\d.]+)\s*(MB|GB)')
                         if ($progressMatches.Count -gt 0) {
                             $lastMatch = $progressMatches[$progressMatches.Count - 1]
-                            $downloaded = [long]$lastMatch.Groups[1].Value
-                            $total = [long]$lastMatch.Groups[2].Value
-                            if ($total -gt 10000) {  # sanity check: at least 10KB
-                                $downloadDetected = $true
-                                $dlMB = [math]::Round($downloaded / 1MB, 1)
-                                $totalMB = [math]::Round($total / 1MB, 1)
-                                $status = "Downloading update... $dlMB MB / $totalMB MB"
+                            $dlVal = $lastMatch.Groups[1].Value
+                            $dlUnit = $lastMatch.Groups[2].Value
+                            $totalVal = $lastMatch.Groups[3].Value
+                            $totalUnit = $lastMatch.Groups[4].Value
+                            $downloadDetected = $true
+                            $status = "Downloading update... $dlVal $dlUnit / $totalVal $totalUnit"
+                            if ($status -ne $lastStatus) {
+                                $lastStatus = $status
+                                Write-InfoDialogStatus -SignalFilePath $SignalFilePath -Status $status
+                            }
+                        }
+
+                        # Detect installation phase (stdout shows this after download completes)
+                        if (-not $downloadDetected -or $lastStatus -like "Downloading*") {
+                            if ($outText -match 'Successfully installed|Installing|Configuring|Starting installer') {
+                                $status = "Installing update..."
                                 if ($status -ne $lastStatus) {
                                     $lastStatus = $status
                                     Write-InfoDialogStatus -SignalFilePath $SignalFilePath -Status $status
                                 }
                             }
                         }
-
-                        # Detect installation phase
-                        if ($logText -match 'Starting package install|Installer started|begin installation') {
-                            $status = "Installing update..."
-                            if ($status -ne $lastStatus) {
-                                $lastStatus = $status
-                                Write-InfoDialogStatus -SignalFilePath $SignalFilePath -Status $status
-                            }
-                        }
                     }
                 } catch {
-                    # Log file may not be ready yet, ignore
+                    # Output file may not be ready yet, ignore
                 }
             }
         }
