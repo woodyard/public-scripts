@@ -1,6 +1,6 @@
 [
     {
-        "AppID": "Mozilla.Firefox",
+        "AppID": "Mozilla.Firefox*",
         "FriendlyName": "Firefox",
         "Disabled": false,
         "BlockingProcess": "firefox",
