@@ -316,6 +316,21 @@ function Get-InteractiveUser {
             }
             
             if (-not $loggedInUser -or -not $LoggedSID) {
+                # CIM/WMI returns empty on Windows 365 (RDP sessions) - try Explorer process owner as fallback
+                Write-Log "CIM/WMI returned no user (possible RDP/Windows 365 session) - trying Explorer process fallback..." | Out-Null
+                try {
+                    $explorerProc = Get-Process explorer -IncludeUserName -ErrorAction Stop | Select-Object -First 1
+                    if ($explorerProc -and $explorerProc.UserName) {
+                        $loggedInUser = $explorerProc.UserName
+                        $LoggedSID = ([System.Security.Principal.NTAccount]$loggedInUser).Translate([System.Security.Principal.SecurityIdentifier]).Value
+                        Write-Log "Explorer fallback successful - User: $loggedInUser, SID: $LoggedSID" | Out-Null
+                    }
+                } catch {
+                    Write-Log "Explorer process fallback failed: $($_.Exception.Message)" | Out-Null
+                }
+            }
+
+            if (-not $loggedInUser -or -not $LoggedSID) {
                 throw "User detection failed - no logged in user found"
             }
             
