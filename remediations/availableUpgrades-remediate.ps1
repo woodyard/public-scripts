@@ -6344,7 +6344,7 @@ if ($OUTPUT) {
                         if ($okapp.DeferralEnabled -eq $true) {
                             Write-Log -Message "Deferral system enabled for $($okapp.AppID), checking status" | Out-Null
 
-                            $deferralStatus = Get-DeferralStatus -AppID $okapp.AppID -WhitelistConfig $okapp -AvailableVersion $appInfo.AvailableVersion
+                            $deferralStatus = Get-DeferralStatus -AppID $appInfo.AppID -WhitelistConfig $okapp -AvailableVersion $appInfo.AvailableVersion
 
                             if ($deferralStatus.ForceUpdate) {
                                 # Past admin hard deadline or user deadline - mandatory update
@@ -6436,7 +6436,7 @@ if ($OUTPUT) {
                                     $customTimeout = if ($okapp.TimeoutSeconds -and $okapp.TimeoutSeconds -gt 0) { $okapp.TimeoutSeconds } else { 60 }
                                     
                                     Write-Log -Message "Using timeout: ${customTimeout}s, default action: $defaultTimeoutAction" | Out-Null
-                                    $dialogResult = Show-ProcessCloseDialog -AppName $okapp.AppID -ProcessName $runningProcessName -TimeoutSeconds $customTimeout -DefaultTimeoutAction $defaultTimeoutAction -FriendlyName $okapp.FriendlyName -CurrentVersion $appInfo.CurrentVersion -AvailableVersion $appInfo.AvailableVersion -WhitelistConfig $okapp
+                                    $dialogResult = Show-ProcessCloseDialog -AppName $appInfo.AppID -ProcessName $runningProcessName -TimeoutSeconds $customTimeout -DefaultTimeoutAction $defaultTimeoutAction -FriendlyName $okapp.FriendlyName -CurrentVersion $appInfo.CurrentVersion -AvailableVersion $appInfo.AvailableVersion -WhitelistConfig $okapp
                                     
                                     Write-Log -Message "Show-ProcessCloseDialog returned: $($dialogResult | ConvertTo-Json -Compress)"
                                 }
