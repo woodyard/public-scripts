@@ -590,27 +590,43 @@ function Get-InteractiveUser {
         }
         
         Write-Log "Detecting interactive user using Win32_ComputerSystem..."
-        
+
         # Primary method - proven to work with Azure AD
+        $loggedInUser = $null
         try {
             $loggedInUser = Get-WmiObject -Class Win32_ComputerSystem | Select-Object username -ExpandProperty username
             if (-not $loggedInUser) {
-                $Message = "User is not logged on to the primary session: No username returned from Win32_ComputerSystem"
-                Throw $Message
+                Write-Log "No username returned from Win32_ComputerSystem (possible RDP/Windows 365 session) - trying Explorer process fallback..."
             }
-            
-            $username = ($loggedInUser -split '\\')[1]
-            $domain = ($loggedInUser -split '\\')[0]
-            
-            Write-Log "Found logged in user: $loggedInUser"
-            Write-Log "Extracted username: $username"
-            Write-Log "Extracted domain: $domain"
-            
-        } catch [Exception] {
-            $Message = "User is not logged on to the primary session: $_"
+        } catch {
+            Write-Log "Win32_ComputerSystem failed: $($_.Exception.Message) - trying Explorer process fallback..."
+        }
+
+        # Fallback for RDP/Windows 365 sessions where Win32_ComputerSystem returns empty
+        if (-not $loggedInUser) {
+            try {
+                $explorerProc = Get-Process explorer -IncludeUserName -ErrorAction Stop | Select-Object -First 1
+                if ($explorerProc -and $explorerProc.UserName) {
+                    $loggedInUser = $explorerProc.UserName
+                    Write-Log "Explorer fallback successful - User: $loggedInUser"
+                }
+            } catch {
+                Write-Log "Explorer process fallback failed: $($_.Exception.Message)"
+            }
+        }
+
+        if (-not $loggedInUser) {
+            $Message = "User is not logged on to the primary session: No username returned from Win32_ComputerSystem or Explorer fallback"
             Write-Log $Message
             Throw $Message
         }
+
+        $username = ($loggedInUser -split '\\')[1]
+        $domain = ($loggedInUser -split '\\')[0]
+
+        Write-Log "Found logged in user: $loggedInUser"
+        Write-Log "Extracted username: $username"
+        Write-Log "Extracted domain: $domain"
         
         # Get user SID for reliable task creation
         $userSid = $null
