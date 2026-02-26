@@ -6551,7 +6551,7 @@ if ($OUTPUT) {
                         # First attempt: Standard upgrade with progress monitoring
                         $wingetExe = if ((Test-RunningAsSystem) -and $WingetPath) { Join-Path $WingetPath "winget.exe" } else { "winget.exe" }
                         $wingetDir = if ((Test-RunningAsSystem) -and $WingetPath) { $WingetPath } else { $null }
-                        $wingetArgs = @("upgrade", "--silent", "--accept-source-agreements", "--id", $appInfo.AppID)
+                        $wingetArgs = @("upgrade", "--silent", "--accept-source-agreements", "--source", "winget", "--id", $appInfo.AppID)
 
                         # Detect installed scope and add --scope flag accordingly
                         $detectedScope = "unknown"
