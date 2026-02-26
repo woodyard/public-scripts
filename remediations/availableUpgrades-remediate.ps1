@@ -6423,18 +6423,12 @@ if ($OUTPUT) {
                                     }
                                     
                                     if ($canAutoClose) {
-                                        Write-Log -Message "Only auto-closeable processes running for $($okapp.AppID): $($runningProcesses -join ', '). Auto-closing without user prompt."
-                                        $dialogResult = @{
-                                            CloseProcess = $true
-                                            DeferralDays = 0
-                                            Action = "Update"
-                                            UserChoice = $true
-                                        }
+                                        Write-Log -Message "Only auto-closeable processes running for $($okapp.AppID): $($runningProcesses -join ', '). Will auto-close after user confirms."
                                     }
                                 }
-                                
-                                # If we can't auto-close and PromptWhenBlocked is true, show the interactive popup
-                                if (-not $canAutoClose) {
+
+                                # Always show the interactive dialog when PromptWhenBlocked is true
+                                if ($true) {
                                     Write-Log -Message "$($okapp.AppID) has PromptWhenBlocked=true, showing interactive dialog"
                                     $defaultTimeoutAction = if ($okapp.DefaultTimeoutAction -eq $true) { $true } else { $false }
                                     

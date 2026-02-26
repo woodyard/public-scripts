@@ -319,8 +319,7 @@
     {
         "AppID": "Cloudflare.Warp",
         "FriendlyName": "Cloudflare WARP",
-        "BlockingProcess": "Cloudflare WARP,warp-svc",
-        "AutoCloseProcesses": "warp-svc",
+        "BlockingProcess": "Cloudflare WARP",
         "PromptWhenBlocked": true,
         "DefaultTimeoutAction": false,
         "TimeoutSeconds": 90,
