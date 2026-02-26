@@ -6517,7 +6517,7 @@ if ($OUTPUT) {
                     $infoSignalFile = $null
 
                     # Show informational progress dialog when no interactive dialog with built-in progress is active
-                    if ((-not $dialogResult -or -not $dialogResult.ProgressSignalFile) -and (Test-RunningAsSystem)) {
+                    if (-not $dialogResult -or -not $dialogResult.ProgressSignalFile) {
                         if (-not (Test-InfoDialogsSuppressed)) {
                             $infoSignalFile = Show-UpgradeProgressNotification -AppName $okapp.AppID -FriendlyName $okapp.FriendlyName -CurrentVersion $appInfo.CurrentVersion -AvailableVersion $appInfo.AvailableVersion
                         } else {
