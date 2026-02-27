@@ -19,10 +19,13 @@ Intune Remediation Policy
             +-- Loads whitelist (local file > GitHub > hardcoded fallback)
             +-- Filters disabled apps, checks deferral status
             +-- For each whitelisted app with an available upgrade:
+            |       +-- Check if version was skipped (failure tracking)
             |       +-- Check blocking processes
             |       +-- Show WPF dialog if process is running (user prompt)
             |       +-- Handle deferral choices
             |       +-- Execute winget upgrade --silent
+            |       +-- Post-upgrade verification (confirms version changed)
+            |       +-- On failure: increment count, show skip dialog after 3
             +-- Schedules user context task for user-scoped apps
 ```
 
@@ -31,7 +34,7 @@ Intune Remediation Policy
 | File | Version | Tag | Purpose |
 |------|---------|-----|---------|
 | `availableUpgrades-detect.ps1` | 5.25 | 5D | Main detection script (whitelist-based, dual-context) |
-| `availableUpgrades-remediate.ps1` | 8.6 | 8X | Main remediation script (upgrades apps, shows user prompts) |
+| `availableUpgrades-remediate.ps1` | 8.8 | 8X | Main remediation script (upgrades apps, shows user prompts) |
 | `availableUpgrades-detect-all.ps1` | - | - | Alternative detection script (exclude-list approach, simpler) |
 | `app-whitelist.json` | - | - | Centralized whitelist configuration for all managed apps |
 | `available-detect.ps1` | - | - | Wrapper: downloads and runs the detect script from GitHub |
@@ -147,7 +150,7 @@ User-context scheduled tasks are launched via a temporary VBS wrapper (`wscript.
 ### Interactive Session Checks
 
 Before creating user-context tasks, the script verifies:
-- An interactive user is logged in (via `Win32_ComputerSystem`)
+- An interactive user is logged in (via `Win32_ComputerSystem`, with Explorer process fallback for RDP/Windows 365 sessions)
 - `explorer.exe` is running (active desktop session)
 - Session ID > 0 (not a service session)
 
@@ -176,6 +179,34 @@ Deferral state is stored in the registry at `HKLM:\SOFTWARE\WingetUpgradeManager
 - First seen date (for admin hard deadline calculation)
 
 When `MaxDeferralDays` is reached, the update becomes mandatory and the `ForcedUpgradeMessage` is displayed.
+
+### Version Failure Tracking
+
+The remediation script tracks consecutive upgrade failures per application version. When an upgrade fails repeatedly, the user is offered the option to skip that specific version until a newer one is released.
+
+**How it works:**
+
+1. Each failed upgrade increments a per-version failure counter stored in the registry at `HKLM:\SOFTWARE\WingetUpgradeManager\Failures\{AppID}`
+2. After **3 consecutive failures** for the same version, a WPF dialog appears with two options:
+   - **Skip this version** — the script will not attempt this version again
+   - **Try again later** — the script will retry on the next remediation cycle
+3. If no choice is made within 60 seconds, the default is "Try again later" (safe default)
+4. When a **newer version** becomes available, the skip is automatically cleared and the upgrade proceeds normally
+5. On a **successful upgrade**, all failure data for that app is removed
+
+**Registry structure:**
+
+```
+HKLM:\SOFTWARE\WingetUpgradeManager\Failures\{AppID}
+    FailedVersion   (String)  – version that accumulated failures
+    FailureCount    (DWORD)   – number of consecutive failures
+    Skipped         (String)  – "true" / "false"
+    SkippedAt       (String)  – ISO 8601 datetime
+```
+
+### Post-Upgrade Verification
+
+When winget reports exit code 0 but no explicit success message (e.g. "Successfully installed") appears in the output, the script runs a post-upgrade verification step. It checks `winget list --id {AppID} --source winget` to confirm the installed version was actually updated. If the "Available" column is still present (meaning the update didn't take effect), the upgrade is counted as a failure instead of a false-positive success. This prevents endless upgrade loops for apps whose installer exits successfully without changing the installed version.
 
 ### Timeout Behavior
 
