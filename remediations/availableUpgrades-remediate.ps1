@@ -12,7 +12,7 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 8.7
+ Version: 8.8
  Tag: 8X
     
     Version History:
@@ -55,6 +55,7 @@
     8.5 - ENHANCEMENT: Implemented comprehensive marker file management system with centralized cleanup functions, orphaned file detection, and emergency cleanup handlers to prevent accumulation of .userdetection files; Added hidden console window execution method using cmd.exe with /min flag to eliminate visible console windows during scheduled task execution
     8.6 - PERFORMANCE OPTIMIZATION: Implemented user info caching to eliminate redundant CIM/WMI calls (3+ second savings), fixed deferral system type comparison error that blocked Adobe Reader updates, eliminated double marker file initialization, enhanced scheduled task execution with -NoProfile flag for better reliability
     8.7 - FEATURE: Added per-version failure tracking - counts consecutive install failures per app version in registry, offers user skip dialog after 3 failures; skip auto-clears when a newer version becomes available or upgrade succeeds
+    8.8 - FIX: Added post-upgrade verification for exit-code-0 successes: runs winget list after upgrade and checks if "Available" column is still present; if so treats as failure instead of false-positive success (fixes detection loop for apps like Adobe Reader whose installer returns 0 without changing the installed version)
     
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6927,7 +6928,41 @@ if ($OUTPUT) {
 
                         # Evaluate success
                         Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Verifying installation..."
-                        if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*Successfully updated*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*" -or ($null -ne $LASTEXITCODE -and $LASTEXITCODE -eq 0 -and $upgradeOutput -notlike "*failed*" -and $upgradeOutput -notlike "*error*0x*")) {
+                        $isSuccess = $false
+                        if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*Successfully updated*") {
+                            $isSuccess = $true
+                        } elseif ($upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*") {
+                            $isSuccess = $true
+                        } elseif ($null -ne $LASTEXITCODE -and $LASTEXITCODE -eq 0 -and $upgradeOutput -notlike "*failed*" -and $upgradeOutput -notlike "*error*0x*") {
+                            # Exit code 0 but no explicit success message - verify by checking if update is still pending
+                            if ($Script:TestMode) {
+                                $isSuccess = $true
+                            } else {
+                                try {
+                                    $verifyExe = if ((Test-RunningAsSystem) -and $WingetPath) { Join-Path $WingetPath "winget.exe" } else { "winget.exe" }
+                                    $verifyArgs = @("list", "--id", $appInfo.AppID, "--source", "winget", "--accept-source-agreements")
+                                    if ((Test-RunningAsSystem) -and $WingetPath) {
+                                        Push-Location $WingetPath
+                                        try { $verifyResult = & $verifyExe @verifyArgs 2>&1 } finally { Pop-Location }
+                                    } else {
+                                        $verifyResult = & $verifyExe @verifyArgs 2>&1
+                                    }
+                                    $verifyText = $verifyResult -join "`n"
+                                    # If winget list still shows an "Available" upgrade column for this app, the upgrade didn't change the installed version
+                                    if ($verifyText -match "\sAvailable\s" -and $verifyText -like "*$($appInfo.AppID)*") {
+                                        Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) still shows pending update - treating as failure"
+                                        $isSuccess = $false
+                                    } else {
+                                        Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) confirmed up to date"
+                                        $isSuccess = $true
+                                    }
+                                } catch {
+                                    Write-Log -Message "Post-upgrade verification error: $($_.Exception.Message) - trusting exit code 0"
+                                    $isSuccess = $true
+                                }
+                            }
+                        }
+                        if ($isSuccess) {
                             Write-Log -Message "Upgrade completed successfully for: $($appInfo.AppID)"
                             Clear-VersionFailureData -AppID $appInfo.AppID
                             $message += "$($appInfo.AppID)|"
