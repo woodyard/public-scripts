@@ -75,12 +75,9 @@ The whitelist controls which applications are managed. It is loaded with a three
 
 | Property | Type | Required | Default | Description |
 |----------|------|----------|---------|-------------|
-| `AppID` | string | Yes | - | Winget package ID (e.g. `Mozilla.Firefox`) |
+| `AppID` | string | Yes | - | Winget package ID, supports wildcards (e.g. `Mozilla.Firefox*`) |
 | `FriendlyName` | string | No | AppID | Display name shown in user prompts |
 | `Disabled` | bool | No | `false` | Set to `true` to exclude from upgrades |
-| `SystemContext` | bool | No | `true` | Allow upgrade in system context |
-| `UserContext` | bool | No | `false` | Allow upgrade in user context (`--scope user`) |
-| `UserContextPath` | string | No | - | Path to verify user-context installation exists |
 | `BlockingProcess` | string | No | - | Comma-separated process names that block upgrade |
 | `AutoCloseProcesses` | string | No | - | Subset of blocking processes safe to kill silently |
 | `PromptWhenBlocked` | bool | No | `false` | Show interactive WPF dialog when a blocking process runs |
@@ -88,7 +85,6 @@ The whitelist controls which applications are managed. It is loaded with a three
 | `TimeoutSeconds` | int | No | `60` | Seconds before the dialog times out |
 | `DeferralEnabled` | bool | No | `false` | Allow users to postpone the update |
 | `MaxDeferralDays` | int | No | `0` | Maximum days the update can be deferred |
-| `DeferralOptions` | array | No | `[]` | Options shown in the deferral dialog |
 | `ForcedUpgradeMessage` | string | No | - | Message shown when deferrals are exhausted |
 
 ### Example Entries
@@ -97,22 +93,14 @@ The whitelist controls which applications are managed. It is loaded with a three
 
 ```json
 {
-    "AppID": "Mozilla.Firefox",
+    "AppID": "Mozilla.Firefox*",
     "FriendlyName": "Firefox",
-    "SystemContext": true,
-    "UserContext": true,
-    "UserContextPath": "$Env:LocalAppData\\Mozilla Firefox\\firefox.exe",
     "BlockingProcess": "firefox",
     "PromptWhenBlocked": true,
     "DefaultTimeoutAction": false,
     "TimeoutSeconds": 60,
     "DeferralEnabled": true,
     "MaxDeferralDays": 5,
-    "DeferralOptions": [
-        {"Days": 1, "Label": "1 day"},
-        {"Days": 3, "Label": "3 days"},
-        {"Days": 5, "Label": "5 days"}
-    ],
     "ForcedUpgradeMessage": "Firefox security updates can no longer be deferred."
 }
 ```
@@ -206,7 +194,7 @@ HKLM:\SOFTWARE\WingetUpgradeManager\Failures\{AppID}
 
 ### Post-Upgrade Verification
 
-When winget reports exit code 0 but no explicit success message (e.g. "Successfully installed") appears in the output, the script runs a post-upgrade verification step. It checks `winget list --id {AppID} --source winget` to confirm the installed version was actually updated. If the "Available" column is still present (meaning the update didn't take effect), the upgrade is counted as a failure instead of a false-positive success. This prevents endless upgrade loops for apps whose installer exits successfully without changing the installed version.
+After every upgrade attempt that reports exit code 0, the script runs a post-upgrade verification step. It checks `winget list --id {AppID} --source winget` to confirm the installed version was actually updated. If the "Available" column is still present (meaning the update didn't take effect), the upgrade is counted as a failure instead of a false-positive success. This prevents endless upgrade loops for apps whose installer exits successfully without changing the installed version.
 
 ### Timeout Behavior
 

@@ -6934,32 +6934,30 @@ if ($OUTPUT) {
                         } elseif ($upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*") {
                             $isSuccess = $true
                         } elseif ($null -ne $LASTEXITCODE -and $LASTEXITCODE -eq 0 -and $upgradeOutput -notlike "*failed*" -and $upgradeOutput -notlike "*error*0x*") {
-                            # Exit code 0 but no explicit success message - verify by checking if update is still pending
-                            if ($Script:TestMode) {
-                                $isSuccess = $true
-                            } else {
-                                try {
-                                    $verifyExe = if ((Test-RunningAsSystem) -and $WingetPath) { Join-Path $WingetPath "winget.exe" } else { "winget.exe" }
-                                    $verifyArgs = @("list", "--id", $appInfo.AppID, "--source", "winget", "--accept-source-agreements")
-                                    if ((Test-RunningAsSystem) -and $WingetPath) {
-                                        Push-Location $WingetPath
-                                        try { $verifyResult = & $verifyExe @verifyArgs 2>&1 } finally { Pop-Location }
-                                    } else {
-                                        $verifyResult = & $verifyExe @verifyArgs 2>&1
-                                    }
-                                    $verifyText = $verifyResult -join "`n"
-                                    # If winget list still shows an "Available" upgrade column for this app, the upgrade didn't change the installed version
-                                    if ($verifyText -match "\sAvailable\s" -and $verifyText -like "*$($appInfo.AppID)*") {
-                                        Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) still shows pending update - treating as failure"
-                                        $isSuccess = $false
-                                    } else {
-                                        Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) confirmed up to date"
-                                        $isSuccess = $true
-                                    }
-                                } catch {
-                                    Write-Log -Message "Post-upgrade verification error: $($_.Exception.Message) - trusting exit code 0"
-                                    $isSuccess = $true
+                            $isSuccess = $true
+                        }
+
+                        # Post-upgrade verification: always confirm via winget list that the update actually took effect
+                        if ($isSuccess -and -not $Script:TestMode) {
+                            try {
+                                $verifyExe = if ((Test-RunningAsSystem) -and $WingetPath) { Join-Path $WingetPath "winget.exe" } else { "winget.exe" }
+                                $verifyArgs = @("list", "--id", $appInfo.AppID, "--source", "winget", "--accept-source-agreements")
+                                if ((Test-RunningAsSystem) -and $WingetPath) {
+                                    Push-Location $WingetPath
+                                    try { $verifyResult = & $verifyExe @verifyArgs 2>&1 } finally { Pop-Location }
+                                } else {
+                                    $verifyResult = & $verifyExe @verifyArgs 2>&1
                                 }
+                                $verifyText = $verifyResult -join "`n"
+                                # If winget list still shows an "Available" upgrade column for this app, the upgrade didn't change the installed version
+                                if ($verifyText -match "\sAvailable\s" -and $verifyText -like "*$($appInfo.AppID)*") {
+                                    Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) still shows pending update - treating as failure"
+                                    $isSuccess = $false
+                                } else {
+                                    Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) confirmed up to date"
+                                }
+                            } catch {
+                                Write-Log -Message "Post-upgrade verification error: $($_.Exception.Message) - trusting original result"
                             }
                         }
                         if ($isSuccess) {
