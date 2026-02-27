@@ -12,7 +12,7 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 8.6
+ Version: 8.7
  Tag: 8X
     
     Version History:
@@ -54,6 +54,7 @@
     8.4 - CRITICAL FIX: Fixed Azure AD identity cache registry errors in Intune by replacing Start-Job background registry access with direct Test-Path and SilentlyContinue error handling, eliminating "remediation error" messages on AAD-joined machines
     8.5 - ENHANCEMENT: Implemented comprehensive marker file management system with centralized cleanup functions, orphaned file detection, and emergency cleanup handlers to prevent accumulation of .userdetection files; Added hidden console window execution method using cmd.exe with /min flag to eliminate visible console windows during scheduled task execution
     8.6 - PERFORMANCE OPTIMIZATION: Implemented user info caching to eliminate redundant CIM/WMI calls (3+ second savings), fixed deferral system type comparison error that blocked Adobe Reader updates, eliminated double marker file initialization, enhanced scheduled task execution with -NoProfile flag for better reliability
+    8.7 - FEATURE: Added per-version failure tracking - counts consecutive install failures per app version in registry, offers user skip dialog after 3 failures; skip auto-clears when a newer version becomes available or upgrade succeeds
     
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -3310,7 +3311,13 @@ function Initialize-DeferralRegistry {
             Write-Log "Creating release cache registry path: $cachePath" | Out-Null
             New-Item -Path $cachePath -Force | Out-Null
         }
-        
+
+        $failurePath = "HKLM:\SOFTWARE\WingetUpgradeManager\Failures"
+        if (-not (Test-Path $failurePath)) {
+            Write-Log "Creating failure tracking registry path: $failurePath" | Out-Null
+            New-Item -Path $failurePath -Force | Out-Null
+        }
+
         return $true
         
     } catch {
@@ -4588,6 +4595,286 @@ function Clear-ExpiredDeferralData {
 
 # ============================================================================
 # END DEFERRAL MANAGEMENT SYSTEM
+# ============================================================================
+
+# ============================================================================
+# VERSION FAILURE TRACKING SYSTEM
+# ============================================================================
+
+function Get-VersionFailureData {
+    <#
+    .SYNOPSIS
+        Returns failure count and skip status for a specific app version
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Version
+    )
+    $default = @{ FailureCount = 0; IsSkipped = $false }
+    try {
+        $path = "HKLM:\SOFTWARE\WingetUpgradeManager\Failures\$AppID"
+        if (-not (Test-Path $path)) { return $default }
+        $data = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+        if (-not $data -or $data.FailedVersion -ne $Version) { return $default }
+        return @{
+            FailureCount = [int]($data.FailureCount)
+            IsSkipped    = ($data.Skipped -eq "true")
+        }
+    } catch {
+        return $default
+    }
+}
+
+function Set-VersionFailure {
+    <#
+    .SYNOPSIS
+        Increments the failure count for a specific app version. Returns new count.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Version
+    )
+    try {
+        $path = "HKLM:\SOFTWARE\WingetUpgradeManager\Failures\$AppID"
+        New-Item -Path $path -Force | Out-Null
+        $existing = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+        $count = if ($existing -and $existing.FailedVersion -eq $Version) { [int]$existing.FailureCount + 1 } else { 1 }
+        Set-ItemProperty -Path $path -Name "FailedVersion" -Value $Version
+        Set-ItemProperty -Path $path -Name "FailureCount"  -Value $count -Type DWord
+        Set-ItemProperty -Path $path -Name "Skipped"       -Value "false"
+        Set-ItemProperty -Path $path -Name "LastFailure"   -Value (Get-Date -Format "o")
+        return $count
+    } catch {
+        Write-Log "Error recording version failure for $AppID`: $($_.Exception.Message)" | Out-Null
+        return 0
+    }
+}
+
+function Set-VersionSkipped {
+    <#
+    .SYNOPSIS
+        Marks a specific app version as skipped by the user
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Version
+    )
+    try {
+        $path = "HKLM:\SOFTWARE\WingetUpgradeManager\Failures\$AppID"
+        New-Item -Path $path -Force | Out-Null
+        Set-ItemProperty -Path $path -Name "FailedVersion" -Value $Version
+        Set-ItemProperty -Path $path -Name "Skipped"       -Value "true"
+        Set-ItemProperty -Path $path -Name "SkippedAt"     -Value (Get-Date -Format "o")
+        Write-Log "Marked $AppID version $Version as skipped by user" | Out-Null
+    } catch {
+        Write-Log "Error marking version as skipped for $AppID`: $($_.Exception.Message)" | Out-Null
+    }
+}
+
+function Clear-VersionFailureData {
+    <#
+    .SYNOPSIS
+        Removes failure tracking data for an app (called after successful upgrade)
+    #>
+    param([Parameter(Mandatory)][string]$AppID)
+    try {
+        $path = "HKLM:\SOFTWARE\WingetUpgradeManager\Failures\$AppID"
+        if (Test-Path $path) {
+            Remove-Item -Path $path -Force | Out-Null
+            Write-Log "Cleared failure tracking data for $AppID" | Out-Null
+        }
+    } catch {
+        Write-Log "Error clearing failure data for $AppID`: $($_.Exception.Message)" | Out-Null
+    }
+}
+
+function Show-VersionSkipDialog {
+    <#
+    .SYNOPSIS
+        Shows a dialog offering the user to skip a version after repeated failures.
+        Returns $true if user chose to skip, $false to retry next time.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AppName,
+        [string]$FriendlyName,
+        [Parameter(Mandatory)][string]$Version,
+        [int]$FailureCount = 3,
+        [int]$TimeoutSeconds = 60
+    )
+
+    try {
+        $displayName = if ($FriendlyName) { $FriendlyName } else { $AppName }
+
+        $userInfo = Get-InteractiveUser
+        if (-not $userInfo) {
+            Write-Log "No interactive user - cannot show skip dialog for $AppName" | Out-Null
+            return $false
+        }
+
+        $promptId     = [System.Guid]::NewGuid().ToString().Substring(0, 8)
+        $userTempPath = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
+        $responseFile = Join-Path $userTempPath "SkipPrompt_$promptId`_Response.json"
+        $scriptPath   = Join-Path $userTempPath "Show-SkipPrompt_$promptId.ps1"
+
+        $timesWord = if ($FailureCount -eq 1) { "time" } else { "times" }
+        $message   = "$displayName $Version has failed to install $FailureCount $timesWord.`nSkip this version until a newer one becomes available?"
+        $title     = "Update Failed - $displayName"
+
+        $encodedMessage = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($message))
+        $encodedTitle   = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($title))
+
+        $scriptContent = @'
+param(
+    [string]$ResponseFilePath,
+    [string]$EncodedMessage,
+    [string]$EncodedTitle,
+    [int]$TimeoutSeconds = 60
+)
+$logPath = Join-Path $env:TEMP "SkipPrompt_Debug.log"
+function Write-SkipLog { param([string]$m); "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'))] $m" | Out-File -FilePath $logPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue }
+
+try {
+    Write-SkipLog "=== SKIP PROMPT SCRIPT STARTED ==="
+    $msg = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedMessage))
+    $ttl = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedTitle))
+
+    $isDark = $true
+    try {
+        $t = Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name AppsUseLightTheme -ErrorAction Stop
+        $isDark = $t.AppsUseLightTheme -eq 0
+    } catch {}
+    if ($isDark) {
+        $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $textColor = "#FFCCCCCC"; $shadowOpacity = "0.6"; $closeFg = "#FF888888"
+    } else {
+        $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $textColor = "#FF1B1B1B"; $shadowOpacity = "0.25"; $closeFg = "#FF999999"
+    }
+
+    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms -ErrorAction Stop
+    $workArea    = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $dialogWidth = 480
+    $escapedMsg  = [System.Security.SecurityElement]::Escape($msg) -replace "`n", "&#10;"
+    $escapedTtl  = [System.Security.SecurityElement]::Escape($ttl)
+
+    $xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="$escapedTtl" Width="$dialogWidth" SizeToContent="Height" WindowStartupLocation="Manual"
+        ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
+    <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
+        <Border.Effect><DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/></Border.Effect>
+        <Grid>
+            <Grid Margin="20">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Text="$escapedMsg" Foreground="$textColor" TextWrapping="Wrap" Margin="0,0,24,20" FontSize="12"/>
+                <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Center">
+                    <Button Name="SkipButton"  Content="Skip this version" Width="130" Height="28" Margin="0,0,8,0"/>
+                    <Button Name="RetryButton" Content="Try again later"   Width="130" Height="28" Background="#FF0078D4" Foreground="White" IsDefault="True"/>
+                </StackPanel>
+            </Grid>
+            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0" Background="Transparent" Foreground="$closeFg" BorderThickness="0" FontSize="13" Cursor="Hand"/>
+        </Grid>
+    </Border>
+</Window>
+"@
+
+    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+    $window = [Windows.Markup.XamlReader]::Load($reader)
+    $window.Left = $workArea.Right - $dialogWidth - 20
+    $window.Top  = $workArea.Bottom - 220
+
+    $writeResponse = { param($skip) @{ Skip = $skip } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8 }
+
+    $window.FindName("SkipButton").Add_Click({
+        Write-SkipLog "Skip button clicked"
+        & $writeResponse $true
+        $window.Close()
+    })
+    $window.FindName("RetryButton").Add_Click({
+        Write-SkipLog "Retry button clicked"
+        & $writeResponse $false
+        $window.Close()
+    })
+    $window.FindName("CloseButton").Add_Click({
+        Write-SkipLog "Close button clicked"
+        & $writeResponse $false
+        $window.Close()
+    })
+
+    $script:elapsed = 0
+    $timer = [System.Windows.Threading.DispatcherTimer]::new()
+    $timer.Interval = [TimeSpan]::FromSeconds(1)
+    $timer.Add_Tick({
+        $script:elapsed++
+        if ($script:elapsed -ge $TimeoutSeconds) {
+            Write-SkipLog "Timeout - defaulting to retry"
+            & $writeResponse $false
+            $window.Close()
+        }
+    })
+    $timer.Start()
+    Write-SkipLog "Showing dialog..."
+    $window.ShowDialog() | Out-Null
+    $timer.Stop()
+    Write-SkipLog "Dialog closed"
+} catch {
+    Write-SkipLog "ERROR: $_"
+    @{ Skip = $false } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+}
+'@
+
+        $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8 -Force
+
+        $psArgs   = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" " +
+                    "-ResponseFilePath `"$responseFile`" " +
+                    "-EncodedMessage `"$encodedMessage`" -EncodedTitle `"$encodedTitle`" " +
+                    "-TimeoutSeconds $TimeoutSeconds"
+        $taskName = "SkipPrompt_$promptId"
+        $launch   = New-HiddenLaunchAction -PowerShellArguments $psArgs -VbsDirectory $userTempPath -AllowUI
+
+        $principal = New-ScheduledTaskPrincipal -UserId $userInfo.FullName -LogonType Interactive -RunLevel Limited
+        $settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
+        $task      = New-ScheduledTask -Action $launch.Action -Principal $principal -Settings $settings
+        Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+        Write-Log "Skip version dialog launched (task: $taskName)" | Out-Null
+
+        # Wait for user response
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds + 15)
+        while (-not (Test-Path $responseFile) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+        }
+
+        $skipChoice = $false
+        if (Test-Path $responseFile) {
+            try {
+                $response   = Get-Content $responseFile -Raw | ConvertFrom-Json
+                $skipChoice = ($response.Skip -eq $true)
+                Write-Log "Skip dialog response received: Skip=$skipChoice" | Out-Null
+            } catch {
+                Write-Log "Error reading skip dialog response: $($_.Exception.Message)" | Out-Null
+            }
+        } else {
+            Write-Log "Skip dialog timed out - defaulting to retry" | Out-Null
+        }
+
+        # Cleanup
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-Item $scriptPath   -Force -ErrorAction SilentlyContinue
+        Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
+        if ($launch.VbsPath) { Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue }
+
+        return $skipChoice
+
+    } catch {
+        Write-Log "Error showing skip dialog for $AppName`: $($_.Exception.Message)" | Out-Null
+        return $false
+    }
+}
+
+# ============================================================================
+# END VERSION FAILURE TRACKING SYSTEM
 # ============================================================================
 
 function Schedule-UserContextRemediation {
@@ -6363,7 +6650,14 @@ if ($OUTPUT) {
                                 }
                             }
                         }
-                        
+
+                        # Check if this version was skipped by user after repeated failures
+                        $failureData = Get-VersionFailureData -AppID $appInfo.AppID -Version $appInfo.AvailableVersion
+                        if ($failureData.IsSkipped) {
+                            Write-Log -Message "Skipping $($appInfo.AppID) version $($appInfo.AvailableVersion) - skipped by user after repeated install failures"
+                            continue
+                        }
+
                         # Process blocking processes
                         $blockingProcessNames = $okapp.BlockingProcess
                         if (-not [string]::IsNullOrEmpty($blockingProcessNames)) {
@@ -6635,6 +6929,7 @@ if ($OUTPUT) {
                         Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Verifying installation..."
                         if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*Successfully updated*" -or $upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*" -or ($null -ne $LASTEXITCODE -and $LASTEXITCODE -eq 0 -and $upgradeOutput -notlike "*failed*" -and $upgradeOutput -notlike "*error*0x*")) {
                             Write-Log -Message "Upgrade completed successfully for: $($appInfo.AppID)"
+                            Clear-VersionFailureData -AppID $appInfo.AppID
                             $message += "$($appInfo.AppID)|"
 
                             if ($dialogResult -and $dialogResult.ProgressSignalFile) {
@@ -6654,6 +6949,15 @@ if ($OUTPUT) {
                             $debugLines = ($upgradeResult | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne "" -and $_ -notmatch '^[\u2580-\u259F\s\|/\\-]+$' }) -join " | "
                             Write-Log -Message "Upgrade failed for $($appInfo.AppID) - Exit code: $LASTEXITCODE - Output: $debugLines"
                             $message += "$($appInfo.AppID) (FAILED)|"
+                            $newFailCount = Set-VersionFailure -AppID $appInfo.AppID -Version $appInfo.AvailableVersion
+                            Write-Log -Message "Install failure count for $($appInfo.AppID) $($appInfo.AvailableVersion): $newFailCount/3"
+                            if ($newFailCount -ge 3) {
+                                Write-Log -Message "3 failures reached for $($appInfo.AppID) - showing skip version dialog"
+                                $skipChoice = Show-VersionSkipDialog -AppName $appInfo.AppID -FriendlyName $okapp.FriendlyName -Version $appInfo.AvailableVersion -FailureCount $newFailCount
+                                if ($skipChoice) {
+                                    Set-VersionSkipped -AppID $appInfo.AppID -Version $appInfo.AvailableVersion
+                                }
+                            }
                             if ($dialogResult -and $dialogResult.ProgressSignalFile) {
                                 @{ Success = $false; Message = "Update failed" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
                                 Write-Log -Message "Wrote failure signal to progress dialog"
