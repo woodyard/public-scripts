@@ -169,23 +169,16 @@ function Remove-OldTempFiles {
     $cutoff = (Get-Date).AddMinutes(-30)
     $removed = 0
 
-    # All file patterns this script creates in C:\ProgramData\Temp
-    $patterns = @(
-        "UserDetection_*.json",
-        "UserDetection_Fallback_*.json",
-        "availableUpgrades-detect_*.ps1",
-        "availableUpgrades-detect_*.ps1.userdetection",
-        "HiddenLaunch_*.vbs"
-    )
+    # Match all file patterns this script creates in C:\ProgramData\Temp
+    # Using regex instead of -Filter because Windows filter matching is unreliable with multiple dots (e.g. .ps1.userdetection)
+    $nameRegex = '^(UserDetection_(Fallback_)?\d+\.json$|availableUpgrades-detect_\d+\.ps1|HiddenLaunch_\d+\.vbs$)'
 
-    foreach ($pattern in $patterns) {
-        Get-ChildItem -Path $tempPath -Filter $pattern -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -lt $cutoff } |
-            ForEach-Object {
-                Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-                $removed++
-            }
-    }
+    Get-ChildItem -Path $tempPath -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
+        ForEach-Object {
+            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+            $removed++
+        }
 
     if ($removed -gt 0) {
         Write-Log -Message "Cleaned up $removed old temp files from $tempPath"

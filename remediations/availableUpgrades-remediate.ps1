@@ -5681,36 +5681,16 @@ function Remove-OldTempFiles {
     $cutoff = (Get-Date).AddMinutes(-30)
     $removed = 0
 
-    # All file patterns this script creates in C:\ProgramData\Temp
-    $patterns = @(
-        "UserRemediation_*.json",
-        "UserRemediation_*.status",
-        "UserRemediation_*.heartbeat",
-        "UserRemediation_*.heartbeat.*",
-        "UserRemediationHeartbeat_*.json",
-        "availableUpgrades-remediate_*.ps1",
-        "MandatoryPrompt_*_Response.json",
-        "MandatoryPrompt_*_Progress.json",
-        "MandatoryPrompt_*_Progress_Status.txt",
-        "Show-MandatoryPrompt_*.ps1",
-        "DeferralPrompt_*_Response.json",
-        "Show-DeferralPrompt_*.ps1",
-        "UserPrompt_*_Response.json",
-        "Show-UserPrompt_*.ps1",
-        "UserContext_Debug.log",
-        "UserContext_Debug_Fallback.log",
-        "UserContext_Heartbeat_Error_*.log",
-        "HiddenLaunch_*.vbs"
-    )
+    # Match all file patterns this script creates in C:\ProgramData\Temp
+    # Using regex instead of -Filter because Windows filter matching is unreliable with multiple dots (e.g. .heartbeat.error)
+    $nameRegex = '^(UserRemediation_\d+\.|UserRemediationHeartbeat_|availableUpgrades-remediate_\d+\.ps1|MandatoryPrompt_.*_(Response|Progress)|Show-MandatoryPrompt_|DeferralPrompt_.*_Response|Show-DeferralPrompt_|UserPrompt_.*_Response|Show-UserPrompt_|UserContext_Debug|UserContext_Heartbeat_Error_|HiddenLaunch_\d+\.vbs$)'
 
-    foreach ($pattern in $patterns) {
-        Get-ChildItem -Path $tempPath -Filter $pattern -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -lt $cutoff } |
-            ForEach-Object {
-                Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-                $removed++
-            }
-    }
+    Get-ChildItem -Path $tempPath -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
+        ForEach-Object {
+            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+            $removed++
+        }
 
     if ($removed -gt 0) {
         Write-Log -Message "Cleaned up $removed old temp files from $tempPath"
