@@ -3050,32 +3050,16 @@ param(
     [int]$TimeoutSeconds = 60
 )
 
-$logPath = Join-Path $env:TEMP "MandatoryPrompt_Debug.log"
-function Write-MandLog {
-    param([string]$Message)
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
-    "[$ts] $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
-}
-
 try {
-    Write-MandLog "=== MANDATORY PROMPT STARTED ==="
-    Write-MandLog "ResponseFilePath: $ResponseFilePath"
-    Write-MandLog "EncodedQuestion length: $($EncodedQuestion.Length)"
-    Write-MandLog "EncodedTitle length: $($EncodedTitle.Length)"
-    Write-MandLog "TimeoutSeconds: $TimeoutSeconds"
-
     # Decode parameters
     $actualQuestion = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedQuestion))
     $actualTitle = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedTitle))
-    Write-MandLog "Decoded question: $actualQuestion"
-    Write-MandLog "Decoded title: $actualTitle"
 
     # Load WPF assemblies
     Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
     Add-Type -AssemblyName PresentationCore -ErrorAction Stop
     Add-Type -AssemblyName WindowsBase -ErrorAction Stop
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-    Write-MandLog "WPF assemblies loaded"
 
     # Use the decoded text and split on pipe separator for separate display
     $parts = $actualQuestion -split '\|'
@@ -3098,12 +3082,8 @@ try {
     } else {
         $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $textColor = "#FF1B1B1B"; $subtextColor = "#FF555555"; $shadowOpacity = "0.25"
     }
-    Write-MandLog "Theme: $(if ($isDark) { 'Dark' } else { 'Light' })"
-
     $screen = [System.Windows.Forms.Screen]::PrimaryScreen
     $workArea = $screen.WorkingArea
-    Write-MandLog "Screen workArea: $($workArea.Width)x$($workArea.Height) at ($($workArea.Left),$($workArea.Top))"
-
     $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="$escapedTitle" Width="420" MinHeight="140" SizeToContent="Height" WindowStartupLocation="Manual"
@@ -3190,23 +3170,16 @@ try {
 </Window>
 "@
 
-    Write-MandLog "XAML created, parsing..."
     $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
     $window = [Windows.Markup.XamlReader]::Load($reader)
-    Write-MandLog "XAML parsed successfully"
-
     $script:result = "Continue"
 
     # Get button reference and store original text
     $upgradeButton = $window.FindName("UpgradeButton")
     $originalButtonText = if ($upgradeButton) { $upgradeButton.Content } else { "Upgrade" }
-    Write-MandLog "Button found: $($upgradeButton -ne $null)"
-
     # Position window (before showing, like progress dialog)
     $window.Left = $workArea.Right - 440
     $window.Top = $workArea.Bottom - 160
-    Write-MandLog "Window positioned at $($window.Left),$($window.Top)"
-
     # Create countdown timer (updates every second)
     $script:timeRemaining = $TimeoutSeconds
     $countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -3260,26 +3233,18 @@ try {
     $timer.Start()
     $countdownTimer.Start()
 
-    Write-MandLog "Showing dialog..."
     $window.Activate()
     $window.ShowDialog() | Out-Null
-    Write-MandLog "Dialog closed with result: $($script:result)"
-
     # Ensure timers are stopped
     $timer.Stop()
     $countdownTimer.Stop()
 
     # Write response
     @{ response = $script:result; timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ") } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
-    Write-MandLog "Response written to $ResponseFilePath"
-
 } catch {
-    Write-MandLog "ERROR: $($_.Exception.Message)"
-    Write-MandLog "Stack: $($_.ScriptStackTrace)"
     # Still try to write response so the wait loop doesn't time out
     @{ response = "Continue"; timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ") } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8 -ErrorAction SilentlyContinue
 }
-Write-MandLog "=== MANDATORY PROMPT ENDED ==="
 '@
 
         Write-Log -Message "Creating mandatory prompt script: $mandatoryScriptPath" | Out-Null
