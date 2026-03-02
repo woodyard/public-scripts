@@ -2993,6 +2993,7 @@ function Show-DirectMandatoryUpdateDialog {
         $timer.Start()
         $countdownTimer.Start()
         Write-Log "Mandatory dialog: Timeout and countdown timers started" | Out-Null
+        $window.Activate()
         $result = $window.ShowDialog()
         $timer.Stop()
         $countdownTimer.Stop()
@@ -3238,6 +3239,7 @@ $window.Add_Closing({
 $timer.Start()
 $countdownTimer.Start()
 
+$window.Activate()
 $window.ShowDialog() | Out-Null
 
 # Ensure timers are stopped
