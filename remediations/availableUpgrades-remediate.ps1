@@ -3086,6 +3086,20 @@ try {
     $escapedVersionInfo = [System.Security.SecurityElement]::Escape($versionInfo)
     $escapedActionMessage = [System.Security.SecurityElement]::Escape($actionMessage)
 
+    # Detect system theme
+    $isDark = $true
+    try {
+        $themeKey = Get-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -ErrorAction Stop
+        $isDark = $themeKey.AppsUseLightTheme -eq 0
+    } catch { }
+
+    if ($isDark) {
+        $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $textColor = "White"; $subtextColor = "#FFCCCCCC"; $shadowOpacity = "0.6"
+    } else {
+        $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $textColor = "#FF1B1B1B"; $subtextColor = "#FF555555"; $shadowOpacity = "0.25"
+    }
+    Write-MandLog "Theme: $(if ($isDark) { 'Dark' } else { 'Light' })"
+
     $screen = [System.Windows.Forms.Screen]::PrimaryScreen
     $workArea = $screen.WorkingArea
     Write-MandLog "Screen workArea: $($workArea.Width)x$($workArea.Height) at ($($workArea.Left),$($workArea.Top))"
@@ -3095,9 +3109,9 @@ try {
         Title="$escapedTitle" Width="420" MinHeight="140" SizeToContent="Height" WindowStartupLocation="Manual"
         ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
 
-    <Border Background="#FF1F1F1F" CornerRadius="8" BorderBrush="#FF323232" BorderThickness="1">
+    <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
         <Border.Effect>
-            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
+            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/>
         </Border.Effect>
         <Grid Margin="16,12,16,12">
             <Grid.ColumnDefinitions>
@@ -3130,7 +3144,7 @@ try {
             <!-- Title -->
             <TextBlock Grid.Column="1" Grid.Row="0"
                        Text="$escapedTitle"
-                       Foreground="White"
+                       Foreground="$textColor"
                        FontSize="14"
                        FontWeight="SemiBold"
                        Margin="12,0,0,2"
@@ -3139,7 +3153,7 @@ try {
             <!-- Version Info -->
             <TextBlock Grid.Column="1" Grid.Row="1"
                        Text="$escapedVersionInfo"
-                       Foreground="#FFCCCCCC"
+                       Foreground="$subtextColor"
                        FontSize="12"
                        Margin="12,0,0,8"
                        TextWrapping="Wrap"/>
@@ -3147,7 +3161,7 @@ try {
             <!-- Action Message -->
             <TextBlock Grid.Column="1" Grid.Row="2"
                        Text="$escapedActionMessage"
-                       Foreground="#FFCCCCCC"
+                       Foreground="$subtextColor"
                        FontSize="12"
                        Margin="12,0,0,8"
                        TextWrapping="Wrap"/>
