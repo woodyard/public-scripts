@@ -2327,7 +2327,17 @@ function Invoke-WingetWithProgress {
             return & $WingetExe @Arguments 2>&1
         }
     } finally {
-        Remove-Item $logFile, $outFile, $errFile -Force -ErrorAction SilentlyContinue
+        # Clean up temp files; winget may briefly hold a lock on the log file after exit
+        Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
+        for ($i = 0; $i -lt 3; $i++) {
+            Remove-Item $logFile -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path $logFile)) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        # Also clean up any orphaned winget_progress files from previous runs
+        Get-ChildItem -Path $env:TEMP -Filter "winget_progress_*.log" -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
     }
 }
 
