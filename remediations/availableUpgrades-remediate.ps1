@@ -2210,6 +2210,7 @@ function Invoke-WingetWithProgress {
 
         $lastStatus = ""
         $downloadDetected = $false
+        $pastSourceUpdate = $false
         while (-not $proc.HasExited) {
             Start-Sleep -Seconds 2
 
@@ -2223,6 +2224,24 @@ function Invoke-WingetWithProgress {
                     $fs.Close()
 
                     if ($outText.Length -gt 0) {
+                        # Ignore download progress until we're past the source index update
+                        if (-not $pastSourceUpdate) {
+                            if ($outText -match '(Found |No applicable |No newer |No available |Already installed)') {
+                                $pastSourceUpdate = $true
+                                # Only consider output after the "Found ..." line for download progress
+                                $foundIndex = $outText.IndexOf($Matches[0])
+                                $outText = $outText.Substring($foundIndex)
+                            } else {
+                                # Still in source update phase, show a status but skip download progress
+                                $status = "Updating sources..."
+                                if ($status -ne $lastStatus) {
+                                    $lastStatus = $status
+                                    Write-InfoDialogStatus -SignalFilePath $SignalFilePath -Status $status
+                                }
+                                continue
+                            }
+                        }
+
                         # Match winget stdout progress: "1024 KB / 6.31 MB" or "2.00 MB / 6.31 MB"
                         $progressMatches = [regex]::Matches($outText, '([\d.]+)\s*(KB|MB)\s*/\s*([\d.]+)\s*(MB|GB)')
                         if ($progressMatches.Count -gt 0) {
