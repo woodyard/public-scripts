@@ -3045,6 +3045,7 @@ function Invoke-SystemMandatoryUpdatePrompt {
         $mandatoryScriptContent = @'
 param(
     [string]$ResponseFilePath,
+    [string]$ProgressSignalFilePath,
     [string]$EncodedQuestion,
     [string]$EncodedTitle,
     [int]$TimeoutSeconds = 60
@@ -3070,6 +3071,10 @@ try {
     $escapedVersionInfo = [System.Security.SecurityElement]::Escape($versionInfo)
     $escapedActionMessage = [System.Security.SecurityElement]::Escape($actionMessage)
 
+    # Extract display name from title (strip "Required Update: " prefix)
+    $displayName = $actualTitle -replace '^Required Update:\s*', ''
+    $escapedDisplayName = [System.Security.SecurityElement]::Escape($displayName)
+
     # Detect system theme
     $isDark = $true
     try {
@@ -3086,85 +3091,100 @@ try {
     $workArea = $screen.WorkingArea
     $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="$escapedTitle" Width="420" MinHeight="140" SizeToContent="Height" WindowStartupLocation="Manual"
+        Title="$escapedTitle" Width="420" MinHeight="120" SizeToContent="Height" WindowStartupLocation="Manual"
         ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
 
     <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
         <Border.Effect>
             <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/>
         </Border.Effect>
-        <Grid Margin="16,12,16,12">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="32"/>
-                <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
+        <Grid>
+            <!-- Phase 1: Mandatory prompt content -->
+            <Grid Name="PromptPanel" Margin="16,12,16,12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="32"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
 
-            <!-- Icon -->
-            <Ellipse Grid.Column="0" Grid.RowSpan="3"
-                     Width="24" Height="24"
-                     Fill="#FFFF6B00"
-                     VerticalAlignment="Top"
-                     Margin="0,2,0,0"/>
+                <!-- Icon -->
+                <Ellipse Grid.Column="0" Grid.RowSpan="3"
+                         Width="24" Height="24"
+                         Fill="#FFFF6B00"
+                         VerticalAlignment="Top"
+                         Margin="0,2,0,0"/>
 
-            <TextBlock Grid.Column="0" Grid.RowSpan="3"
-                       Text="!"
-                       Foreground="White"
-                       FontSize="14"
-                       FontWeight="Bold"
-                       HorizontalAlignment="Center"
-                       VerticalAlignment="Top"
-                       Margin="0,4,0,0"/>
+                <TextBlock Grid.Column="0" Grid.RowSpan="3"
+                           Text="!"
+                           Foreground="White"
+                           FontSize="14"
+                           FontWeight="Bold"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Top"
+                           Margin="0,4,0,0"/>
 
-            <!-- Title -->
-            <TextBlock Grid.Column="1" Grid.Row="0"
-                       Text="$escapedTitle"
-                       Foreground="$textColor"
-                       FontSize="14"
-                       FontWeight="SemiBold"
-                       Margin="12,0,0,2"
-                       TextWrapping="Wrap"/>
+                <!-- Title -->
+                <TextBlock Grid.Column="1" Grid.Row="0"
+                           Text="$escapedTitle"
+                           Foreground="$textColor"
+                           FontSize="14"
+                           FontWeight="SemiBold"
+                           Margin="12,0,0,2"
+                           TextWrapping="Wrap"/>
 
-            <!-- Version Info -->
-            <TextBlock Grid.Column="1" Grid.Row="1"
-                       Text="$escapedVersionInfo"
-                       Foreground="$subtextColor"
-                       FontSize="12"
-                       Margin="12,0,0,8"
-                       TextWrapping="Wrap"/>
+                <!-- Version Info -->
+                <TextBlock Grid.Column="1" Grid.Row="1"
+                           Text="$escapedVersionInfo"
+                           Foreground="$subtextColor"
+                           FontSize="12"
+                           Margin="12,0,0,8"
+                           TextWrapping="Wrap"/>
 
-            <!-- Action Message -->
-            <TextBlock Grid.Column="1" Grid.Row="2"
-                       Text="$escapedActionMessage"
-                       Foreground="$subtextColor"
-                       FontSize="12"
-                       Margin="12,0,0,8"
-                       TextWrapping="Wrap"/>
+                <!-- Action Message -->
+                <TextBlock Grid.Column="1" Grid.Row="2"
+                           Text="$escapedActionMessage"
+                           Foreground="$subtextColor"
+                           FontSize="12"
+                           Margin="12,0,0,8"
+                           TextWrapping="Wrap"/>
 
-            <!-- Button -->
-            <StackPanel Grid.Column="1" Grid.Row="3"
-                        Orientation="Horizontal"
-                        HorizontalAlignment="Right"
-                        Margin="12,0,0,0">
+                <!-- Button -->
+                <StackPanel Grid.Column="1" Grid.Row="3"
+                            Orientation="Horizontal"
+                            HorizontalAlignment="Right"
+                            Margin="12,0,0,0">
 
-                <Button Name="UpgradeButton" Content="Upgrade" Width="80" Height="24" Background="#FF0078D4" Foreground="White" IsDefault="true">
-                    <Button.Style>
-                        <Style TargetType="Button">
-                            <Style.Triggers>
-                                <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter Property="Background" Value="#FF106EBE"/>
-                                </Trigger>
-                            </Style.Triggers>
-                        </Style>
-                    </Button.Style>
-                </Button>
+                    <Button Name="UpgradeButton" Content="Upgrade" Width="80" Height="24" Background="#FF0078D4" Foreground="White" IsDefault="true">
+                        <Button.Style>
+                            <Style TargetType="Button">
+                                <Style.Triggers>
+                                    <Trigger Property="IsMouseOver" Value="True">
+                                        <Setter Property="Background" Value="#FF106EBE"/>
+                                    </Trigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Button.Style>
+                    </Button>
 
-            </StackPanel>
+                </StackPanel>
+            </Grid>
+
+            <!-- Phase 2: Progress content (hidden initially) -->
+            <Grid Name="ProgressPanel" Margin="20,16,20,16" Visibility="Collapsed">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Name="ProgressTitle" Text="Updating $escapedDisplayName..." Foreground="$textColor" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                <ProgressBar Grid.Row="1" Name="ProgressBar" IsIndeterminate="True" Height="3" Margin="0,8,0,6" Foreground="#FF0078D4"/>
+                <TextBlock Grid.Row="2" Name="StatusText" Text="Preparing update..." Foreground="#FF888888" FontSize="11" HorizontalAlignment="Center"/>
+            </Grid>
         </Grid>
     </Border>
 </Window>
@@ -3173,13 +3193,21 @@ try {
     $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
     $window = [Windows.Markup.XamlReader]::Load($reader)
     $script:result = "Continue"
+    $script:inProgressMode = $false
 
-    # Get button reference and store original text
+    # Get UI element references
     $upgradeButton = $window.FindName("UpgradeButton")
+    $promptPanel = $window.FindName("PromptPanel")
+    $progressPanel = $window.FindName("ProgressPanel")
     $originalButtonText = if ($upgradeButton) { $upgradeButton.Content } else { "Upgrade" }
-    # Position window (before showing, like progress dialog)
+
+    # Progress signal file paths
+    $progressStatusFile = $ProgressSignalFilePath -replace '\.json$', '_Status.txt'
+
+    # Position window
     $window.Left = $workArea.Right - 440
     $window.Top = $workArea.Bottom - 160
+
     # Create countdown timer (updates every second)
     $script:timeRemaining = $TimeoutSeconds
     $countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -3187,19 +3215,15 @@ try {
 
     $countdownTimer.Add_Tick({
         $script:timeRemaining--
-
-        # Update button with countdown
         if ($upgradeButton) {
             $upgradeButton.Content = "$originalButtonText ($($script:timeRemaining))"
         }
-
-        # Stop countdown timer when we reach zero (main timeout timer will handle dialog close)
         if ($script:timeRemaining -le 0) {
             $countdownTimer.Stop()
         }
     })
 
-    # Create main timeout timer
+    # Create main timeout timer (for prompt phase)
     $timer = New-Object System.Windows.Threading.DispatcherTimer
     $timer.Interval = [System.TimeSpan]::FromSeconds($TimeoutSeconds)
 
@@ -3207,16 +3231,83 @@ try {
         $script:result = "Continue"
         $timer.Stop()
         $countdownTimer.Stop()
-        $window.Close()
+        if (-not $script:inProgressMode) {
+            # Timeout during prompt phase: transition to progress mode (auto-accept)
+            $promptPanel.Visibility = [System.Windows.Visibility]::Collapsed
+            $progressPanel.Visibility = [System.Windows.Visibility]::Visible
+            $script:inProgressMode = $true
+            @{ response = $script:result; timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ") } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+            $script:progressStartTime = Get-Date
+            $script:progressPollTimer.Start()
+        }
     })
 
-    # Add upgrade button handler
+    # Create progress poll timer (for progress phase)
+    $script:progressStartTime = $null
+    $script:lastStatus = ""
+    $script:progressPollTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $script:progressPollTimer.Interval = [TimeSpan]::FromSeconds(2)
+    $script:progressPollTimer.Add_Tick({
+        # Check for status updates
+        if (Test-Path $progressStatusFile) {
+            try {
+                $currentStatus = (Get-Content $progressStatusFile -Raw).Trim()
+                if ($currentStatus -and $currentStatus -ne $script:lastStatus) {
+                    $script:lastStatus = $currentStatus
+                    $window.FindName("StatusText").Text = $currentStatus
+                }
+            } catch {}
+        }
+        # Check for completion signal
+        if (Test-Path $ProgressSignalFilePath) {
+            $script:progressPollTimer.Stop()
+            try {
+                $signalData = Get-Content $ProgressSignalFilePath -Raw | ConvertFrom-Json
+                $pBar = $window.FindName("ProgressBar")
+                $sText = $window.FindName("StatusText")
+                $pBar.IsIndeterminate = $false
+                $pBar.Value = 100
+                if ($signalData.Success -eq $true) {
+                    $sText.Text = "Update complete!"
+                } else {
+                    $sText.Text = "Update could not be completed."
+                }
+            } catch {
+                $window.FindName("StatusText").Text = "Update complete!"
+            }
+            # Auto-close after 3 seconds
+            $script:closeTimer = [System.Windows.Threading.DispatcherTimer]::new()
+            $script:closeTimer.Interval = [TimeSpan]::FromSeconds(3)
+            $script:closeTimer.Add_Tick({
+                $script:closeTimer.Stop()
+                $window.Close()
+            })
+            $script:closeTimer.Start()
+        } elseif ($script:progressStartTime -and ((Get-Date) - $script:progressStartTime).TotalMinutes -gt 5) {
+            # Progress timeout
+            $script:progressPollTimer.Stop()
+            $window.Close()
+        }
+    })
+
+    # Upgrade button handler: transition to progress mode
     if ($upgradeButton) {
         $upgradeButton.Add_Click({
             $timer.Stop()
             $countdownTimer.Stop()
             $script:result = "Continue"
-            $window.Close()
+
+            # Transition UI to progress view
+            $promptPanel.Visibility = [System.Windows.Visibility]::Collapsed
+            $progressPanel.Visibility = [System.Windows.Visibility]::Visible
+            $script:inProgressMode = $true
+
+            # Write response so the parent process unblocks and starts the upgrade
+            @{ response = $script:result; timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ") } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+
+            # Start polling for progress updates
+            $script:progressStartTime = Get-Date
+            $script:progressPollTimer.Start()
         })
     }
 
@@ -3224,23 +3315,23 @@ try {
     $window.Add_Closing({
         $timer.Stop()
         $countdownTimer.Stop()
+        $script:progressPollTimer.Stop()
         if ($script:result -eq $null) {
             $script:result = "Continue"
         }
+        # Ensure response is written even if window is closed externally
+        if (-not (Test-Path $ResponseFilePath)) {
+            @{ response = $script:result; timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ") } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8 -ErrorAction SilentlyContinue
+        }
     })
 
-    # Start both timers
+    # Start prompt timers
     $timer.Start()
     $countdownTimer.Start()
 
     $window.Activate()
     $window.ShowDialog() | Out-Null
-    # Ensure timers are stopped
-    $timer.Stop()
-    $countdownTimer.Stop()
 
-    # Write response
-    @{ response = $script:result; timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ") } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
 } catch {
     # Still try to write response so the wait loop doesn't time out
     @{ response = "Continue"; timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ") } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8 -ErrorAction SilentlyContinue
@@ -3254,17 +3345,20 @@ try {
         $guid = [System.Guid]::NewGuid().ToString()
         $taskName = "MandatoryPrompt_$guid"
         
+        # Create progress signal file path (dialog stays open to show progress)
+        $progressSignalFile = Join-Path $userTempPath "MandatoryPrompt_$promptId`_Progress.json"
+
         # Create task arguments with encoded parameters
         $encodedQuestion = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Question))
         $encodedTitle = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Title))
         # Create hidden launch action using VBS wrapper (no console window flash)
-        $mandatoryPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$mandatoryScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -TimeoutSeconds $TimeoutSeconds"
+        $mandatoryPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$mandatoryScriptPath`" -ResponseFilePath `"$responseFile`" -ProgressSignalFilePath `"$progressSignalFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -TimeoutSeconds $TimeoutSeconds"
         $mandatoryVbsDir = Split-Path $responseFile -Parent
         $mandatoryLaunch = New-HiddenLaunchAction -PowerShellArguments $mandatoryPsArgs -VbsDirectory $mandatoryVbsDir -AllowUI
         if ($mandatoryLaunch) {
             $action = $mandatoryLaunch.Action
         } else {
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$mandatoryScriptPath`" -ResponseFilePath `"$responseFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -TimeoutSeconds $TimeoutSeconds"
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$mandatoryScriptPath`" -ResponseFilePath `"$responseFile`" -ProgressSignalFilePath `"$progressSignalFile`" -EncodedQuestion `"$encodedQuestion`" -EncodedTitle `"$encodedTitle`" -TimeoutSeconds $TimeoutSeconds"
         }
         
         # Create task principal
@@ -3303,21 +3397,26 @@ try {
             return "Continue"
         }
         
-        # Wait for response
+        # Wait for response (user clicks Upgrade or timeout auto-accepts)
         $taskTimeout = $TimeoutSeconds + 30
         $response = Wait-ForUserResponse -ResponseFilePath $responseFile -TimeoutSeconds $taskTimeout
-        
-        # Cleanup
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        Remove-Item $mandatoryScriptPath -Force -ErrorAction SilentlyContinue
-        Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
-        if ($mandatoryLaunch.VbsPath) { Remove-Item $mandatoryLaunch.VbsPath -Force -ErrorAction SilentlyContinue }
 
-        return "Continue"  # Always continue for mandatory updates
-        
+        # Don't clean up immediately - the dialog stays open to show progress.
+        # Schedule async cleanup after a generous timeout (dialog has 5-min progress timeout + 3s close).
+        $progressStatusFile = $progressSignalFile -replace '\.json$', '_Status.txt'
+        Start-Job -ScriptBlock {
+            param($tn, $sp, $vp, $rf, $psf, $pstf)
+            Start-Sleep -Seconds 360  # 6 min - after dialog's 5-min progress timeout
+            Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+            Remove-Item $sp, $rf, $psf, $pstf -Force -ErrorAction SilentlyContinue
+            if ($vp) { Remove-Item $vp -Force -ErrorAction SilentlyContinue }
+        } -ArgumentList $taskName, $mandatoryScriptPath, $mandatoryLaunch.VbsPath, $responseFile, $progressSignalFile, $progressStatusFile | Out-Null
+
+        return $progressSignalFile  # Return signal file so caller can send progress updates
+
     } catch {
         Write-Log "Error in system mandatory prompt: $($_.Exception.Message)" | Out-Null
-        return "Continue"
+        return $null
     }
 }
 
@@ -3818,12 +3917,17 @@ function Show-DeferralDialog {
             
             # Pass separate components instead of combined question
             $response = Show-MandatoryUpdateDialog -Question "$versionInfo|$actionMessage" -Title $title -TimeoutSeconds $TimeoutSeconds -HasBlockingProcess $hasBlockingProcess
-            
-            return @{
+
+            # $response is the progress signal file path (if system context) so the dialog can show progress in-place
+            $result = @{
                 Action = "Update"
                 DeferralDays = 0
                 CloseProcess = $true
             }
+            if ($response -and $response -ne "Continue" -and (Test-Path (Split-Path $response -Parent) -ErrorAction SilentlyContinue)) {
+                $result.ProgressSignalFile = $response
+            }
+            return $result
         } else {
             # Show deferral options
             $title = "Update Available: $displayName"
