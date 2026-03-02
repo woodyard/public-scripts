@@ -3050,26 +3050,47 @@ param(
     [int]$TimeoutSeconds = 60
 )
 
-# Decode parameters
-$actualQuestion = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedQuestion))
-$actualTitle = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedTitle))
+$logPath = Join-Path $env:TEMP "MandatoryPrompt_Debug.log"
+function Write-MandLog {
+    param([string]$Message)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    "[$ts] $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+}
 
-# Load WPF assemblies
-Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName PresentationCore
-Add-Type -AssemblyName WindowsBase
-Add-Type -AssemblyName System.Windows.Forms
+try {
+    Write-MandLog "=== MANDATORY PROMPT STARTED ==="
+    Write-MandLog "ResponseFilePath: $ResponseFilePath"
+    Write-MandLog "EncodedQuestion length: $($EncodedQuestion.Length)"
+    Write-MandLog "EncodedTitle length: $($EncodedTitle.Length)"
+    Write-MandLog "TimeoutSeconds: $TimeoutSeconds"
 
-# Use the decoded text and split on pipe separator for separate display
-$parts = $actualQuestion -split '\|'
-$versionInfo = if ($parts.Length -gt 0) { $parts[0].Trim() } else { $actualQuestion }
-$actionMessage = if ($parts.Length -gt 1) { $parts[1].Trim() } else { "" }
+    # Decode parameters
+    $actualQuestion = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedQuestion))
+    $actualTitle = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EncodedTitle))
+    Write-MandLog "Decoded question: $actualQuestion"
+    Write-MandLog "Decoded title: $actualTitle"
 
-$escapedTitle = [System.Security.SecurityElement]::Escape($actualTitle)
-$escapedVersionInfo = [System.Security.SecurityElement]::Escape($versionInfo)
-$escapedActionMessage = [System.Security.SecurityElement]::Escape($actionMessage)
+    # Load WPF assemblies
+    Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+    Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+    Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Write-MandLog "WPF assemblies loaded"
 
-$xaml = @"
+    # Use the decoded text and split on pipe separator for separate display
+    $parts = $actualQuestion -split '\|'
+    $versionInfo = if ($parts.Length -gt 0) { $parts[0].Trim() } else { $actualQuestion }
+    $actionMessage = if ($parts.Length -gt 1) { $parts[1].Trim() } else { "" }
+
+    $escapedTitle = [System.Security.SecurityElement]::Escape($actualTitle)
+    $escapedVersionInfo = [System.Security.SecurityElement]::Escape($versionInfo)
+    $escapedActionMessage = [System.Security.SecurityElement]::Escape($actionMessage)
+
+    $screen = [System.Windows.Forms.Screen]::PrimaryScreen
+    $workArea = $screen.WorkingArea
+    Write-MandLog "Screen workArea: $($workArea.Width)x$($workArea.Height) at ($($workArea.Left),$($workArea.Top))"
+
+    $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="$escapedTitle" Width="420" MinHeight="140" SizeToContent="Height" WindowStartupLocation="Manual"
         ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
@@ -3089,14 +3110,14 @@ $xaml = @"
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
-            
+
             <!-- Icon -->
             <Ellipse Grid.Column="0" Grid.RowSpan="3"
                      Width="24" Height="24"
                      Fill="#FFFF6B00"
                      VerticalAlignment="Top"
                      Margin="0,2,0,0"/>
-            
+
             <TextBlock Grid.Column="0" Grid.RowSpan="3"
                        Text="!"
                        Foreground="White"
@@ -3105,7 +3126,7 @@ $xaml = @"
                        HorizontalAlignment="Center"
                        VerticalAlignment="Top"
                        Margin="0,4,0,0"/>
-            
+
             <!-- Title -->
             <TextBlock Grid.Column="1" Grid.Row="0"
                        Text="$escapedTitle"
@@ -3114,7 +3135,7 @@ $xaml = @"
                        FontWeight="SemiBold"
                        Margin="12,0,0,2"
                        TextWrapping="Wrap"/>
-            
+
             <!-- Version Info -->
             <TextBlock Grid.Column="1" Grid.Row="1"
                        Text="$escapedVersionInfo"
@@ -3122,7 +3143,7 @@ $xaml = @"
                        FontSize="12"
                        Margin="12,0,0,8"
                        TextWrapping="Wrap"/>
-            
+
             <!-- Action Message -->
             <TextBlock Grid.Column="1" Grid.Row="2"
                        Text="$escapedActionMessage"
@@ -3130,13 +3151,13 @@ $xaml = @"
                        FontSize="12"
                        Margin="12,0,0,8"
                        TextWrapping="Wrap"/>
-            
+
             <!-- Button -->
             <StackPanel Grid.Column="1" Grid.Row="3"
                         Orientation="Horizontal"
                         HorizontalAlignment="Right"
                         Margin="12,0,0,0">
-                        
+
                 <Button Name="UpgradeButton" Content="Upgrade" Width="80" Height="24" Background="#FF0078D4" Foreground="White" IsDefault="true">
                     <Button.Style>
                         <Style TargetType="Button">
@@ -3148,93 +3169,103 @@ $xaml = @"
                         </Style>
                     </Button.Style>
                 </Button>
-                
+
             </StackPanel>
         </Grid>
     </Border>
 </Window>
 "@
 
-$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
-$window = [Windows.Markup.XamlReader]::Load($reader)
+    Write-MandLog "XAML created, parsing..."
+    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+    $window = [Windows.Markup.XamlReader]::Load($reader)
+    Write-MandLog "XAML parsed successfully"
 
-$script:result = "Continue"
-
-# Get button reference and store original text
-$upgradeButton = $window.FindName("UpgradeButton")
-$originalButtonText = if ($upgradeButton) { $upgradeButton.Content } else { "Upgrade" }
-
-# Create countdown timer (updates every second)
-$script:timeRemaining = $TimeoutSeconds
-$countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
-$countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
-
-$countdownTimer.Add_Tick({
-    $script:timeRemaining--
-    
-    # Update button with countdown
-    if ($upgradeButton) {
-        $upgradeButton.Content = "$originalButtonText ($($script:timeRemaining))"
-    }
-    
-    # Stop countdown timer when we reach zero (main timeout timer will handle dialog close)
-    if ($script:timeRemaining -le 0) {
-        $countdownTimer.Stop()
-    }
-})
-
-# Create main timeout timer
-$timer = New-Object System.Windows.Threading.DispatcherTimer
-$timer.Interval = [System.TimeSpan]::FromSeconds($TimeoutSeconds)
-
-$timer.Add_Tick({
     $script:result = "Continue"
-    $timer.Stop()
-    $countdownTimer.Stop()
-    $window.Close()
-})
 
-# Position window like other dialogs (bottom-right)
-$window.Add_Loaded({
-    $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    
-    # Position at bottom-right (near notification area)
-    $window.Left = $workArea.Width - $window.Width - 16
-    $window.Top = $workArea.Height - $window.Height - 16
-})
+    # Get button reference and store original text
+    $upgradeButton = $window.FindName("UpgradeButton")
+    $originalButtonText = if ($upgradeButton) { $upgradeButton.Content } else { "Upgrade" }
+    Write-MandLog "Button found: $($upgradeButton -ne $null)"
 
-# Add upgrade button handler
-if ($upgradeButton) {
-    $upgradeButton.Add_Click({
+    # Position window (before showing, like progress dialog)
+    $window.Left = $workArea.Right - 440
+    $window.Top = $workArea.Bottom - 160
+    Write-MandLog "Window positioned at $($window.Left),$($window.Top)"
+
+    # Create countdown timer (updates every second)
+    $script:timeRemaining = $TimeoutSeconds
+    $countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
+
+    $countdownTimer.Add_Tick({
+        $script:timeRemaining--
+
+        # Update button with countdown
+        if ($upgradeButton) {
+            $upgradeButton.Content = "$originalButtonText ($($script:timeRemaining))"
+        }
+
+        # Stop countdown timer when we reach zero (main timeout timer will handle dialog close)
+        if ($script:timeRemaining -le 0) {
+            $countdownTimer.Stop()
+        }
+    })
+
+    # Create main timeout timer
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [System.TimeSpan]::FromSeconds($TimeoutSeconds)
+
+    $timer.Add_Tick({
+        $script:result = "Continue"
         $timer.Stop()
         $countdownTimer.Stop()
-        $script:result = "Continue"
         $window.Close()
     })
-}
 
-# Handle window closing
-$window.Add_Closing({
+    # Add upgrade button handler
+    if ($upgradeButton) {
+        $upgradeButton.Add_Click({
+            $timer.Stop()
+            $countdownTimer.Stop()
+            $script:result = "Continue"
+            $window.Close()
+        })
+    }
+
+    # Handle window closing
+    $window.Add_Closing({
+        $timer.Stop()
+        $countdownTimer.Stop()
+        if ($script:result -eq $null) {
+            $script:result = "Continue"
+        }
+    })
+
+    # Start both timers
+    $timer.Start()
+    $countdownTimer.Start()
+
+    Write-MandLog "Showing dialog..."
+    $window.Activate()
+    $window.ShowDialog() | Out-Null
+    Write-MandLog "Dialog closed with result: $($script:result)"
+
+    # Ensure timers are stopped
     $timer.Stop()
     $countdownTimer.Stop()
-    if ($script:result -eq $null) {
-        $script:result = "Continue"
-    }
-})
 
-# Start both timers
-$timer.Start()
-$countdownTimer.Start()
+    # Write response
+    @{ response = $script:result; timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ") } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+    Write-MandLog "Response written to $ResponseFilePath"
 
-$window.Activate()
-$window.ShowDialog() | Out-Null
-
-# Ensure timers are stopped
-$timer.Stop()
-$countdownTimer.Stop()
-
-# Write response
-@{ response = $script:result; timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ") } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+} catch {
+    Write-MandLog "ERROR: $($_.Exception.Message)"
+    Write-MandLog "Stack: $($_.ScriptStackTrace)"
+    # Still try to write response so the wait loop doesn't time out
+    @{ response = "Continue"; timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ") } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+Write-MandLog "=== MANDATORY PROMPT ENDED ==="
 '@
 
         Write-Log -Message "Creating mandatory prompt script: $mandatoryScriptPath" | Out-Null
