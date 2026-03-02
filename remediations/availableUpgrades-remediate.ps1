@@ -2260,9 +2260,37 @@ function Invoke-WingetWithProgress {
         $proc.WaitForExit()
 
         # Read final output (same format as & winget ... 2>&1)
+        $rawResult = @()
+        if (Test-Path $outFile) { $rawResult += Get-Content $outFile -ErrorAction SilentlyContinue }
+        if (Test-Path $errFile) { $rawResult += Get-Content $errFile -ErrorAction SilentlyContinue }
+
+        # Filter out winget source-update noise (spinners, progress bars, blank lines).
+        # The source update appears before the first meaningful line (e.g. "Found ...").
+        # Once past the source update, keep content but still strip spinners and blank lines.
         $result = @()
-        if (Test-Path $outFile) { $result += Get-Content $outFile -ErrorAction SilentlyContinue }
-        if (Test-Path $errFile) { $result += Get-Content $errFile -ErrorAction SilentlyContinue }
+        $pastSourceUpdate = $false
+        foreach ($rawLine in $rawResult) {
+            $line = "$rawLine"
+            # Detect the start of actual winget output (after source update)
+            if (-not $pastSourceUpdate) {
+                if ($line -match '^\s*(Found |No applicable |No newer |No available |Already installed|No package found|Multiple packages found|Successfully)') {
+                    $pastSourceUpdate = $true
+                } else {
+                    continue
+                }
+            }
+            # From here on, filter remaining noise but keep meaningful content
+            # Remove spinner-only lines
+            if ($line -match '^\s*[-\\|/]\s*$') { continue }
+            # Remove progress bar lines UNLESS they contain download size info
+            if ($line -match '[\u2580-\u259F]') {
+                if ($line -match '[\d.]+\s*[KMG]B\s*/\s*[\d.]+\s*[KMG]B') { $result += $rawLine }
+                continue
+            }
+            # Remove empty/whitespace-only lines
+            if ($line -match '^\s*$') { continue }
+            $result += $rawLine
+        }
         Write-Log "Winget process exited with code: $($proc.ExitCode)" | Out-Null
 
         # Propagate exit code so $LASTEXITCODE reflects winget's result
