@@ -2238,6 +2238,9 @@ function Invoke-WingetWithProgress {
                                 Write-InfoDialogStatus -SignalFilePath $SignalFilePath -Status $status
                             }
                             continue
+                        } else {
+                            # pastSourceUpdate is true but "Found" not in current read (partial read) - skip to avoid showing source index sizes
+                            continue
                         }
 
                         # Match winget stdout progress: "1024 KB / 6.31 MB" or "2.00 MB / 6.31 MB"
