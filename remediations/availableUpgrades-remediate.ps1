@@ -5655,7 +5655,7 @@ function Stop-BlockingProcesses {
 
 function Remove-OldLogs {
     param([string]$LogPath)
-    
+
     try {
         $cutoffDate = (Get-Date).AddMonths(-1)
         $logFiles = Get-ChildItem -Path $LogPath -Filter "*AvailableUpgrades*.log" -ErrorAction SilentlyContinue
@@ -5667,6 +5667,53 @@ function Remove-OldLogs {
         }
     } catch {
         # Don't use Write-Log here as it may not be ready yet - just silently continue
+    }
+}
+
+function Remove-OldTempFiles {
+    <#
+    .SYNOPSIS
+        Cleans up stale temp files created by this script in C:\ProgramData\Temp
+    #>
+    $tempPath = "C:\ProgramData\Temp"
+    if (-not (Test-Path $tempPath)) { return }
+
+    $cutoff = (Get-Date).AddMinutes(-30)
+    $removed = 0
+
+    # All file patterns this script creates in C:\ProgramData\Temp
+    $patterns = @(
+        "UserRemediation_*.json",
+        "UserRemediation_*.status",
+        "UserRemediation_*.heartbeat",
+        "UserRemediation_*.heartbeat.*",
+        "UserRemediationHeartbeat_*.json",
+        "availableUpgrades-remediate_*.ps1",
+        "MandatoryPrompt_*_Response.json",
+        "MandatoryPrompt_*_Progress.json",
+        "MandatoryPrompt_*_Progress_Status.txt",
+        "Show-MandatoryPrompt_*.ps1",
+        "DeferralPrompt_*_Response.json",
+        "Show-DeferralPrompt_*.ps1",
+        "UserPrompt_*_Response.json",
+        "Show-UserPrompt_*.ps1",
+        "UserContext_Debug.log",
+        "UserContext_Debug_Fallback.log",
+        "UserContext_Heartbeat_Error_*.log",
+        "HiddenLaunch_*.vbs"
+    )
+
+    foreach ($pattern in $patterns) {
+        Get-ChildItem -Path $tempPath -Filter $pattern -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $cutoff } |
+            ForEach-Object {
+                Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+                $removed++
+            }
+    }
+
+    if ($removed -gt 0) {
+        Write-Log -Message "Cleaned up $removed old temp files from $tempPath"
     }
 }
 
@@ -6032,6 +6079,9 @@ if (-not $Script:MarkerSystemInitialized) {
 
 # Clean up old log files (older than 1 month)
 Remove-OldLogs -LogPath $LogPath
+
+# Clean up stale temp files from previous runs (older than 30 minutes)
+Remove-OldTempFiles
 
 # Initialize and clean up deferral system
 Write-Log -Message "Initializing deferral management system" | Out-Null
