@@ -6312,10 +6312,11 @@ if ($UserRemediationOnly) {
             
             try {
                 # Enhanced heartbeat creation with multiple fallback paths
+                $heartbeatBaseName = [System.IO.Path]::GetFileNameWithoutExtension($heartbeatFile)
                 $heartbeatPaths = @(
                     $heartbeatFile,
-                    "$env:TEMP\UserRemediationHeartbeat_$(Split-Path (Split-Path $heartbeatFile -Leaf) -LeafBase).json",
-                    "C:\ProgramData\Temp\UserRemediationHeartbeat_$(Split-Path (Split-Path $heartbeatFile -Leaf) -LeafBase).json"
+                    "$env:TEMP\UserRemediationHeartbeat_$heartbeatBaseName.json",
+                    "C:\ProgramData\Temp\UserRemediationHeartbeat_$heartbeatBaseName.json"
                 )
                 
                 $heartbeatData = @{
