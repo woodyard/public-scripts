@@ -56,7 +56,7 @@
     8.6 - PERFORMANCE OPTIMIZATION: Implemented user info caching to eliminate redundant CIM/WMI calls (3+ second savings), fixed deferral system type comparison error that blocked Adobe Reader updates, eliminated double marker file initialization, enhanced scheduled task execution with -NoProfile flag for better reliability
     8.7 - FEATURE: Added per-version failure tracking - counts consecutive install failures per app version in registry, offers user skip dialog after 3 failures; skip auto-clears when a newer version becomes available or upgrade succeeds
     8.8 - FIX: Added post-upgrade verification for exit-code-0 successes: runs winget list after upgrade and checks if "Available" column is still present; if so treats as failure instead of false-positive success (fixes detection loop for apps like Adobe Reader whose installer returns 0 without changing the installed version)
-    8.9 - FIX: Removed --scope user from winget upgrade listing in user remediation context; machine-scoped apps were hidden from detection. Added scope detection to upgrade command so machine-scoped apps are skipped in non-admin user context instead of getting wrong --scope user flag
+    8.9 - FIX: Removed --scope user from winget upgrade listing in user remediation context; machine-scoped apps were hidden from detection. Added scope detection to upgrade command: machine-scoped apps attempt upgrade without scope flag (avoids wrong --scope user), user-scoped apps keep --scope user
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -7038,8 +7038,9 @@ if ($OUTPUT) {
                         } elseif (-not $userIsAdmin) {
                             $detectedScope = Get-AppInstalledScope -AppID $appInfo.AppID -FriendlyName $okapp.FriendlyName
                             if ($detectedScope -eq "machine") {
-                                Write-Log -Message "Skipping $($appInfo.AppID) - machine-scoped install requires admin/SYSTEM context to upgrade"
-                                $doUpgrade = $false
+                                Write-Log -Message "Attempting upgrade of machine-scoped app $($appInfo.AppID) without scope flag (non-admin user context)"
+                                # Don't add --scope user for machine-scoped apps - it would fail or create a duplicate.
+                                # The --silent flag ensures no UAC prompt; if elevation is needed the installer will just fail.
                             } else {
                                 Write-Log -Message "Using --scope user for non-admin user context upgrade (detected scope: $detectedScope)"
                                 $wingetArgs += @("--scope", "user")
