@@ -160,7 +160,8 @@
         "BlockingProcess": "StorageExplorer",
         "PromptWhenBlocked": true,
         "DefaultTimeoutAction": false,
-        "TimeoutSeconds": 75
+        "TimeoutSeconds": 75,
+        "Disabled":true
     },
     {
         "AppID": "calibre.calibre",
