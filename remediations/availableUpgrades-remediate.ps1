@@ -56,7 +56,8 @@
     8.6 - PERFORMANCE OPTIMIZATION: Implemented user info caching to eliminate redundant CIM/WMI calls (3+ second savings), fixed deferral system type comparison error that blocked Adobe Reader updates, eliminated double marker file initialization, enhanced scheduled task execution with -NoProfile flag for better reliability
     8.7 - FEATURE: Added per-version failure tracking - counts consecutive install failures per app version in registry, offers user skip dialog after 3 failures; skip auto-clears when a newer version becomes available or upgrade succeeds
     8.8 - FIX: Added post-upgrade verification for exit-code-0 successes: runs winget list after upgrade and checks if "Available" column is still present; if so treats as failure instead of false-positive success (fixes detection loop for apps like Adobe Reader whose installer returns 0 without changing the installed version)
-    
+    8.9 - FIX: Removed --scope user from winget upgrade listing in user remediation context; machine-scoped apps were hidden from detection, preventing upgrades for apps like Azure Storage Explorer
+
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
     1 - Error occurred during remediation
@@ -6495,14 +6496,11 @@ if ($UserRemediationOnly) {
         
         try {
             # Use background job with timeout to prevent winget hanging
+            # Note: No --scope filter here - we need to see ALL upgradeable apps (both user and machine scoped)
+            # The --scope user filter is only applied during the actual upgrade command for non-admin users
             $wingetJob = Start-Job -ScriptBlock {
-                param($isAdmin)
-                if ($isAdmin) {
-                    winget upgrade --accept-source-agreements
-                } else {
-                    winget upgrade --accept-source-agreements --scope user
-                }
-            } -ArgumentList $userIsAdmin
+                winget upgrade --accept-source-agreements
+            }
             
             Write-Log -Message "Winget job started (Job ID: $($wingetJob.Id)), waiting up to $wingetTimeout seconds..."
             Update-Status -Status "Running winget" -Progress "Executing winget upgrade command with timeout protection"
@@ -6600,13 +6598,8 @@ if ($UserRemediationOnly) {
             
             try {
                 $retryJob = Start-Job -ScriptBlock {
-                    param($isAdmin)
-                    if ($isAdmin) {
-                        winget upgrade --accept-source-agreements
-                    } else {
-                        winget upgrade --accept-source-agreements --scope user
-                    }
-                } -ArgumentList $userIsAdmin
+                    winget upgrade --accept-source-agreements
+                }
                 
                 if (Wait-Job $retryJob -Timeout $wingetTimeout) {
                     $OUTPUT = Receive-Job $retryJob
