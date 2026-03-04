@@ -4798,7 +4798,7 @@ function Set-VersionFailure {
     )
     try {
         $path = "HKLM:\SOFTWARE\WingetUpgradeManager\Failures\$AppID"
-        New-Item -Path $path -Force | Out-Null
+        if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
         $existing = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
         $count = if ($existing -and $existing.FailedVersion -eq $Version) { [int]$existing.FailureCount + 1 } else { 1 }
         Set-ItemProperty -Path $path -Name "FailedVersion" -Value $Version
