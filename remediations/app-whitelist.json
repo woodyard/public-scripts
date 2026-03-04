@@ -300,7 +300,7 @@
     {
         "AppID": "Adobe.Acrobat.Reader*",
         "FriendlyName": "Adobe Acrobat Reader",
-        "Disabled": false,
+        "Disabled": true,
         "BlockingProcess": "AcroRd32,Acrobat,AcroBroker,AdobeARM,AdobeCollabSync",
         "AutoCloseProcesses": "AdobeCollabSync",
         "PromptWhenBlocked": true,
