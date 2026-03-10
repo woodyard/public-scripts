@@ -454,5 +454,13 @@
         "DeferralEnabled": true,
         "MaxDeferralDays": 5,
         "ForcedUpgradeMessage": "Claude updates can no longer be deferred."
+    },
+    {
+        "AppID": "Perplexity.Comet",
+        "FriendlyName": "Perplexity Comet",
+        "BlockingProcess": "Comet",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 60
     }
 ]
