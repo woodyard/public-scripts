@@ -65,7 +65,8 @@
 
 param(
     [switch]$UserRemediationOnly,
-    [string]$RemediationResultFile
+    [string]$RemediationResultFile,
+    [string]$WhitelistUrl
 )
 
 # Note: Admin requirement is conditional - not needed for user context execution (UserRemediationOnly mode)
@@ -4921,12 +4922,14 @@ function Schedule-UserContextRemediation {
         
         $scriptPath = $tempScriptPath
         # Create hidden launch action using VBS wrapper (no console window flash)
-        $remPsArgs = "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`""
+        # Pass WhitelistUrl through so the user-context child process uses the same whitelist source
+        $whitelistArg = if ($whitelistUrl) { " -WhitelistUrl `"$whitelistUrl`"" } else { "" }
+        $remPsArgs = "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`"$whitelistArg"
         $remLaunch = New-HiddenLaunchAction -PowerShellArguments $remPsArgs -VbsDirectory $sharedTempPath
         if (-not $remLaunch) {
             Write-Log "ERROR: Failed to create hidden launch action - falling back to direct PowerShell" | Out-Null
             $remLaunch = @{
-                Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`""
+                Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -UserRemediationOnly -RemediationResultFile `"$resultFile`"$whitelistArg"
                 VbsPath = $null
             }
         }
@@ -5967,6 +5970,10 @@ $localWhitelistPath = $null
 if ($MyInvocation.MyCommand.Path) {
     $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
     $localWhitelistPath = Join-Path $scriptPath "app-whitelist.json"
+}
+# WhitelistUrl parameter (from scheduled task) takes precedence over bootstrapper variable
+if ($WhitelistUrl) {
+    $whitelistUrl = $WhitelistUrl
 }
 if (-not $whitelistUrl) {
     $whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"

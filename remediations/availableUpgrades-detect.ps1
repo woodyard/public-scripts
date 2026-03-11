@@ -858,8 +858,13 @@ function Invoke-UserContextDetection {
         $scriptPath = $tempScriptPath
         
         # Create a marker file to indicate this is a user detection task (workaround for parameter passing issues)
+        # Include whitelistUrl so the user-context child process uses the same whitelist source
         $markerFile = "$tempScriptPath.userdetection"
-        $markerCreated = New-MarkerFile -FilePath $markerFile -Content "USERDETECTION:$resultFile" -Description "User detection task marker"
+        $markerContent = "USERDETECTION:$resultFile"
+        if ($whitelistUrl) {
+            $markerContent += "`nWHITELISTURL:$whitelistUrl"
+        }
+        $markerCreated = New-MarkerFile -FilePath $markerFile -Content $markerContent -Description "User detection task marker"
         
         if (-not $markerCreated) {
             Write-Log -Message "ERROR: Failed to create user detection marker file - user detection may not work properly"
@@ -1407,6 +1412,11 @@ if (Test-Path $markerFile) {
             $isUserDetectionTask = $true
             $markerResultFile = $matches[1].Trim()
             Write-Log -Message "DEBUG: Found user detection marker file with result path: $markerResultFile" -IsDebug
+        }
+        # Restore whitelistUrl from marker file (passed from SYSTEM context bootstrapper)
+        if ($markerContent -match "WHITELISTURL:(.+)") {
+            $whitelistUrl = $matches[1].Trim()
+            Write-Log -Message "DEBUG: Restored whitelistUrl from marker file: $whitelistUrl" -IsDebug
         }
     } catch {
         Write-Log -Message "DEBUG: Error reading marker file: $($_.Exception.Message)" -IsDebug
