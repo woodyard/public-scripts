@@ -10,6 +10,13 @@
 .PARAMETER UserRemediationOnly
     When specified, the script runs in user remediation mode (scheduled task execution)
 
+.PARAMETER RemediationResultFile
+    Path to the file where remediation results are written (used by scheduled task child process)
+
+.PARAMETER WhitelistUrl
+    URL to the whitelist JSON file. Passed through to user-context scheduled tasks.
+    If not specified, falls back to $global:whitelistUrl (bootstrapper scenario), then the default GitHub URL.
+
 .NOTES
  Author: Henrik Skovgaard
  Version: 8.8
@@ -5971,7 +5978,7 @@ if ($MyInvocation.MyCommand.Path) {
     $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
     $localWhitelistPath = Join-Path $scriptPath "app-whitelist.json"
 }
-# WhitelistUrl parameter (from scheduled task) takes precedence, then global scope (iex bootstrapper), then default
+# WhitelistUrl parameter (from scheduled task) takes precedence, then global scope (bootstrapper), then default
 if ($WhitelistUrl) {
     $whitelistUrl = $WhitelistUrl
 } elseif ($global:whitelistUrl) {
