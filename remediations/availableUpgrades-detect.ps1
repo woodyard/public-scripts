@@ -1214,6 +1214,12 @@ if (-not (OOBEComplete)) {
 
 <# ---------------------------------------------- #>
 
+# Scope-safe: pick up $whitelistUrl from parent/global scope (iex bootstrapper scenario)
+if (-not $whitelistUrl -and $global:whitelistUrl) {
+    $whitelistUrl = $global:whitelistUrl
+    Write-Log -Message "Restored whitelistUrl from global scope: $whitelistUrl"
+}
+
 # Early marker file check — restore whitelistUrl BEFORE whitelist loading
 # (scheduled task child process needs this to use the correct whitelist source)
 if ($MyInvocation.MyCommand.Path) {
@@ -1254,13 +1260,14 @@ if ([string]::IsNullOrEmpty($whitelistJSON)) {
     if (-not $whitelistUrl) {
         $whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"
     }
-    Write-Log -Message "Loading whitelist configuration from GitHub"
-    
+    Write-Log -Message "Loading whitelist configuration from GitHub: $whitelistUrl"
+
     try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         $webClient = New-Object System.Net.WebClient
         $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/4.2")
         $whitelistJSON = $webClient.DownloadString($whitelistUrl)
-        Write-Log -Message "Successfully downloaded whitelist configuration from GitHub"
+        Write-Log -Message "Successfully downloaded whitelist configuration from GitHub ($($whitelistJSON.Length) bytes)"
     } catch {
         Write-Log -Message "Error downloading whitelist from GitHub: $($_.Exception.Message)"
         $whitelistJSON = $null

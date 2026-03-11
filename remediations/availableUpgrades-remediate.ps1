@@ -5971,9 +5971,12 @@ if ($MyInvocation.MyCommand.Path) {
     $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
     $localWhitelistPath = Join-Path $scriptPath "app-whitelist.json"
 }
-# WhitelistUrl parameter (from scheduled task) takes precedence over bootstrapper variable
+# WhitelistUrl parameter (from scheduled task) takes precedence, then global scope (iex bootstrapper), then default
 if ($WhitelistUrl) {
     $whitelistUrl = $WhitelistUrl
+} elseif ($global:whitelistUrl) {
+    $whitelistUrl = $global:whitelistUrl
+    Write-Log -Message "Restored whitelistUrl from global scope: $whitelistUrl"
 }
 if (-not $whitelistUrl) {
     $whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"
@@ -5996,11 +5999,12 @@ if ($localWhitelistPath -and (Test-Path $localWhitelistPath)) {
 # If local file failed or doesn't exist, try GitHub
 if (-not $whitelistJSON) {
     try {
-        Write-Log -Message "Fetching whitelist configuration from GitHub"
+        Write-Log -Message "Fetching whitelist configuration from GitHub: $whitelistUrl"
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         $webClient = New-Object System.Net.WebClient
         $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/7.1")
         $whitelistJSON = $webClient.DownloadString($whitelistUrl)
-        Write-Log -Message "Successfully downloaded whitelist configuration from GitHub"
+        Write-Log -Message "Successfully downloaded whitelist configuration from GitHub ($($whitelistJSON.Length) bytes)"
     } catch {
         Write-Log -Message "Error downloading whitelist from GitHub: $($_.Exception.Message)"
         Write-Log -Message "Falling back to basic hardcoded configuration"
