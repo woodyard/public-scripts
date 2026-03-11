@@ -1228,7 +1228,9 @@ if (Test-Path $localWhitelistPath) {
 
 # If no local file or local file failed, try GitHub
 if ([string]::IsNullOrEmpty($whitelistJSON)) {
-    $whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"
+    if (-not $whitelistUrl) {
+        $whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"
+    }
     Write-Log -Message "Loading whitelist configuration from GitHub"
     
     try {
