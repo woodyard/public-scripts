@@ -775,9 +775,9 @@ function Invoke-UserContextDetection {
         Write-Log "DEBUG: Testing direct winget execution in SYSTEM context with --scope user..." -IsDebug
         try {
             if ($WingetPath) {
-                Set-Location $WingetPath
+                $wingetExe = Join-Path $WingetPath "winget.exe"
                 Write-Log "DEBUG: Executing winget --scope user from SYSTEM context..." -IsDebug
-                $testOutput = $(.\winget.exe upgrade --accept-source-agreements --scope user 2>&1)
+                $testOutput = $(& $wingetExe upgrade --accept-source-agreements --source winget --scope user 2>&1)
                 Write-Log "DEBUG: Direct --scope user test completed, output: $($testOutput.Count) lines" -IsDebug
                 # Show first few lines to see if user apps are visible
                 for ($i = 0; $i -lt [Math]::Min(5, $testOutput.Count); $i++) {
@@ -1276,6 +1276,120 @@ try {
     exit 1
 }
 
+function Invoke-WingetUpgradeList {
+    <#
+    .SYNOPSIS
+        Runs winget upgrade and returns the raw output, with validation and retry.
+    .PARAMETER WingetExe
+        Full path to winget.exe. If not specified, uses winget from PATH.
+    .PARAMETER Scope
+        Optional scope filter (e.g. "user"). If not specified, no scope filter is applied.
+    #>
+    param(
+        [string]$WingetExe = "winget.exe",
+        [string]$Scope = ""
+    )
+
+    $wingetArgs = @("upgrade", "--accept-source-agreements", "--source", "winget")
+    if ($Scope) { $wingetArgs += "--scope"; $wingetArgs += $Scope }
+
+    Write-Log -Message "Running: $WingetExe $($wingetArgs -join ' ')"
+    $output = & $WingetExe @wingetArgs 2>&1
+
+    # Validate output contains a separator line (row of dashes below the header)
+    $hasSeparator = $false
+    foreach ($line in $output) {
+        if ($line -match '^-{10,}$') { $hasSeparator = $true; break }
+    }
+
+    if (-not $hasSeparator) {
+        Write-Log -Message "First winget run produced invalid output, retrying..."
+        $output = & $WingetExe @wingetArgs 2>&1
+    }
+
+    return $output
+}
+
+function ConvertFrom-WingetOutput {
+    <#
+    .SYNOPSIS
+        Parses winget upgrade text output into structured app objects.
+    .DESCRIPTION
+        Uses the separator line (dashes) to locate the header, then extracts
+        column positions from the header text. Locale-safe header detection.
+    .PARAMETER Output
+        The raw winget output lines.
+    #>
+    param([array]$Output)
+
+    if (-not $Output -or $Output.Count -eq 0) { return @() }
+
+    # Find the separator line (row of dashes) - this is locale-safe
+    $separatorIndex = -1
+    for ($i = 0; $i -lt $Output.Count; $i++) {
+        if ($Output[$i] -match '^-{10,}$') {
+            $separatorIndex = $i
+            break
+        }
+    }
+
+    if ($separatorIndex -lt 1) {
+        Write-Log -Message "No separator line found in winget output"
+        return @()
+    }
+
+    $headerLine = $Output[$separatorIndex - 1]
+    Write-Log -Message "DEBUG: Header line: $headerLine" -IsDebug
+    Write-Log -Message "DEBUG: Separator at line $separatorIndex" -IsDebug
+
+    # Find column positions from header - use word boundaries to avoid substring matches
+    # Match column names at their exact positions by finding each column header word
+    $columns = @{}
+    foreach ($col in @("Id", "Version", "Available", "Source")) {
+        # Find the column position - must be preceded by whitespace (or be at start) to avoid matching substrings
+        $pos = -1
+        for ($p = 0; $p -le $headerLine.Length - $col.Length; $p++) {
+            $substr = $headerLine.Substring($p, $col.Length)
+            if ($substr -ceq $col) {
+                # Check it's a real column header: preceded by space (or start) and followed by space (or end)
+                $prevOk = ($p -eq 0) -or ($headerLine[$p - 1] -eq ' ')
+                $nextOk = ($p + $col.Length -ge $headerLine.Length) -or ($headerLine[$p + $col.Length] -eq ' ')
+                if ($prevOk -and $nextOk) { $pos = $p; break }
+            }
+        }
+        if ($pos -ge 0) { $columns[$col] = $pos }
+    }
+
+    if (-not $columns.ContainsKey("Id")) {
+        Write-Log -Message "Could not find Id column in header: $headerLine"
+        return @()
+    }
+
+    $idPos = $columns["Id"]
+    $idEnd = if ($columns.ContainsKey("Version")) { $columns["Version"] - 1 } else { $headerLine.Length - 1 }
+
+    Write-Log -Message "Column positions - Id: $idPos, end: $idEnd"
+
+    $apps = [System.Collections.ArrayList]::new()
+    for ($i = $separatorIndex + 1; $i -lt $Output.Count; $i++) {
+        $line = $Output[$i]
+        # Stop at empty lines, summary lines, or the "require explicit targeting" section
+        if ($line.Trim() -eq "" -or $line -match 'upgrades? available' -or $line -match 'following packages') {
+            break
+        }
+        if ($line.Length -le $idPos) { continue }
+
+        $appId = ($line[$idPos..$idEnd] -join "").Trim()
+        if ($appId -ne "") {
+            $null = $apps.Add($appId)
+            Write-Log -Message "DEBUG: Found app: $appId" -IsDebug
+        }
+    }
+
+    Write-Log -Message "Parsed $($apps.Count) apps from winget output"
+    return $apps
+}
+
 # Main detection logic - dual-context architecture - FIXED PARAMETER DETECTION
 # Check for marker file (workaround for scheduled task parameter passing issues)
 $currentScriptPath = $MyInvocation.MyCommand.Path
@@ -1300,14 +1414,12 @@ Write-Log -Message "DEBUG: Marker detection - isUserDetectionTask: $isUserDetect
 
 if ($UserDetectionOnly -eq "true" -or $isUserDetectionTask) {
     # This is a scheduled user detection task - detect user apps only
-    # CRITICAL FIX: Check UserDetectionOnly parameter first, before context checks
     Write-Log -Message "*** RUNNING IN USER CONTEXT (SCHEDULED TASK) ***"
     Write-Log -Message "Current user: $env:USERNAME"
     Write-Log -Message "User domain: $env:USERDOMAIN"
     Write-Log -Message "Session ID: $((Get-Process -Id $PID).SessionId)"
     Write-Log -Message "Process ID: $PID"
     Write-Log -Message "Running user detection task"
-    # Use marker file result path if parameter is empty
     $effectiveResultFile = if (-not [string]::IsNullOrEmpty($DetectionResultFile)) {
         $DetectionResultFile
     } else {
@@ -1315,154 +1427,41 @@ if ($UserDetectionOnly -eq "true" -or $isUserDetectionTask) {
     }
     Write-Log -Message "DetectionResultFile parameter: $DetectionResultFile"
     Write-Log -Message "Effective result file (from marker): $effectiveResultFile"
-    
-    # Check if we're admin in user context - if not, use --scope user
+
     $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     $userIsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    
     Write-Log -Message "User is admin: $userIsAdmin"
-    Write-Log -Message "Test-RunningAsSystem: $(Test-RunningAsSystem)"
-    
-    if ($userIsAdmin) {
-        Write-Log -Message "Admin user context - detecting all apps"
-        $OUTPUT = $(winget upgrade --accept-source-agreements)
-    } else {
-        Write-Log -Message "Non-admin user context - using --scope user for detection"
-        $OUTPUT = $(winget upgrade --accept-source-agreements --scope user)
-    }
-    
-    Write-Log -Message "DEBUG: User context winget output received, $($OUTPUT.Count) lines" -IsDebug
-    # Show first few lines of user context output for debugging
-    for ($debugLine = 0; $debugLine -lt [Math]::Min(5, $OUTPUT.Count); $debugLine++) {
-        Write-Log -Message "DEBUG: User Line $debugLine`: $($OUTPUT[$debugLine])" -IsDebug
-    }
-    
-    # Check if first output is valid (contains actual app data)
-    $hasValidOutput = $false
-    foreach ($line in $OUTPUT) {
-        if ($line -like "Name*Id*Version*Available*Source*") {
-            $hasValidOutput = $true
-            break
-        }
-    }
-    
-    # If first output is nonsense, run again
-    if (-not $hasValidOutput) {
-        Write-Log -Message "First winget run produced invalid output, retrying..."
-        if ($userIsAdmin) {
-            $OUTPUT = $(winget upgrade --accept-source-agreements)
-        } else {
-            $OUTPUT = $(winget upgrade --accept-source-agreements --scope user)
-        }
-    }
-    
+
+    $scope = if ($userIsAdmin) { "" } else { "user" }
+    $OUTPUT = Invoke-WingetUpgradeList -Scope $scope
     Write-Log -Message "User context detection - processing user-scoped apps only"
-    
+
 } elseif (Test-RunningAsSystem) {
-    # SYSTEM context main execution - detect system apps and schedule user detection
     Write-Log -Message "SYSTEM context - detecting system apps and scheduling user detection"
-    
+
     if ($WingetPath) {
         Write-Log -Message "Using winget path: $WingetPath"
-        Set-Location $WingetPath
-        
-        # System context winget - only sees system-wide apps
-        $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
-        
-        # Check if first output is valid (contains actual app data)
-        $hasValidOutput = $false
-        foreach ($line in $OUTPUT) {
-            if ($line -like "Name*Id*Version*Available*Source*") {
-                $hasValidOutput = $true
-                break
-            }
-        }
-        
-        # If first output is nonsense, run again
-        if (-not $hasValidOutput) {
-            Write-Log -Message "First winget run produced invalid output, retrying..."
-            $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
-        }
+        $wingetExe = Join-Path $WingetPath "winget.exe"
+        $OUTPUT = Invoke-WingetUpgradeList -WingetExe $wingetExe
     } else {
         Write-Log -Message "Winget not detected in SYSTEM context"
-        Write-Log -Message "Performing marker file cleanup before exit (no winget in system context)" -IsDebug
         Invoke-MarkerFileEmergencyCleanup -Reason "Winget not detected in SYSTEM context"
         exit 0
     }
 } else {
-    # Direct user context execution - detect user apps only
     Write-Log -Message "USER context - detecting user-scoped apps"
-    
-    # Check if we're admin in user context - if not, use --scope user
-    if ($userIsAdmin) {
-        $OUTPUT = $(winget upgrade --accept-source-agreements)
-    } else {
-        Write-Log -Message "Non-admin user context - using --scope user for detection"
-        $OUTPUT = $(winget upgrade --accept-source-agreements --scope user)
-    }
-    
-    # Check if first output is valid (contains actual app data)
-    $hasValidOutput = $false
-    foreach ($line in $OUTPUT) {
-        if ($line -like "Name*Id*Version*Available*Source*") {
-            $hasValidOutput = $true
-            break
-        }
-    }
-    
-    # If first output is nonsense, run again
-    if (-not $hasValidOutput) {
-        Write-Log -Message "First winget run produced invalid output, retrying..."
-        if ($userIsAdmin) {
-            $OUTPUT = $(winget upgrade --accept-source-agreements)
-        } else {
-            $OUTPUT = $(winget upgrade --accept-source-agreements --scope user)
-        }
-    }
+
+    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    $userIsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    $scope = if ($userIsAdmin) { "" } else { "user" }
+    $OUTPUT = Invoke-WingetUpgradeList -Scope $scope
 }
 
 # Parse winget output and process apps
-if ($OUTPUT) {
-    Write-Log -Message "DEBUG: Winget output received, $($OUTPUT.Count) lines" -IsDebug
-    # Show first few lines of output for debugging
-    for ($debugLine = 0; $debugLine -lt [Math]::Min(5, $OUTPUT.Count); $debugLine++) {
-        Write-Log -Message "DEBUG: Line $debugLine`: $($OUTPUT[$debugLine])" -IsDebug
-    }
-    
-    $headerLine = -1
-    $lineCount = 0
+$LIST = ConvertFrom-WingetOutput -Output $OUTPUT
 
-    foreach ($line in $OUTPUT) {
-        if ($line -like "Name*" -and $headerLine -eq -1) {
-            $headerLine = $lineCount
-            Write-Log -Message "DEBUG: Found header line at position $headerLine`: $line" -IsDebug
-        }
-        $lineCount++
-    }
-    
-    if ($OUTPUT -and $lineCount -gt $headerLine+2) {
-        $str = $OUTPUT[$headerLine]
-        $idPos = $str.indexOf("Id")
-        $versionPos = $str.indexOf("Version")-1
-
-        $LIST= [System.Collections.ArrayList]::new()
-        Write-Log -Message "DEBUG: Parsing apps from line $($headerLine+2) to $($OUTPUT.count-1)" -IsDebug
-        for ($i=$headerLine+2;($i -lt $OUTPUT.count);$i=$i+1) {
-            $lineData = $OUTPUT[$i]
-            Write-Log -Message "DEBUG: Processing line $i`: $lineData" -IsDebug
-            # Stop parsing if we hit the second section or empty lines
-            if ($lineData -like "*upgrade available, but require*" -or $lineData.Trim() -eq "" -or $lineData -like "*following packages*") {
-                Write-Log -Message "DEBUG: Stopping parsing at line $i` due to: $lineData" -IsDebug
-                break
-            }
-            $appId = ($lineData[$idPos..$versionPos] -Join "").trim()
-            Write-Log -Message "DEBUG: Extracted appId: '$appId'" -IsDebug
-            if ($appId -ne "") {
-                $null = $LIST.Add($appId)
-                Write-Log -Message "DEBUG: Added app to list: $appId" -IsDebug
-            }
-        }
-        Write-Log -Message "DEBUG: Total apps found in winget output: $($LIST.Count)" -IsDebug
+if ($LIST -and $LIST.Count -gt 0) {
 
         $contextApps = @()
         $deferredApps = @()
@@ -1759,17 +1758,9 @@ if ($OUTPUT) {
                 exit 0
             }
         }
-    }
-    
-    Write-Log -Message "[$ScriptTag] No apps found in winget output"
-    # Cleanup marker files before exit
-    Write-Log -Message "Performing final marker file cleanup before script exit" -IsDebug
-    Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (no apps found)"
-    exit 0
 } else {
-    Write-Log -Message "[$ScriptTag] No winget output received"
-    # Cleanup marker files before exit
+    Write-Log -Message "[$ScriptTag] No upgrades found in winget output"
     Write-Log -Message "Performing final marker file cleanup before script exit" -IsDebug
-    Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (no winget output)"
+    Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (no upgrades found)"
     exit 0
 }

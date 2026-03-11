@@ -1526,7 +1526,6 @@ function Show-ProcessCloseDialog {
         
     } catch {
         Write-Log -Message "Show-ProcessCloseDialog failed: $($_.Exception.Message)" | Out-Null
-        Write-Log -Message "Using default timeout action: $DefaultTimeoutAction" | Out-Null
         return @{
             CloseProcess = $DefaultTimeoutAction
             DeferralDays = 0
@@ -1539,10 +1538,10 @@ function Show-ProcessCloseDialog {
 function Show-DirectUserDialog {
     <#
     .SYNOPSIS
-        Shows a simple direct WPF dialog when already running in user context
+        Shows a WPF dialog when running in user context by spawning a child process
     .DESCRIPTION
-        Lightweight version of the dialog system for user context execution
-        No scheduled tasks needed - direct WPF execution
+        Runs the WPF dialog in a separate PowerShell process to isolate WPF Dispatcher
+        lifecycle from the parent script. Communicates result via temp file.
     #>
     param(
         [string]$Question,
@@ -1550,257 +1549,163 @@ function Show-DirectUserDialog {
         [int]$TimeoutSeconds = 60,
         [string]$DefaultAction = "Cancel"
     )
-    
+
     try {
-        Write-Log -Message "Showing direct user dialog: '$Question'" | Out-Null
-        
-        # Load WPF assemblies
-        Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
-        Add-Type -AssemblyName PresentationCore -ErrorAction Stop
-        Add-Type -AssemblyName WindowsBase -ErrorAction Stop
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        
-        # Create modern dark-themed XAML dialog
-        $xaml = @"
-<Window
-    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="$Title"
-    Width="420"
-    MinHeight="140"
-    SizeToContent="Height"
-    WindowStartupLocation="Manual"
-    ResizeMode="NoResize"
-    WindowStyle="None"
-    AllowsTransparency="True"
-    Background="Transparent"
-    Topmost="True"
-    ShowInTaskbar="False">
-    
+        Write-Log -Message "Showing direct user dialog via child process: '$Title'" | Out-Null
+
+        $resultFile = Join-Path $env:TEMP "WingetDialog_$([guid]::NewGuid().ToString('N')).txt"
+
+        # Build the child process script using literal here-string (no nested quote issues)
+        $dialogScript = @'
+param($Title, $Question, $TimeoutSeconds, $DefaultAction, $ResultFile)
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+
+# Detect system theme (0 = dark, 1 = light)
+$isDark = $true
+try {
+    $themeVal = Get-ItemPropertyValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name 'AppsUseLightTheme' -ErrorAction Stop
+    if ($themeVal -eq 1) { $isDark = $false }
+} catch {}
+
+if ($isDark) {
+    $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $titleFg = "White"
+    $questionFg = "#FFCCCCCC"; $shadowOpacity = "0.6"
+    $cancelFg = "#FFCCCCCC"; $cancelBorder = "#FF484848"; $closeFg = "#FF888888"
+} else {
+    $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $titleFg = "#FF1B1B1B"
+    $questionFg = "#FF444444"; $shadowOpacity = "0.25"
+    $cancelFg = "#FF444444"; $cancelBorder = "#FFB0B0B0"; $closeFg = "#FF999999"
+}
+
+$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Dialog" Width="420" MinHeight="140" SizeToContent="Height" WindowStartupLocation="Manual"
+    ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
     <Window.Triggers>
         <EventTrigger RoutedEvent="Window.Loaded">
-            <BeginStoryboard>
-                <Storyboard>
-                    <DoubleAnimation Storyboard.TargetProperty="Opacity"
-                                     From="0" To="1" Duration="0:0:0.3"/>
-                    <ThicknessAnimation Storyboard.TargetProperty="Margin"
-                                        From="0,50,0,0" To="0,0,0,0" Duration="0:0:0.3"/>
-                </Storyboard>
-            </BeginStoryboard>
+            <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetProperty="Opacity" From="0" To="1" Duration="0:0:0.3"/></Storyboard></BeginStoryboard>
         </EventTrigger>
     </Window.Triggers>
-    
-    <Border Name="MainBorder"
-            Background="#FF1F1F1F"
-            CornerRadius="8"
-            BorderBrush="#FF323232"
-            BorderThickness="1">
-        <Border.Effect>
-            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
-        </Border.Effect>
-        
-        <Grid Margin="16,12,16,12">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="32"/>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="Auto"/>
-            </Grid.ColumnDefinitions>
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
-            
-            <!-- Icon -->
-            <Ellipse Grid.Column="0" Grid.RowSpan="2"
-                     Width="24" Height="24"
-                     Fill="#FF0078D4"
-                     VerticalAlignment="Top"
-                     Margin="0,2,0,0"/>
-            
-            <TextBlock Grid.Column="0" Grid.RowSpan="2"
-                       Text="?"
-                       Foreground="White"
-                       FontSize="14"
-                       FontWeight="Bold"
-                       HorizontalAlignment="Center"
-                       VerticalAlignment="Top"
-                       Margin="0,4,0,0"/>
-            
-            <!-- Title -->
-            <TextBlock Grid.Column="1" Grid.Row="0"
-                       Text="$Title"
-                       Foreground="White"
-                       FontSize="14"
-                       FontWeight="SemiBold"
-                       Margin="12,0,0,2"
-                       TextWrapping="Wrap"/>
-            
-            <!-- Question -->
-            <TextBlock Grid.Column="1" Grid.Row="1"
-                       Text="$Question"
-                       Foreground="#FFCCCCCC"
-                       FontSize="12"
-                       Margin="12,0,0,8"
-                       TextWrapping="Wrap"/>
-            
-            <!-- Buttons -->
-            <StackPanel Grid.Column="1" Grid.Row="2"
-                        Orientation="Horizontal"
-                        HorizontalAlignment="Right"
-                        Margin="12,0,0,0">
-                
-                <Button Name="CancelButton"
-                        Content="Cancel"
-                        Width="60"
-                        Height="24"
-                        Margin="0,0,8,0"
-                        Background="Transparent"
-                        Foreground="#FFCCCCCC"
-                        BorderBrush="#FF484848"
-                        BorderThickness="1"
-                        FontSize="11"
-                        Cursor="Hand">
-                    <Button.Style>
-                        <Style TargetType="Button">
-                            <Style.Triggers>
-                                <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter Property="Background" Value="#FF2A2A2A"/>
-                                    <Setter Property="Foreground" Value="White"/>
-                                </Trigger>
-                            </Style.Triggers>
-                        </Style>
-                    </Button.Style>
-                </Button>
-                
-                <Button Name="OKButton"
-                        Content="OK"
-                        Width="60"
-                        Height="24"
-                        Background="#FF0078D4"
-                        Foreground="White"
-                        BorderBrush="Transparent"
-                        BorderThickness="0"
-                        FontSize="11"
-                        Cursor="Hand">
-                    <Button.Style>
-                        <Style TargetType="Button">
-                            <Style.Triggers>
-                                <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter Property="Background" Value="#FF106EBE"/>
-                                </Trigger>
-                            </Style.Triggers>
-                        </Style>
-                    </Button.Style>
-                </Button>
-                
-            </StackPanel>
+    <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
+        <Border.Effect><DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/></Border.Effect>
+        <Grid>
+            <!-- Close button top-right -->
+            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0"
+                    Background="Transparent" Foreground="$closeFg" BorderThickness="0" FontSize="13" Cursor="Hand" FontFamily="Segoe UI Symbol"/>
+            <Grid Margin="16,12,16,12">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="32"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <Ellipse Grid.Column="0" Grid.RowSpan="2" Width="24" Height="24" Fill="#FF0078D4" VerticalAlignment="Top" Margin="0,2,0,0"/>
+                <TextBlock Grid.Column="0" Grid.RowSpan="2" Text="?" Foreground="White" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,4,0,0"/>
+                <TextBlock Name="TitleText" Grid.Column="1" Grid.Row="0" Foreground="$titleFg" FontSize="14" FontWeight="SemiBold" Margin="12,0,0,2" TextWrapping="Wrap"/>
+                <TextBlock Name="QuestionText" Grid.Column="1" Grid.Row="1" Foreground="$questionFg" FontSize="12" Margin="12,0,0,8" TextWrapping="Wrap"/>
+                <StackPanel Grid.Column="1" Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="12,0,0,0">
+                    <Button Name="CancelButton" Content="Cancel" Width="80" Height="28" Margin="0,0,8,0" Background="Transparent" Foreground="$cancelFg" BorderBrush="$cancelBorder" BorderThickness="1" FontSize="11" Cursor="Hand"/>
+                    <Button Name="OKButton" Content="OK" Width="80" Height="28" Background="#FF0078D4" Foreground="White" BorderBrush="Transparent" BorderThickness="0" FontSize="11" Cursor="Hand"/>
+                </StackPanel>
+            </Grid>
         </Grid>
     </Border>
 </Window>
 "@
 
-        # Create window from XAML
-        $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
-        $window = [Windows.Markup.XamlReader]::Load($reader)
-        
-        # Get button references
-        $okButton = $window.FindName("OKButton")
-        $cancelButton = $window.FindName("CancelButton")
-        
-        # Set up result handling
-        $script:dialogResult = $DefaultAction
-        
-        # Store original button text and determine which button gets countdown (SAME AS SYSTEM CONTEXT)
-        $originalOKText = $okButton.Content
-        $originalCancelText = $cancelButton.Content
-        $showCountdownOnOK = ($DefaultAction -eq "OK")
-        
-        Write-Log -Message "Countdown will be shown on: $(if ($showCountdownOnOK) { 'OK' } else { 'Cancel' }) button (DefaultAction: $DefaultAction)" | Out-Null
-        
-        # Create countdown timer (updates every second) - SAME AS SYSTEM CONTEXT
-        $script:timeRemaining = $TimeoutSeconds
-        $countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
-        $countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
-        
-        $countdownTimer.Add_Tick({
-            $script:timeRemaining--
-            Write-Log -Message "Countdown update: $($script:timeRemaining) seconds remaining" | Out-Null
-            
-            # Update the appropriate button with countdown
-            if ($showCountdownOnOK) {
-                $okButton.Content = "$originalOKText ($($script:timeRemaining))"
-            } else {
-                $cancelButton.Content = "$originalCancelText ($($script:timeRemaining))"
-            }
-            
-            # Stop countdown timer when we reach zero (main timeout timer will handle dialog close)
-            if ($script:timeRemaining -le 0) {
-                $countdownTimer.Stop()
-            }
-        })
-        
-        # Create main timeout timer - SAME AS SYSTEM CONTEXT
-        $timer = New-Object System.Windows.Threading.DispatcherTimer
-        $timer.Interval = [System.TimeSpan]::FromSeconds($TimeoutSeconds)
-        
-        $timer.Add_Tick({
-            Write-Log -Message "Direct dialog timeout reached - using default action: $DefaultAction" | Out-Null
-            $script:dialogResult = $DefaultAction
-            $timer.Stop()
-            $countdownTimer.Stop()
-            $window.Close()
-        })
-        
-        # Button event handlers - SAME AS SYSTEM CONTEXT
-        $okButton.Add_Click({
-            Write-Log -Message "OK button clicked in direct dialog" | Out-Null
-            $timer.Stop()
-            $countdownTimer.Stop()
-            $script:dialogResult = "OK"
-            $window.Close()
-        })
-        
-        $cancelButton.Add_Click({
-            Write-Log -Message "Cancel button clicked in direct dialog" | Out-Null
-            $timer.Stop()
-            $countdownTimer.Stop()
-            $script:dialogResult = "Cancel"
-            $window.Close()
-        })
-        
-        # Handle window closing without button click - SAME AS SYSTEM CONTEXT
-        $window.Add_Closing({
-            $timer.Stop()
-            $countdownTimer.Stop()
-            if ($script:dialogResult -eq $null) {
-                Write-Log -Message "Direct dialog closed without button click - treating as Cancel" | Out-Null
-                $script:dialogResult = "Cancel"
-            }
-        })
-        
-        # Position window like a native Windows toast notification
-        $window.Add_Loaded({
-            $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-            $taskbarHeight = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height - $workArea.Height
-            
-            # Position at bottom-right (near notification area)
-            $window.Left = $workArea.Width - $window.Width - 16
-            $window.Top = $workArea.Height - $window.Height - 16
-            Write-Log -Message "Direct dialog positioned at bottom-right (near notification area)" | Out-Null
-        })
-        
-        # Start both timers and show dialog - SAME AS SYSTEM CONTEXT
-        $timer.Start()
-        $countdownTimer.Start()
-        Write-Log -Message "Direct dialog: Timeout and countdown timers started" | Out-Null
-        $result = $window.ShowDialog()
-        $timer.Stop()
-        $countdownTimer.Stop()
-        
-        Write-Log -Message "Direct dialog completed with result: $($script:dialogResult)" | Out-Null
-        return $script:dialogResult
-        
+$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+$window = [Windows.Markup.XamlReader]::Load($reader)
+
+# Set text programmatically (avoids XML escaping issues)
+$window.Title = $Title
+$window.FindName("TitleText").Text = $Title
+$window.FindName("QuestionText").Text = $Question
+
+# Position at bottom-right like a notification
+$window.Add_Loaded({
+    $workArea = [System.Windows.SystemParameters]::WorkArea
+    $window.Left = $workArea.Right - $window.ActualWidth - 16
+    $window.Top = $workArea.Bottom - $window.ActualHeight - 16
+})
+
+$okButton = $window.FindName("OKButton")
+$cancelButton = $window.FindName("CancelButton")
+$closeButton = $window.FindName("CloseButton")
+
+# Shared state hashtable — reference type accessible from all event handlers
+$s = @{
+    result = $DefaultAction
+    timeRemaining = [int]$TimeoutSeconds
+    countOnOK = ($DefaultAction -eq "OK")
+    origOK = $okButton.Content
+    origCancel = $cancelButton.Content
+}
+
+$countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
+$countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
+$countdownTimer.Add_Tick({
+    $s.timeRemaining--
+    if ($s.countOnOK) { $okButton.Content = "$($s.origOK) ($($s.timeRemaining))" }
+    else { $cancelButton.Content = "$($s.origCancel) ($($s.timeRemaining))" }
+    if ($s.timeRemaining -le 0) { $countdownTimer.Stop() }
+}.GetNewClosure())
+
+$timer = New-Object System.Windows.Threading.DispatcherTimer
+$timer.Interval = [System.TimeSpan]::FromSeconds([int]$TimeoutSeconds)
+$timer.Add_Tick({
+    $s.result = $DefaultAction
+    $timer.Stop(); $countdownTimer.Stop()
+    $window.Close()
+}.GetNewClosure())
+
+$okButton.Add_Click({
+    $s.result = "OK"
+    $timer.Stop(); $countdownTimer.Stop()
+    $window.Close()
+}.GetNewClosure())
+$cancelButton.Add_Click({
+    $s.result = "Cancel"
+    $timer.Stop(); $countdownTimer.Stop()
+    $window.Close()
+}.GetNewClosure())
+$closeButton.Add_Click({
+    $s.result = "Cancel"
+    $timer.Stop(); $countdownTimer.Stop()
+    $window.Close()
+}.GetNewClosure())
+$window.Add_Closing({
+    $timer.Stop(); $countdownTimer.Stop()
+    if (-not $s.result) { $s.result = "Cancel" }
+}.GetNewClosure())
+
+$timer.Start()
+$countdownTimer.Start()
+$window.ShowDialog()
+$s.result | Out-File -FilePath $ResultFile -Encoding UTF8 -NoNewline
+'@
+
+        # Find PowerShell executable
+        $pwsh = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
+
+        # Write dialog script to temp file (avoids command-line escaping issues)
+        $scriptFile = Join-Path $env:TEMP "WingetDialog_$([guid]::NewGuid().ToString('N')).ps1"
+        $dialogScript | Out-File -FilePath $scriptFile -Encoding UTF8
+
+        Write-Log -Message "Launching dialog child process ($pwsh) from $scriptFile" | Out-Null
+
+        # Run dialog in child process - pass params via -File
+        # Start-Process -WindowStyle Hidden hides the console; WPF Topmost window shows independently
+        $proc = Start-Process $pwsh -ArgumentList "-NoProfile", "-STA", "-File", "`"$scriptFile`"", "-Title", "`"$Title`"", "-Question", "`"$Question`"", "-TimeoutSeconds", $TimeoutSeconds, "-DefaultAction", $DefaultAction, "-ResultFile", "`"$resultFile`"" -PassThru -WindowStyle Hidden
+        $proc.WaitForExit()
+        Remove-Item $scriptFile -Force -ErrorAction SilentlyContinue
+
+        # Read result
+        if (Test-Path $resultFile) {
+            $response = (Get-Content $resultFile -Raw).Trim()
+            Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
+            Write-Log -Message "Dialog child process returned: $response" | Out-Null
+            return $response
+        } else {
+            Write-Log -Message "Dialog child process produced no result file, using default: $DefaultAction" | Out-Null
+            return $DefaultAction
+        }
+
     } catch {
         Write-Log -Message "Error in direct user dialog: $($_.Exception.Message)" | Out-Null
         return $DefaultAction
@@ -1912,8 +1817,7 @@ try {
     Add-Type -AssemblyName WindowsBase -ErrorAction Stop
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
 
-    $screen = [System.Windows.Forms.Screen]::PrimaryScreen
-    $workArea = $screen.WorkingArea
+    $workArea = [System.Windows.SystemParameters]::WorkArea
 
     $escapedAppName = [System.Security.SecurityElement]::Escape($AppDisplayName)
     $versionXml = ""
@@ -2373,148 +2277,128 @@ function Show-CompletionNotification {
 function Show-DirectCompletionNotification {
     <#
     .SYNOPSIS
-        Direct user context completion notification
+        Direct user context completion notification via child process
+    .DESCRIPTION
+        Runs the WPF notification in a separate PowerShell process to isolate WPF Dispatcher
+        lifecycle from the parent script.
     #>
     param(
         [string]$AppName
     )
 
     try {
-        Write-Log "Showing completion notification for $AppName" | Out-Null
+        Write-Log "Showing completion notification for $AppName via child process" | Out-Null
 
-        # Load WPF assemblies
-        Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
-        Add-Type -AssemblyName PresentationCore -ErrorAction Stop
-        Add-Type -AssemblyName WindowsBase -ErrorAction Stop
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $dialogScript = @'
+param($AppName, $ResultFile)
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-        # Create XAML dialog matching the existing dialog style
-        $messageText = "$AppName has been successfully updated."
-        $xaml = @"
-<Window
-    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="Update Complete"
-    Width="420"
-    MinHeight="140"
-    SizeToContent="Height"
-    WindowStartupLocation="Manual"
-    ResizeMode="NoResize"
-    WindowStyle="None"
-    AllowsTransparency="True"
-    Background="Transparent"
-    Topmost="True"
-    ShowInTaskbar="False">
+# Detect system theme (0 = dark, 1 = light)
+$isDark = $true
+try {
+    $themeVal = Get-ItemPropertyValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name 'AppsUseLightTheme' -ErrorAction Stop
+    if ($themeVal -eq 1) { $isDark = $false }
+} catch {}
 
+if ($isDark) {
+    $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $titleFg = "White"
+    $msgFg = "#FFCCCCCC"; $shadowOpacity = "0.6"; $countdownFg = "#FF888888"; $closeFg = "#FF888888"
+} else {
+    $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $titleFg = "#FF1B1B1B"
+    $msgFg = "#FF444444"; $shadowOpacity = "0.25"; $countdownFg = "#FF999999"; $closeFg = "#FF999999"
+}
+
+$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Update Complete" Width="420" MinHeight="140" SizeToContent="Height" WindowStartupLocation="Manual"
+    ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
     <Window.Triggers>
         <EventTrigger RoutedEvent="Window.Loaded">
-            <BeginStoryboard>
-                <Storyboard>
-                    <DoubleAnimation Storyboard.TargetProperty="Opacity"
-                                     From="0" To="1" Duration="0:0:0.3"/>
-                    <ThicknessAnimation Storyboard.TargetProperty="Margin"
-                                        From="0,50,0,0" To="0,0,0,0" Duration="0:0:0.3"/>
-                </Storyboard>
-            </BeginStoryboard>
+            <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetProperty="Opacity" From="0" To="1" Duration="0:0:0.3"/></Storyboard></BeginStoryboard>
         </EventTrigger>
     </Window.Triggers>
-
-    <Border Name="MainBorder"
-            Background="#FF1F1F1F"
-            CornerRadius="8"
-            BorderBrush="#FF323232"
-            BorderThickness="1">
-        <Border.Effect>
-            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
-        </Border.Effect>
-
-        <Grid Margin="16,12,16,12">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="32"/>
-                <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
-
-            <!-- Icon (info/success indicator) -->
-            <Ellipse Grid.Column="0" Grid.RowSpan="2"
-                     Width="24" Height="24"
-                     Fill="#FF107C10"
-                     VerticalAlignment="Top"
-                     Margin="0,2,0,0"/>
-
-            <Path Grid.Column="0" Grid.RowSpan="2"
-                  Data="M9,16.17L4.83,12l-1.42,1.41L9,19L21,7l-1.41-1.41L9,16.17z"
-                  Fill="White"
-                  Stretch="Uniform"
-                  Width="14"
-                  Height="14"
-                  HorizontalAlignment="Center"
-                  VerticalAlignment="Top"
-                  Margin="0,7,0,0"/>
-
-            <!-- Title -->
-            <TextBlock Grid.Column="1" Grid.Row="0"
-                       Text="Update Complete"
-                       Foreground="White"
-                       FontSize="14"
-                       FontWeight="SemiBold"
-                       Margin="12,0,0,2"
-                       TextWrapping="Wrap"/>
-
-            <!-- Message -->
-            <TextBlock Grid.Column="1" Grid.Row="1"
-                       Text="$messageText"
-                       Foreground="#FFCCCCCC"
-                       FontSize="12"
-                       Margin="12,0,0,8"
-                       TextWrapping="Wrap"/>
-
-            <!-- Countdown -->
-            <TextBlock Grid.Column="1" Grid.Row="2"
-                       Foreground="#FF888888"
-                       FontSize="11"
-                       Margin="12,4,0,0"
-                       HorizontalAlignment="Right">
-                <Run Text="Closing in "/>
-                <Run Name="CountdownText" Text="5"/>
-                <Run Text="s"/>
-            </TextBlock>
+    <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
+        <Border.Effect><DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/></Border.Effect>
+        <Grid>
+            <!-- Close button top-right -->
+            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0"
+                    Background="Transparent" Foreground="$closeFg" BorderThickness="0" FontSize="13" Cursor="Hand" FontFamily="Segoe UI Symbol"/>
+            <Grid Margin="16,12,16,12">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="32"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <Ellipse Grid.Column="0" Grid.RowSpan="2" Width="24" Height="24" Fill="#FF107C10" VerticalAlignment="Top" Margin="0,2,0,0"/>
+                <Path Grid.Column="0" Grid.RowSpan="2" Data="M9,16.17L4.83,12l-1.42,1.41L9,19L21,7l-1.41-1.41L9,16.17z" Fill="White" Stretch="Uniform" Width="14" Height="14" HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,7,0,0"/>
+                <TextBlock Name="TitleText" Grid.Column="1" Grid.Row="0" Foreground="$titleFg" FontSize="14" FontWeight="SemiBold" Margin="12,0,0,2" TextWrapping="Wrap"/>
+                <TextBlock Name="MessageText" Grid.Column="1" Grid.Row="1" Foreground="$msgFg" FontSize="12" Margin="12,0,0,8" TextWrapping="Wrap"/>
+                <TextBlock Name="CountdownBlock" Grid.Column="1" Grid.Row="2" Foreground="$countdownFg" FontSize="11" Margin="12,4,0,0" HorizontalAlignment="Right"/>
+            </Grid>
         </Grid>
     </Border>
 </Window>
 "@
 
-        $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]$xaml)
-        $window = [Windows.Markup.XamlReader]::Load($reader)
-        $countdownRun = $window.FindName("CountdownText")
+$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+$window = [Windows.Markup.XamlReader]::Load($reader)
 
-        # Position window in bottom-right corner like system notifications
-        $window.Add_Loaded({
-            $screen = [System.Windows.Forms.Screen]::PrimaryScreen
-            $window.Left = $screen.WorkingArea.Right - $window.ActualWidth - 20
-            $window.Top = $screen.WorkingArea.Bottom - $window.ActualHeight - 20
-        })
+# Set text programmatically (avoids XML escaping issues)
+$window.FindName("TitleText").Text = "Update Complete"
+$window.FindName("MessageText").Text = "$AppName has been successfully updated."
+$countdownBlock = $window.FindName("CountdownBlock")
+$closeButton = $window.FindName("CloseButton")
 
-        # Create timer to auto-close after 5 seconds
-        $script:remainingSeconds = 5
-        $timer = New-Object System.Windows.Threading.DispatcherTimer
-        $timer.Interval = [TimeSpan]::FromSeconds(1)
-        $timer.Add_Tick({
-            $script:remainingSeconds--
-            $countdownRun.Text = $script:remainingSeconds.ToString()
-            if ($script:remainingSeconds -le 0) {
-                $timer.Stop()
-                $window.Close()
-            }
-        })
-        $timer.Start()
+# Position at bottom-right like a notification
+$window.Add_Loaded({
+    $workArea = [System.Windows.SystemParameters]::WorkArea
+    $window.Left = $workArea.Right - $window.ActualWidth - 16
+    $window.Top = $workArea.Bottom - $window.ActualHeight - 16
+})
 
-        # Show dialog (will auto-close)
-        $window.ShowDialog() | Out-Null
+# Shared state hashtable
+$s = @{ timeRemaining = 5 }
+
+$countdownBlock.Text = "Closing in $($s.timeRemaining)s"
+
+$timer = New-Object System.Windows.Threading.DispatcherTimer
+$timer.Interval = [System.TimeSpan]::FromSeconds(1)
+$timer.Add_Tick({
+    $s.timeRemaining--
+    $countdownBlock.Text = "Closing in $($s.timeRemaining)s"
+    if ($s.timeRemaining -le 0) {
+        $timer.Stop()
+        $window.Close()
+    }
+}.GetNewClosure())
+
+$closeButton.Add_Click({
+    $timer.Stop()
+    $window.Close()
+}.GetNewClosure())
+
+$window.Add_Closing({
+    $timer.Stop()
+}.GetNewClosure())
+
+$timer.Start()
+$window.ShowDialog()
+"done" | Out-File -FilePath $ResultFile -Encoding UTF8 -NoNewline
+'@
+
+        # Find PowerShell executable
+        $pwsh = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
+
+        # Write dialog script to temp file
+        $scriptFile = Join-Path $env:TEMP "WingetDialog_$([guid]::NewGuid().ToString('N')).ps1"
+        $resultFile = Join-Path $env:TEMP "WingetDialog_$([guid]::NewGuid().ToString('N')).txt"
+        $dialogScript | Out-File -FilePath $scriptFile -Encoding UTF8
+
+        Write-Log "Launching completion notification child process ($pwsh) from $scriptFile" | Out-Null
+
+        $proc = Start-Process $pwsh -ArgumentList "-NoProfile", "-STA", "-File", "`"$scriptFile`"", "-AppName", "`"$AppName`"", "-ResultFile", "`"$resultFile`"" -PassThru -WindowStyle Hidden
+        $proc.WaitForExit()
+        Remove-Item $scriptFile -Force -ErrorAction SilentlyContinue
+        Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
+
+        Write-Log "Completion notification child process finished" | Out-Null
 
     } catch {
         Write-Log "Error in Show-DirectCompletionNotification: $($_.Exception.Message)" | Out-Null
@@ -2785,224 +2669,160 @@ function Show-MandatoryUpdateDialog {
 function Show-DirectMandatoryUpdateDialog {
     <#
     .SYNOPSIS
-        Direct user context mandatory update dialog with only Continue button
+        Direct user context mandatory update dialog via child process
+    .DESCRIPTION
+        Runs the WPF dialog in a separate PowerShell process to isolate WPF Dispatcher
+        lifecycle from the parent script. Communicates result via temp file.
     #>
     param(
         [string]$Question,
         [string]$Title,
         [int]$TimeoutSeconds = 60
     )
-    
+
     try {
-        Write-Log "Showing direct mandatory update dialog: '$Question'" | Out-Null
-        
-        # Load WPF assemblies
-        Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
-        Add-Type -AssemblyName PresentationCore -ErrorAction Stop
-        Add-Type -AssemblyName WindowsBase -ErrorAction Stop
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        
-        # Create modern dark-themed XAML dialog with only Continue button
-        $xaml = @"
-<Window
-    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="$Title"
-    Width="420"
-    MinHeight="140"
-    SizeToContent="Height"
-    WindowStartupLocation="Manual"
-    ResizeMode="NoResize"
-    WindowStyle="None"
-    AllowsTransparency="True"
-    Background="Transparent"
-    Topmost="True"
-    ShowInTaskbar="False">
-    
+        Write-Log "Showing direct mandatory update dialog via child process: '$Title'" | Out-Null
+
+        $resultFile = Join-Path $env:TEMP "WingetDialog_$([guid]::NewGuid().ToString('N')).txt"
+
+        $dialogScript = @'
+param($Title, $Question, $TimeoutSeconds, $ResultFile)
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+
+# Detect system theme (0 = dark, 1 = light)
+$isDark = $true
+try {
+    $themeVal = Get-ItemPropertyValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name 'AppsUseLightTheme' -ErrorAction Stop
+    if ($themeVal -eq 1) { $isDark = $false }
+} catch {}
+
+if ($isDark) {
+    $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $titleFg = "White"
+    $questionFg = "#FFCCCCCC"; $shadowOpacity = "0.6"; $closeFg = "#FF888888"
+    $btnBg = "#FFFF6B00"; $btnHover = "#FFE55A00"
+} else {
+    $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $titleFg = "#FF1B1B1B"
+    $questionFg = "#FF444444"; $shadowOpacity = "0.25"; $closeFg = "#FF999999"
+    $btnBg = "#FFFF6B00"; $btnHover = "#FFE55A00"
+}
+
+$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Dialog" Width="420" MinHeight="140" SizeToContent="Height" WindowStartupLocation="Manual"
+    ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
     <Window.Triggers>
         <EventTrigger RoutedEvent="Window.Loaded">
-            <BeginStoryboard>
-                <Storyboard>
-                    <DoubleAnimation Storyboard.TargetProperty="Opacity"
-                                     From="0" To="1" Duration="0:0:0.3"/>
-                    <ThicknessAnimation Storyboard.TargetProperty="Margin"
-                                        From="0,50,0,0" To="0,0,0,0" Duration="0:0:0.3"/>
-                </Storyboard>
-            </BeginStoryboard>
+            <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetProperty="Opacity" From="0" To="1" Duration="0:0:0.3"/></Storyboard></BeginStoryboard>
         </EventTrigger>
     </Window.Triggers>
-    
-    <Border Name="MainBorder"
-            Background="#FF1F1F1F"
-            CornerRadius="8"
-            BorderBrush="#FF323232"
-            BorderThickness="1">
-        <Border.Effect>
-            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
-        </Border.Effect>
-        
-        <Grid Margin="16,12,16,12">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="32"/>
-                <ColumnDefinition Width="*"/>
-            </Grid.ColumnDefinitions>
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
-            
-            <!-- Icon -->
-            <Ellipse Grid.Column="0" Grid.RowSpan="2"
-                     Width="24" Height="24"
-                     Fill="#FFFF6B00"
-                     VerticalAlignment="Top"
-                     Margin="0,2,0,0"/>
-            
-            <TextBlock Grid.Column="0" Grid.RowSpan="2"
-                       Text="!"
-                       Foreground="White"
-                       FontSize="14"
-                       FontWeight="Bold"
-                       HorizontalAlignment="Center"
-                       VerticalAlignment="Top"
-                       Margin="0,4,0,0"/>
-            
-            <!-- Title -->
-            <TextBlock Grid.Column="1" Grid.Row="0"
-                       Text="$Title"
-                       Foreground="White"
-                       FontSize="14"
-                       FontWeight="SemiBold"
-                       Margin="12,0,0,2"
-                       TextWrapping="Wrap"/>
-            
-            <!-- Question -->
-            <TextBlock Grid.Column="1" Grid.Row="1"
-                       Text="$Question"
-                       Foreground="#FFCCCCCC"
-                       FontSize="12"
-                       Margin="12,0,0,8"
-                       TextWrapping="Wrap"/>
-            
-            <!-- Button -->
-            <StackPanel Grid.Column="1" Grid.Row="2"
-                        Orientation="Horizontal"
-                        HorizontalAlignment="Right"
-                        Margin="12,0,0,0">
-                
-                <Button Name="ContinueButton"
-                        Content="Continue"
-                        Width="80"
-                        Height="24"
-                        Background="#FFFF6B00"
-                        Foreground="White"
-                        BorderBrush="Transparent"
-                        BorderThickness="0"
-                        FontSize="11"
-                        Cursor="Hand"
-                        IsDefault="true">
-                    <Button.Style>
-                        <Style TargetType="Button">
-                            <Style.Triggers>
-                                <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter Property="Background" Value="#FFE55A00"/>
-                                </Trigger>
-                            </Style.Triggers>
-                        </Style>
-                    </Button.Style>
-                </Button>
-                
-            </StackPanel>
+    <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
+        <Border.Effect><DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/></Border.Effect>
+        <Grid>
+            <!-- Close button top-right -->
+            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0"
+                    Background="Transparent" Foreground="$closeFg" BorderThickness="0" FontSize="13" Cursor="Hand" FontFamily="Segoe UI Symbol"/>
+            <Grid Margin="16,12,16,12">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="32"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <Ellipse Grid.Column="0" Grid.RowSpan="2" Width="24" Height="24" Fill="$btnBg" VerticalAlignment="Top" Margin="0,2,0,0"/>
+                <TextBlock Grid.Column="0" Grid.RowSpan="2" Text="!" Foreground="White" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,4,0,0"/>
+                <TextBlock Name="TitleText" Grid.Column="1" Grid.Row="0" Foreground="$titleFg" FontSize="14" FontWeight="SemiBold" Margin="12,0,0,2" TextWrapping="Wrap"/>
+                <TextBlock Name="QuestionText" Grid.Column="1" Grid.Row="1" Foreground="$questionFg" FontSize="12" Margin="12,0,0,8" TextWrapping="Wrap"/>
+                <StackPanel Grid.Column="1" Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="12,0,0,0">
+                    <Button Name="ContinueButton" Content="Continue" Width="80" Height="24" Background="$btnBg" Foreground="White" BorderBrush="Transparent" BorderThickness="0" FontSize="11" Cursor="Hand"/>
+                </StackPanel>
+            </Grid>
         </Grid>
     </Border>
 </Window>
 "@
 
-        # Create window from XAML
-        $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
-        $window = [Windows.Markup.XamlReader]::Load($reader)
-        
-        # Get button reference
-        $continueButton = $window.FindName("ContinueButton")
-        
-        # Set up result handling
-        $script:dialogResult = "Continue"
-        
-        # Store original button text for countdown
-        $originalButtonText = $continueButton.Content
-        
-        # Create countdown timer (updates every second)
-        $script:timeRemaining = $TimeoutSeconds
-        $countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
-        $countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
-        
-        $countdownTimer.Add_Tick({
-            $script:timeRemaining--
-            Write-Log "Mandatory dialog countdown: $($script:timeRemaining) seconds remaining" | Out-Null
-            
-            # Update button with countdown
-            $continueButton.Content = "$originalButtonText ($($script:timeRemaining))"
-            
-            # Stop countdown timer when we reach zero
-            if ($script:timeRemaining -le 0) {
-                $countdownTimer.Stop()
-            }
-        })
-        
-        # Create main timeout timer
-        $timer = New-Object System.Windows.Threading.DispatcherTimer
-        $timer.Interval = [System.TimeSpan]::FromSeconds($TimeoutSeconds)
-        
-        $timer.Add_Tick({
-            Write-Log "Mandatory dialog timeout reached - auto-continuing" | Out-Null
-            $script:dialogResult = "Continue"
-            $timer.Stop()
-            $countdownTimer.Stop()
-            $window.Close()
-        })
-        
-        # Button event handler
-        $continueButton.Add_Click({
-            Write-Log "Continue button clicked in mandatory dialog" | Out-Null
-            $timer.Stop()
-            $countdownTimer.Stop()
-            $script:dialogResult = "Continue"
-            $window.Close()
-        })
-        
-        # Handle window closing
-        $window.Add_Closing({
-            $timer.Stop()
-            $countdownTimer.Stop()
-            if ($script:dialogResult -eq $null) {
-                Write-Log "Mandatory dialog closed without button click - continuing anyway" | Out-Null
-                $script:dialogResult = "Continue"
-            }
-        })
-        
-        # Position window like a native Windows toast notification
-        $window.Add_Loaded({
-            $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-            
-            # Position at bottom-right (near notification area)
-            $window.Left = $workArea.Width - $window.Width - 16
-            $window.Top = $workArea.Height - $window.Height - 16
-            Write-Log "Mandatory dialog positioned at bottom-right" | Out-Null
-        })
-        
-        # Start both timers and show dialog
-        $timer.Start()
-        $countdownTimer.Start()
-        Write-Log "Mandatory dialog: Timeout and countdown timers started" | Out-Null
-        $window.Activate()
-        $result = $window.ShowDialog()
-        $timer.Stop()
-        $countdownTimer.Stop()
-        
-        Write-Log "Mandatory dialog completed with result: $($script:dialogResult)" | Out-Null
-        return $script:dialogResult
-        
+$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+$window = [Windows.Markup.XamlReader]::Load($reader)
+
+# Set text programmatically (avoids XML escaping issues)
+$window.Title = $Title
+$window.FindName("TitleText").Text = $Title
+$window.FindName("QuestionText").Text = $Question
+
+# Position at bottom-right like a notification
+$window.Add_Loaded({
+    $workArea = [System.Windows.SystemParameters]::WorkArea
+    $window.Left = $workArea.Right - $window.ActualWidth - 16
+    $window.Top = $workArea.Bottom - $window.ActualHeight - 16
+})
+
+$continueButton = $window.FindName("ContinueButton")
+$closeButton = $window.FindName("CloseButton")
+
+# Shared state hashtable
+$s = @{
+    result = "Continue"
+    timeRemaining = [int]$TimeoutSeconds
+    origButton = $continueButton.Content
+}
+
+$countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
+$countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
+$countdownTimer.Add_Tick({
+    $s.timeRemaining--
+    $continueButton.Content = "$($s.origButton) ($($s.timeRemaining))"
+    if ($s.timeRemaining -le 0) { $countdownTimer.Stop() }
+}.GetNewClosure())
+
+$timer = New-Object System.Windows.Threading.DispatcherTimer
+$timer.Interval = [System.TimeSpan]::FromSeconds([int]$TimeoutSeconds)
+$timer.Add_Tick({
+    $s.result = "Continue"
+    $timer.Stop(); $countdownTimer.Stop()
+    $window.Close()
+}.GetNewClosure())
+
+$continueButton.Add_Click({
+    $s.result = "Continue"
+    $timer.Stop(); $countdownTimer.Stop()
+    $window.Close()
+}.GetNewClosure())
+$closeButton.Add_Click({
+    $s.result = "Continue"
+    $timer.Stop(); $countdownTimer.Stop()
+    $window.Close()
+}.GetNewClosure())
+$window.Add_Closing({
+    $timer.Stop(); $countdownTimer.Stop()
+    if (-not $s.result) { $s.result = "Continue" }
+}.GetNewClosure())
+
+$timer.Start()
+$countdownTimer.Start()
+$window.ShowDialog()
+$s.result | Out-File -FilePath $ResultFile -Encoding UTF8 -NoNewline
+'@
+
+        # Find PowerShell executable
+        $pwsh = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
+
+        # Write dialog script to temp file
+        $scriptFile = Join-Path $env:TEMP "WingetDialog_$([guid]::NewGuid().ToString('N')).ps1"
+        $dialogScript | Out-File -FilePath $scriptFile -Encoding UTF8
+
+        Write-Log "Launching mandatory dialog child process ($pwsh) from $scriptFile" | Out-Null
+
+        $proc = Start-Process $pwsh -ArgumentList "-NoProfile", "-STA", "-File", "`"$scriptFile`"", "-Title", "`"$Title`"", "-Question", "`"$Question`"", "-TimeoutSeconds", $TimeoutSeconds, "-ResultFile", "`"$resultFile`"" -PassThru -WindowStyle Hidden
+        $proc.WaitForExit()
+        Remove-Item $scriptFile -Force -ErrorAction SilentlyContinue
+
+        # Read result
+        if (Test-Path $resultFile) {
+            $response = (Get-Content $resultFile -Raw).Trim()
+            Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
+            Write-Log "Mandatory dialog child process returned: $response" | Out-Null
+            return $response
+        } else {
+            Write-Log "Mandatory dialog child process produced no result file, using default: Continue" | Out-Null
+            return "Continue"
+        }
+
     } catch {
         Write-Log "Error in direct mandatory dialog: $($_.Exception.Message)" | Out-Null
         return "Continue"
@@ -3994,11 +3814,14 @@ function Show-EnhancedDeferralDialog {
 function Show-DirectDeferralDialog {
     <#
     .SYNOPSIS
-        Direct user context deferral dialog
+        Direct user context deferral dialog via child process
+    .DESCRIPTION
+        Runs the WPF dialog in a separate PowerShell process to isolate WPF Dispatcher
+        lifecycle from the parent script. Communicates result via temp file.
     .PARAMETER TimeoutSeconds
         Timeout in seconds before using default action
     #>
-    
+
     param(
         [string]$Question,
         [string]$Title,
@@ -4007,252 +3830,164 @@ function Show-DirectDeferralDialog {
     )
 
     try {
-        Write-Log "Showing direct deferral dialog (single Defer button)" | Out-Null
+        Write-Log "Showing direct deferral dialog via child process: '$Title'" | Out-Null
 
-        # Load WPF assemblies
-        Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
-        Add-Type -AssemblyName PresentationCore -ErrorAction Stop
-        Add-Type -AssemblyName WindowsBase -ErrorAction Stop
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $resultFile = Join-Path $env:TEMP "WingetDialog_$([guid]::NewGuid().ToString('N')).txt"
 
-        # Build button XML: single Defer button + Update Now button
-        $buttonXml = @"
-                <Button Name="DeferButton"
-                        Content="Defer"
-                        Width="100"
-                        Height="28"
-                        Margin="0,0,8,0"
-                        Background="Transparent"
-                        Foreground="#FFCCCCCC"
-                        BorderBrush="#FF484848"
-                        BorderThickness="1"
-                        FontSize="11"
-                        Cursor="Hand"
-                        Tag="0">
-                    <Button.Style>
-                        <Style TargetType="Button">
-                            <Style.Triggers>
-                                <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter Property="Background" Value="#FF2A2A2A"/>
-                                    <Setter Property="Foreground" Value="White"/>
-                                </Trigger>
-                            </Style.Triggers>
-                        </Style>
-                    </Button.Style>
-                </Button>
-                <Button Name="UpdateButton"
-                        Content="Update Now"
-                        Width="100"
-                        Height="28"
-                        Background="#FF0078D4"
-                        Foreground="White"
-                        BorderBrush="Transparent"
-                        BorderThickness="0"
-                        FontSize="11"
-                        Cursor="Hand"
-                        IsDefault="true"
-                        Tag="0">
-                    <Button.Style>
-                        <Style TargetType="Button">
-                            <Style.Triggers>
-                                <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter Property="Background" Value="#FF106EBE"/>
-                                </Trigger>
-                            </Style.Triggers>
-                        </Style>
-                    </Button.Style>
-                </Button>
-"@
+        # Child process script — result written as "Action|DeferralDays|CloseProcess"
+        $dialogScript = @'
+param($Title, $Question, $TimeoutSeconds, $ResultFile)
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-        # Fixed dialog width for two buttons
-        $dialogWidth = 500
-        
-        # Create modern dark-themed XAML
-        $xaml = @"
-<Window
-    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="$Title"
-    Width="$dialogWidth"
-    MinHeight="200"
-    SizeToContent="Height"
-    WindowStartupLocation="Manual"
-    ResizeMode="NoResize"
-    WindowStyle="None"
-    AllowsTransparency="True"
-    Background="Transparent"
-    Topmost="True"
-    ShowInTaskbar="False">
-    
+# Detect system theme (0 = dark, 1 = light)
+$isDark = $true
+try {
+    $themeVal = Get-ItemPropertyValue 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name 'AppsUseLightTheme' -ErrorAction Stop
+    if ($themeVal -eq 1) { $isDark = $false }
+} catch {}
+
+if ($isDark) {
+    $bgColor = "#FF1F1F1F"; $borderColor = "#FF323232"; $questionFg = "#FFCCCCCC"
+    $shadowOpacity = "0.6"; $closeFg = "#FF888888"
+    $deferFg = "#FFCCCCCC"; $deferBorder = "#FF484848"
+} else {
+    $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $questionFg = "#FF444444"
+    $shadowOpacity = "0.25"; $closeFg = "#FF999999"
+    $deferFg = "#FF444444"; $deferBorder = "#FFB0B0B0"
+}
+
+$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Dialog" Width="500" MinHeight="200" SizeToContent="Height" WindowStartupLocation="Manual"
+    ResizeMode="NoResize" WindowStyle="None" AllowsTransparency="True" Background="Transparent" Topmost="True" ShowInTaskbar="False">
     <Window.Triggers>
         <EventTrigger RoutedEvent="Window.Loaded">
-            <BeginStoryboard>
-                <Storyboard>
-                    <DoubleAnimation Storyboard.TargetProperty="Opacity"
-                                     From="0" To="1" Duration="0:0:0.3"/>
-                    <ThicknessAnimation Storyboard.TargetProperty="Margin"
-                                        From="0,50,0,0" To="0,0,0,0" Duration="0:0:0.3"/>
-                </Storyboard>
-            </BeginStoryboard>
+            <BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetProperty="Opacity" From="0" To="1" Duration="0:0:0.3"/></Storyboard></BeginStoryboard>
         </EventTrigger>
     </Window.Triggers>
-    
-    <Border Name="MainBorder"
-            Background="#FF1F1F1F"
-            CornerRadius="8"
-            BorderBrush="#FF323232"
-            BorderThickness="1">
-        <Border.Effect>
-            <DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="0.6" BlurRadius="12"/>
-        </Border.Effect>
-        
-        <Grid Margin="20">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
-                <RowDefinition Height="Auto"/>
-            </Grid.RowDefinitions>
-            
-            <!-- Question -->
-            <TextBlock Grid.Row="0"
-                       Text="$Question"
-                       Foreground="#FFCCCCCC"
-                       TextWrapping="Wrap"
-                       Margin="0,0,0,20"
-                       FontSize="12"/>
-            
-            <!-- Buttons -->
-            <StackPanel Grid.Row="1"
-                        Orientation="Horizontal"
-                        HorizontalAlignment="Center">
-                $buttonXml
-            </StackPanel>
+    <Border Background="$bgColor" CornerRadius="8" BorderBrush="$borderColor" BorderThickness="1">
+        <Border.Effect><DropShadowEffect ShadowDepth="4" Direction="270" Color="Black" Opacity="$shadowOpacity" BlurRadius="12"/></Border.Effect>
+        <Grid>
+            <!-- Close button top-right -->
+            <Button Name="CloseButton" Content="&#x2715;" Width="24" Height="24" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,6,6,0"
+                    Background="Transparent" Foreground="$closeFg" BorderThickness="0" FontSize="13" Cursor="Hand" FontFamily="Segoe UI Symbol"/>
+            <Grid Margin="20">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Name="QuestionText" Grid.Row="0" Foreground="$questionFg" TextWrapping="Wrap" Margin="0,0,0,20" FontSize="12"/>
+                <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Center">
+                    <Button Name="DeferButton" Content="Defer" Width="100" Height="28" Margin="0,0,8,0"
+                            Background="Transparent" Foreground="$deferFg" BorderBrush="$deferBorder" BorderThickness="1" FontSize="11" Cursor="Hand"/>
+                    <Button Name="UpdateButton" Content="Update Now" Width="100" Height="28"
+                            Background="#FF0078D4" Foreground="White" BorderBrush="Transparent" BorderThickness="0" FontSize="11" Cursor="Hand"/>
+                </StackPanel>
+            </Grid>
         </Grid>
     </Border>
 </Window>
 "@
 
-        # Create window
-        $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
-        $window = [Windows.Markup.XamlReader]::Load($reader)
-        
-        # Set up result handling
-        $script:deferralResult = @{
-            Action = "Update"
-            DeferralDays = 0
-            CloseProcess = $true
+$reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+$window = [Windows.Markup.XamlReader]::Load($reader)
+
+# Set text programmatically (avoids XML escaping issues)
+$window.Title = $Title
+$window.FindName("QuestionText").Text = $Question
+
+# Position at bottom-right like a notification
+$window.Add_Loaded({
+    $workArea = [System.Windows.SystemParameters]::WorkArea
+    $window.Left = $workArea.Right - $window.ActualWidth - 16
+    $window.Top = $workArea.Bottom - $window.ActualHeight - 16
+})
+
+$updateButton = $window.FindName("UpdateButton")
+$deferButton = $window.FindName("DeferButton")
+$closeButton = $window.FindName("CloseButton")
+
+# Shared state hashtable — "Update|0|True" is default (timeout = update)
+$s = @{
+    result = "Update|0|True"
+    timeRemaining = [int]$TimeoutSeconds
+    origUpdate = $updateButton.Content
+}
+
+$countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
+$countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
+$countdownTimer.Add_Tick({
+    $s.timeRemaining--
+    $updateButton.Content = "$($s.origUpdate) ($($s.timeRemaining))"
+    if ($s.timeRemaining -le 0) { $countdownTimer.Stop() }
+}.GetNewClosure())
+
+$timer = New-Object System.Windows.Threading.DispatcherTimer
+$timer.Interval = [System.TimeSpan]::FromSeconds([int]$TimeoutSeconds)
+$timer.Add_Tick({
+    $s.result = "Update|0|True"
+    $timer.Stop(); $countdownTimer.Stop()
+    $window.Close()
+}.GetNewClosure())
+
+$updateButton.Add_Click({
+    $s.result = "Update|0|True"
+    $timer.Stop(); $countdownTimer.Stop()
+    $window.Close()
+}.GetNewClosure())
+$deferButton.Add_Click({
+    $s.result = "Defer|0|False"
+    $timer.Stop(); $countdownTimer.Stop()
+    $window.Close()
+}.GetNewClosure())
+$closeButton.Add_Click({
+    $s.result = "Defer|0|False"
+    $timer.Stop(); $countdownTimer.Stop()
+    $window.Close()
+}.GetNewClosure())
+$window.Add_Closing({
+    $timer.Stop(); $countdownTimer.Stop()
+    if (-not $s.result) { $s.result = "Defer|0|False" }
+}.GetNewClosure())
+
+$timer.Start()
+$countdownTimer.Start()
+$window.ShowDialog()
+$s.result | Out-File -FilePath $ResultFile -Encoding UTF8 -NoNewline
+'@
+
+        # Find PowerShell executable
+        $pwsh = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
+
+        # Write dialog script to temp file
+        $scriptFile = Join-Path $env:TEMP "WingetDialog_$([guid]::NewGuid().ToString('N')).ps1"
+        $dialogScript | Out-File -FilePath $scriptFile -Encoding UTF8
+
+        Write-Log "Launching deferral dialog child process ($pwsh) from $scriptFile" | Out-Null
+
+        $proc = Start-Process $pwsh -ArgumentList "-NoProfile", "-STA", "-File", "`"$scriptFile`"", "-Title", "`"$Title`"", "-Question", "`"$Question`"", "-TimeoutSeconds", $TimeoutSeconds, "-ResultFile", "`"$resultFile`"" -PassThru -WindowStyle Hidden
+        $proc.WaitForExit()
+        Remove-Item $scriptFile -Force -ErrorAction SilentlyContinue
+
+        # Read and parse result (format: "Action|DeferralDays|CloseProcess")
+        if (Test-Path $resultFile) {
+            $response = (Get-Content $resultFile -Raw).Trim()
+            Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
+            Write-Log "Deferral dialog child process returned: $response" | Out-Null
+
+            $parts = $response -split '\|'
+            $deferralResult = @{
+                Action       = if ($parts[0]) { $parts[0] } else { "Update" }
+                DeferralDays = if ($parts.Count -gt 1) { [int]$parts[1] } else { 0 }
+                CloseProcess = if ($parts.Count -gt 2) { $parts[2] -eq "True" } else { $true }
+            }
+            Write-Log "Deferral dialog result parsed: Action=$($deferralResult.Action), Days=$($deferralResult.DeferralDays), CloseProcess=$($deferralResult.CloseProcess)" | Out-Null
+            return $deferralResult
+        } else {
+            Write-Log "Deferral dialog child process produced no result file, using default: Update" | Out-Null
+            return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
         }
-        
-        # Add timeout functionality with countdown timer - same as other dialogs
-        $script:timeRemaining = $TimeoutSeconds
-        $countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
-        $countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
-        
-        # Get the Update button for countdown display
-        $updateButton = $window.FindName("UpdateButton")
-        $originalUpdateText = if ($updateButton) { $updateButton.Content } else { "Update Now" }
-        
-        $countdownTimer.Add_Tick({
-            $script:timeRemaining--
-            Write-Log "Deferral dialog countdown: $($script:timeRemaining) seconds remaining" | Out-Null
-            
-            # Update the Update button with countdown (default action)
-            if ($updateButton) {
-                $updateButton.Content = "$originalUpdateText ($($script:timeRemaining))"
-            }
-            
-            # Stop countdown timer when we reach zero (main timeout timer will handle dialog close)
-            if ($script:timeRemaining -le 0) {
-                $countdownTimer.Stop()
-            }
-        })
-        
-        # Create main timeout timer
-        $timer = New-Object System.Windows.Threading.DispatcherTimer
-        $timer.Interval = [System.TimeSpan]::FromSeconds($TimeoutSeconds)
-        
-        $timer.Add_Tick({
-            Write-Log "Deferral dialog timeout reached after $TimeoutSeconds seconds - defaulting to Update" | Out-Null
-            $script:deferralResult = @{
-                Action = "Update"
-                DeferralDays = 0
-                CloseProcess = $true
-            }
-            $timer.Stop()
-            $countdownTimer.Stop()
-            $window.Close()
-        })
-        
-        # Add event handler for Defer button
-        $deferButton = $window.FindName("DeferButton")
-        if ($deferButton) {
-            $deferButton.Add_Click({
-                Write-Log "User selected deferral (until end of day)" | Out-Null
-                $timer.Stop()
-                $countdownTimer.Stop()
-                $script:deferralResult = @{
-                    Action = "Defer"
-                    DeferralDays = 0
-                    CloseProcess = $false
-                }
-                $window.Close()
-            })
-        }
-        
-        # Add event handler for Update button
-        if ($updateButton) {
-            $updateButton.Add_Click({
-                Write-Log "User selected immediate update" | Out-Null
-                $timer.Stop()
-                $countdownTimer.Stop()
-                $script:deferralResult = @{
-                    Action = "Update"
-                    DeferralDays = 0
-                    CloseProcess = $true
-                }
-                $window.Close()
-            })
-        }
-        
-        # Handle window closing without button click (X = Defer)
-        $window.Add_Closing({
-            $timer.Stop()
-            $countdownTimer.Stop()
-            if ($script:deferralResult.Action -eq $null) {
-                Write-Log "Deferral dialog closed without selection - defaulting to defer (until end of day)" | Out-Null
-                $script:deferralResult = @{
-                    Action = "Defer"
-                    DeferralDays = 0
-                    CloseProcess = $false
-                }
-            }
-        })
-        
-        # Position window like a native Windows toast notification
-        $window.Add_Loaded({
-            $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-            $taskbarHeight = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height - $workArea.Height
-            
-            # Position at bottom-right (near notification area)
-            $window.Left = $workArea.Width - $window.Width - 16
-            $window.Top = $workArea.Height - $window.Height - 16
-            Write-Log "Deferral dialog positioned at bottom-right (near notification area)" | Out-Null
-        })
-        
-        # Start both timers and show dialog
-        Write-Log "Starting deferral dialog with $TimeoutSeconds second timeout" | Out-Null
-        $timer.Start()
-        $countdownTimer.Start()
-        
-        # Show dialog
-        $result = $window.ShowDialog()
-        
-        # Ensure timers are stopped
-        $timer.Stop()
-        $countdownTimer.Stop()
-        
-        Write-Log "Direct deferral dialog completed with choice: $($script:deferralResult.Action), Days: $($script:deferralResult.DeferralDays)" | Out-Null
-        return $script:deferralResult
-        
+
     } catch {
         Write-Log "Error in direct deferral dialog: $($_.Exception.Message)" | Out-Null
         return @{
@@ -4938,8 +4673,8 @@ try {
         $bgColor = "#FFF3F3F3"; $borderColor = "#FFD1D1D1"; $textColor = "#FF1B1B1B"; $shadowOpacity = "0.25"; $closeFg = "#FF999999"
     }
 
-    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms -ErrorAction Stop
-    $workArea    = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
+    $workArea    = [System.Windows.SystemParameters]::WorkArea
     $dialogWidth = 480
     $escapedMsg  = [System.Security.SecurityElement]::Escape($msg) -replace "`n", "&#10;"
     $escapedTtl  = [System.Security.SecurityElement]::Escape($ttl)
@@ -6312,6 +6047,95 @@ if ($Script:TestMode) {
     Write-Log -Message "TEST MODE: Added Test.DemoApp to whitelist (blocking process: notepad)"
 }
 
+function ConvertFrom-WingetOutput {
+    <#
+    .SYNOPSIS
+        Parses winget upgrade text output into structured app objects.
+    .DESCRIPTION
+        Uses the separator line (dashes) to locate the header, then extracts
+        column positions from the header text. Locale-safe header detection.
+        Returns objects with AppID, CurrentVersion, and AvailableVersion.
+    #>
+    param([array]$Output)
+
+    if (-not $Output -or $Output.Count -eq 0) { return @() }
+
+    # Find the separator line (row of dashes) - locale-safe
+    $separatorIndex = -1
+    for ($i = 0; $i -lt $Output.Count; $i++) {
+        if ($Output[$i] -match '^-{10,}$') {
+            $separatorIndex = $i
+            break
+        }
+    }
+
+    if ($separatorIndex -lt 1) {
+        Write-Log -Message "No separator line found in winget output"
+        return @()
+    }
+
+    $headerLine = $Output[$separatorIndex - 1]
+    Write-Log -Message "Header found at line $($separatorIndex - 1), total lines: $($Output.Count)"
+
+    # Find column positions from header using word-boundary matching
+    $columns = @{}
+    foreach ($col in @("Id", "Version", "Available", "Source")) {
+        for ($p = 0; $p -le $headerLine.Length - $col.Length; $p++) {
+            if ($headerLine.Substring($p, $col.Length) -ceq $col) {
+                $prevOk = ($p -eq 0) -or ($headerLine[$p - 1] -eq ' ')
+                $nextOk = ($p + $col.Length -ge $headerLine.Length) -or ($headerLine[$p + $col.Length] -eq ' ')
+                if ($prevOk -and $nextOk) { $columns[$col] = $p; break }
+            }
+        }
+    }
+
+    if (-not $columns.ContainsKey("Id")) {
+        Write-Log -Message "Could not find Id column in header: $headerLine"
+        return @()
+    }
+
+    $idPos = $columns["Id"]
+    $idEnd = if ($columns.ContainsKey("Version")) { $columns["Version"] - 1 } else { $headerLine.Length - 1 }
+    $versionPos = if ($columns.ContainsKey("Version")) { $columns["Version"] } else { -1 }
+    $availablePos = if ($columns.ContainsKey("Available")) { $columns["Available"] } else { -1 }
+    $sourcePos = if ($columns.ContainsKey("Source")) { $columns["Source"] } else { -1 }
+
+    Write-Log -Message "Column positions - Id: $idPos, Version: $versionPos, Available: $availablePos"
+
+    $apps = [System.Collections.ArrayList]::new()
+    for ($i = $separatorIndex + 1; $i -lt $Output.Count; $i++) {
+        $line = $Output[$i]
+        if ($line.Trim() -eq "" -or $line -match 'upgrades? available' -or $line -match 'following packages') {
+            break
+        }
+        if ($line.Length -le $idPos) { continue }
+
+        $appId = ($line[$idPos..$idEnd] -join "").Trim()
+        if ($appId -eq "") { continue }
+
+        $currentVersion = ""
+        $availableVersion = ""
+
+        if ($versionPos -ge 0 -and $availablePos -gt $versionPos -and $line.Length -gt $versionPos) {
+            $verEnd = $availablePos - 1
+            $currentVersion = ($line[$versionPos..$verEnd] -join "").Trim()
+        }
+        if ($availablePos -ge 0 -and $line.Length -gt $availablePos) {
+            $avEnd = if ($sourcePos -gt $availablePos) { $sourcePos - 1 } else { $line.Length - 1 }
+            $availableVersion = ($line[$availablePos..$avEnd] -join "").Trim()
+        }
+
+        $null = $apps.Add(@{
+            AppID = $appId
+            CurrentVersion = $currentVersion
+            AvailableVersion = $availableVersion
+        })
+    }
+
+    Write-Log -Message "Parsed $($apps.Count) apps from winget output"
+    return $apps
+}
+
 # Main remediation logic - dual-context architecture
 # Check UserRemediationOnly FIRST - this flag means we're a scheduled user remediation task,
 # regardless of whether Test-RunningAsSystem is true (the task may run as the user's principal)
@@ -6527,7 +6351,7 @@ if ($UserRemediationOnly) {
             # Note: No --scope filter here - we need to see ALL upgradeable apps (both user and machine scoped)
             # The --scope user filter is only applied during the actual upgrade command for non-admin users
             $wingetJob = Start-Job -ScriptBlock {
-                winget upgrade --accept-source-agreements
+                winget upgrade --accept-source-agreements --source winget
             }
             
             Write-Log -Message "Winget job started (Job ID: $($wingetJob.Id)), waiting up to $wingetTimeout seconds..."
@@ -6611,10 +6435,7 @@ if ($UserRemediationOnly) {
         $outputValidationStart = Get-Date
         $hasValidOutput = $false
         foreach ($line in $OUTPUT) {
-            if ($line -like "Name*Id*Version*Available*Source*") {
-                $hasValidOutput = $true
-                break
-            }
+            if ($line -match '^-{10,}$') { $hasValidOutput = $true; break }
         }
         $outputValidationTime = (Get-Date) - $outputValidationStart
         Write-Log -Message "Output validation completed in $($outputValidationTime.TotalMilliseconds) ms - Valid: $hasValidOutput"
@@ -6626,7 +6447,7 @@ if ($UserRemediationOnly) {
             
             try {
                 $retryJob = Start-Job -ScriptBlock {
-                    winget upgrade --accept-source-agreements
+                    winget upgrade --accept-source-agreements --source winget
                 }
                 
                 if (Wait-Job $retryJob -Timeout $wingetTimeout) {
@@ -6675,11 +6496,11 @@ if ($UserRemediationOnly) {
         
         if ($WingetPath) {
             Write-Log -Message "Using winget path: $WingetPath"
-            Set-Location $WingetPath
-            
+            $wingetExe = Join-Path $WingetPath "winget.exe"
+
             try {
                 # System context winget - only sees system-wide apps
-                $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
+                $OUTPUT = $(& $wingetExe upgrade --accept-source-agreements --source winget)
                 Write-Log -Message "Successfully executed winget upgrade in system context"
             } catch {
                 Write-Log -Message "Error executing winget in system context: $($_.Exception.Message)"
@@ -6688,20 +6509,17 @@ if ($UserRemediationOnly) {
                 Invoke-MarkerFileCleanup -Reason "Winget execution failed in system context"
                 exit 1
             }
-            
-            # Check if first output is valid (contains actual app data)
+
+            # Validate output contains separator line
             $hasValidOutput = $false
             foreach ($line in $OUTPUT) {
-                if ($line -like "Name*Id*Version*Available*Source*") {
-                    $hasValidOutput = $true
-                    break
-                }
+                if ($line -match '^-{10,}$') { $hasValidOutput = $true; break }
             }
-            
-            # If first output is nonsense, run again
+
+            # If first output is invalid, run again
             if (-not $hasValidOutput) {
                 Write-Log -Message "First winget run produced invalid output, retrying..."
-                $OUTPUT = $(.\winget.exe upgrade --accept-source-agreements)
+                $OUTPUT = $(& $wingetExe upgrade --accept-source-agreements --source winget)
             }
         } else {
             Write-Log -Message "Winget not detected in SYSTEM context"
@@ -6712,9 +6530,9 @@ if ($UserRemediationOnly) {
 } else {
     # User context execution - process user apps only
     Write-Log -Message "USER context - processing user-scoped apps"
-    
+
     try {
-        $OUTPUT = $(winget upgrade --accept-source-agreements)
+        $OUTPUT = $(winget upgrade --accept-source-agreements --source winget)
         Write-Log -Message "Successfully executed winget upgrade in user context"
     } catch {
         Write-Log -Message "Error executing winget in user context: $($_.Exception.Message)"
@@ -6723,20 +6541,17 @@ if ($UserRemediationOnly) {
         Invoke-MarkerFileCleanup -Reason "Winget not available or properly configured"
         exit 1
     }
-    
-    # Check if first output is valid (contains actual app data)
+
+    # Validate output contains separator line
     $hasValidOutput = $false
     foreach ($line in $OUTPUT) {
-        if ($line -like "Name*Id*Version*Available*Source*") {
-            $hasValidOutput = $true
-            break
-        }
+        if ($line -match '^-{10,}$') { $hasValidOutput = $true; break }
     }
-    
-    # If first output is nonsense, run again
+
+    # If first output is invalid, run again
     if (-not $hasValidOutput) {
         Write-Log -Message "First winget run produced invalid output, retrying..."
-        $OUTPUT = $(winget upgrade --accept-source-agreements)
+        $OUTPUT = $(winget upgrade --accept-source-agreements --source winget)
     }
 }
 
@@ -6754,81 +6569,9 @@ if ($Script:TestMode) {
 Write-Log -Message "Starting winget output parsing..."
 $parsingStart = Get-Date
 
-if ($OUTPUT) {
-    Write-Log -Message "Winget output contains $($OUTPUT.Count) lines, parsing structure..."
-    $headerLine = -1
-    $lineCount = 0
+$LIST = ConvertFrom-WingetOutput -Output $OUTPUT
 
-    foreach ($line in $OUTPUT) {
-        if ($line -like "Name*" -and $headerLine -eq -1) {
-            $headerLine = $lineCount
-        }
-        $lineCount++
-    }
-
-    Write-Log -Message "Header found at line $headerLine, total lines: $lineCount"
-
-    if ($OUTPUT -and $lineCount -gt $headerLine+2) {
-        $str = $OUTPUT[$headerLine]
-        $idPos = $str.indexOf("Id")
-        $versionPos = $str.indexOf("Version")-1
-        $availablePos = $str.indexOf("Available")-1
-
-        Write-Log -Message "Column positions - Id: $idPos, Version: $versionPos, Available: $availablePos"
-
-        $LIST= [System.Collections.ArrayList]::new()
-        for ($i = $headerLine+2; $i -lt $OUTPUT.count; $i++ ) {
-            $lineData = $OUTPUT[$i]
-            # Stop parsing if we hit the second section or empty lines
-            if ($lineData -like "*upgrade available, but require*" -or $lineData.Trim() -eq "" -or $lineData -like "*following packages*") {
-                break
-            }
-            
-            # Extract AppID, current version, and available version
-            $appId = ($lineData[$idPos..$versionPos] -Join "").trim()
-            if ($appId -ne "") {
-                # Extract current version (between Version and Available columns)
-                $currentVersion = ""
-                $availableVersion = ""
-                
-                if ($availablePos -gt $versionPos) {
-                    $currentVersionEnd = $availablePos
-                    # Find the start of Version column content
-                    $versionStart = $versionPos + 1
-                    while ($versionStart -lt $lineData.Length -and $lineData[$versionStart] -eq ' ') {
-                        $versionStart++
-                    }
-                    if ($versionStart -lt $currentVersionEnd) {
-                        $currentVersion = ($lineData[$versionStart..$currentVersionEnd] -Join "").trim()
-                    }
-                    
-                    # Extract available version (from Available column to end)
-                    $availableStart = $availablePos + 1
-                    while ($availableStart -lt $lineData.Length -and $lineData[$availableStart] -eq ' ') {
-                        $availableStart++
-                    }
-                    # Find end of available version (next column or end of line)
-                    $sourcePos = $str.indexOf("Source")
-                    $availableEnd = if ($sourcePos -gt $availablePos) { $sourcePos - 1 } else { $lineData.Length - 1 }
-                    
-                    if ($availableStart -lt $lineData.Length -and $availableStart -le $availableEnd) {
-                        $availableVersion = ($lineData[$availableStart..$availableEnd] -Join "").trim()
-                    }
-                }
-                
-                # Create enhanced app object with version information
-                $appInfo = @{
-                    AppID = $appId
-                    CurrentVersion = $currentVersion
-                    AvailableVersion = $availableVersion
-                }
-                $null = $LIST.Add($appInfo)
-            }
-        }
-
-        $parsingTime = (Get-Date) - $parsingStart
-        Write-Log -Message "Parsing completed in $($parsingTime.TotalSeconds) seconds - Found $($LIST.Count) apps"
-
+if ($LIST -and $LIST.Count -gt 0) {
         $count = 0
         $message = ""
         $processingStart = Get-Date
@@ -7333,13 +7076,9 @@ if ($OUTPUT) {
         Write-Log -Message "Performing final marker file cleanup before script completion"
         Invoke-MarkerFileCleanup -Reason "Script completion (remediation complete)"
         exit 0
-    }
-    Write-Log -Message "[$ScriptTag] No upgrades (0x0000002)"
+} else {
+    Write-Log -Message "[$ScriptTag] No upgrades found in winget output"
     Write-Log -Message "Performing final marker file cleanup before script exit (no upgrades)"
     Invoke-MarkerFileCleanup -Reason "Script completion (no upgrades)"
     exit 0
 }
-Write-Log -Message "[$ScriptTag] Winget not detected"
-Write-Log -Message "Performing final marker file cleanup before script exit (winget not detected)"
-Invoke-MarkerFileCleanup -Reason "Script completion (winget not detected)"
-exit 0
