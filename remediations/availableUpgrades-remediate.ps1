@@ -4445,76 +4445,102 @@ try {
         Write-DeferLog "Attached close button handler (defers until end of day)"
     }
 
+    # Shared function to switch dialog to progress mode and start polling for completion
+    $script:inProgressMode = $false
+    $script:signalFilePath = $ResponseFilePath -replace '_Response\.json$', '_Complete.json'
+    $script:statusFilePath = $script:signalFilePath -replace '\.json$', '_Status.txt'
+    $script:lastStatus = ""
+
+    $script:SwitchToProgressMode = {
+        param([string]$Reason)
+        if ($script:inProgressMode) { return }
+        $script:inProgressMode = $true
+        Write-DeferLog "Switching to progress mode (reason: $Reason)"
+
+        # Write response if not already written
+        if (-not (Test-Path $ResponseFilePath)) {
+            @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
+        }
+
+        # Switch to progress UI
+        $window.FindName("ButtonPanel").Visibility = [System.Windows.Visibility]::Collapsed
+        $window.FindName("CloseButton").Visibility = [System.Windows.Visibility]::Collapsed
+        $window.FindName("ProgressPanel").Visibility = [System.Windows.Visibility]::Visible
+        $window.FindName("QuestionText").Text = "Closing application and installing update..."
+
+        $script:progressStartTime = Get-Date
+        $script:pollTimer = [System.Windows.Threading.DispatcherTimer]::new()
+        $script:pollTimer.Interval = [TimeSpan]::FromSeconds(2)
+        $script:pollTimer.Add_Tick({
+            # Check for status updates
+            if (Test-Path $script:statusFilePath) {
+                try {
+                    $currentStatus = (Get-Content $script:statusFilePath -Raw).Trim()
+                    if ($currentStatus -and $currentStatus -ne $script:lastStatus) {
+                        $script:lastStatus = $currentStatus
+                        $window.FindName("ProgressText").Text = $currentStatus
+                        Write-DeferLog "Status updated: $currentStatus"
+                    }
+                } catch {}
+            }
+            # Check for final signal
+            if (Test-Path $script:signalFilePath) {
+                $script:pollTimer.Stop()
+                Write-DeferLog "Completion signal received at: $script:signalFilePath"
+                try {
+                    $signalData = Get-Content $script:signalFilePath -Raw | ConvertFrom-Json
+                    $pBar = $window.FindName("ProgressBar")
+                    $pText = $window.FindName("ProgressText")
+                    $pBar.IsIndeterminate = $false
+                    $pBar.Value = 100
+                    if ($signalData.Success -eq $true) {
+                        $pText.Text = "Update complete!"
+                    } else {
+                        $pText.Text = "Update could not be completed."
+                    }
+                } catch {
+                    Write-DeferLog "Error reading signal: $($_.Exception.Message)"
+                    $window.FindName("ProgressText").Text = "Update complete!"
+                }
+                # Auto-close after 3 seconds
+                $script:closeTimer = [System.Windows.Threading.DispatcherTimer]::new()
+                $script:closeTimer.Interval = [TimeSpan]::FromSeconds(3)
+                $script:closeTimer.Add_Tick({
+                    $script:closeTimer.Stop()
+                    $window.Close()
+                })
+                $script:closeTimer.Start()
+            } elseif (((Get-Date) - $script:progressStartTime).TotalMinutes -gt 5) {
+                $script:pollTimer.Stop()
+                Write-DeferLog "Progress timeout after 5 minutes - closing dialog"
+                $window.Close()
+            }
+        })
+        $script:pollTimer.Start()
+        Write-DeferLog "Started polling for completion signal"
+    }
+
     $updateButton = $window.FindName("UpdateButton")
     if ($updateButton) {
         $updateButton.Add_Click({
-            # Write response immediately so SYSTEM script can proceed with the upgrade
-            Write-DeferLog "Update button clicked, writing response and switching to progress mode"
-            @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true } | ConvertTo-Json | Out-File -FilePath $ResponseFilePath -Encoding UTF8
-
-            # Switch to progress UI
-            $window.FindName("ButtonPanel").Visibility = [System.Windows.Visibility]::Collapsed
-            $window.FindName("CloseButton").Visibility = [System.Windows.Visibility]::Collapsed
-            $window.FindName("ProgressPanel").Visibility = [System.Windows.Visibility]::Visible
-            $window.FindName("QuestionText").Text = "Closing application and installing update..."
-
-            # Poll for completion signal file
-            $script:signalFilePath = $ResponseFilePath -replace '_Response\.json$', '_Complete.json'
-            $script:progressStartTime = Get-Date
-
-            $script:statusFilePath = $script:signalFilePath -replace '\.json$', '_Status.txt'
-            $script:lastStatus = ""
-            $script:pollTimer = [System.Windows.Threading.DispatcherTimer]::new()
-            $script:pollTimer.Interval = [TimeSpan]::FromSeconds(2)
-            $script:pollTimer.Add_Tick({
-                # Check for status updates
-                if (Test-Path $script:statusFilePath) {
-                    try {
-                        $currentStatus = (Get-Content $script:statusFilePath -Raw).Trim()
-                        if ($currentStatus -and $currentStatus -ne $script:lastStatus) {
-                            $script:lastStatus = $currentStatus
-                            $window.FindName("ProgressText").Text = $currentStatus
-                            Write-DeferLog "Status updated: $currentStatus"
-                        }
-                    } catch {}
-                }
-                # Check for final signal
-                if (Test-Path $script:signalFilePath) {
-                    $script:pollTimer.Stop()
-                    Write-DeferLog "Completion signal received at: $script:signalFilePath"
-                    try {
-                        $signalData = Get-Content $script:signalFilePath -Raw | ConvertFrom-Json
-                        $pBar = $window.FindName("ProgressBar")
-                        $pText = $window.FindName("ProgressText")
-                        $pBar.IsIndeterminate = $false
-                        $pBar.Value = 100
-                        if ($signalData.Success -eq $true) {
-                            $pText.Text = "Update complete!"
-                        } else {
-                            $pText.Text = "Update could not be completed."
-                        }
-                    } catch {
-                        Write-DeferLog "Error reading signal: $($_.Exception.Message)"
-                        $window.FindName("ProgressText").Text = "Update complete!"
-                    }
-                    # Auto-close after 3 seconds
-                    $script:closeTimer = [System.Windows.Threading.DispatcherTimer]::new()
-                    $script:closeTimer.Interval = [TimeSpan]::FromSeconds(3)
-                    $script:closeTimer.Add_Tick({
-                        $script:closeTimer.Stop()
-                        $window.Close()
-                    })
-                    $script:closeTimer.Start()
-                } elseif (((Get-Date) - $script:progressStartTime).TotalMinutes -gt 5) {
-                    $script:pollTimer.Stop()
-                    Write-DeferLog "Progress timeout after 5 minutes - closing dialog"
-                    $window.Close()
-                }
-            })
-            $script:pollTimer.Start()
-            Write-DeferLog "Started polling for completion signal"
+            Write-DeferLog "Update button clicked"
+            & $script:SwitchToProgressMode "UserClickedUpdate"
         })
         Write-DeferLog "Attached click handler for UpdateButton"
+    }
+
+    # Timeout timer: auto-switch to progress mode so the dialog detects completion
+    # even if the user doesn't click anything (SYSTEM script proceeds after its own timeout)
+    if ($TimeoutSeconds -gt 0) {
+        $script:timeoutTimer = [System.Windows.Threading.DispatcherTimer]::new()
+        $script:timeoutTimer.Interval = [TimeSpan]::FromSeconds($TimeoutSeconds)
+        $script:timeoutTimer.Add_Tick({
+            $script:timeoutTimer.Stop()
+            Write-DeferLog "Dialog timeout reached ($TimeoutSeconds seconds) - auto-switching to progress mode"
+            & $script:SwitchToProgressMode "Timeout"
+        })
+        $script:timeoutTimer.Start()
+        Write-DeferLog "Started timeout timer: $TimeoutSeconds seconds"
     }
 
     Write-DeferLog "Showing dialog..."
