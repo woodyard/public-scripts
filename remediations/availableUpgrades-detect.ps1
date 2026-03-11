@@ -1214,6 +1214,21 @@ if (-not (OOBEComplete)) {
 
 <# ---------------------------------------------- #>
 
+# Early marker file check — restore whitelistUrl BEFORE whitelist loading
+# (scheduled task child process needs this to use the correct whitelist source)
+if ($MyInvocation.MyCommand.Path) {
+    $earlyMarkerFile = "$($MyInvocation.MyCommand.Path).userdetection"
+    if (Test-Path $earlyMarkerFile) {
+        try {
+            $earlyMarkerContent = Get-Content $earlyMarkerFile -Raw
+            if ($earlyMarkerContent -match "WHITELISTURL:(.+)") {
+                $whitelistUrl = $matches[1].Trim()
+                Write-Log -Message "Restored whitelistUrl from marker file: $whitelistUrl"
+            }
+        } catch { }
+    }
+}
+
 # Load whitelist configuration with priority: Local file > GitHub > Hardcoded fallback
 $whitelistJSON = $null
 $localWhitelistPath = $null
