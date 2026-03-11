@@ -1210,12 +1210,15 @@ if (-not (OOBEComplete)) {
 <# ---------------------------------------------- #>
 
 # Load whitelist configuration with priority: Local file > GitHub > Hardcoded fallback
-$scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
-$localWhitelistPath = Join-Path $scriptDirectory "app-whitelist.json"
 $whitelistJSON = $null
+$localWhitelistPath = $null
+if ($MyInvocation.MyCommand.Path) {
+    $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $localWhitelistPath = Join-Path $scriptDirectory "app-whitelist.json"
+}
 
 # First, try to load from local file
-if (Test-Path $localWhitelistPath) {
+if ($localWhitelistPath -and (Test-Path $localWhitelistPath)) {
     try {
         Write-Log -Message "Loading whitelist configuration from local file: $localWhitelistPath"
         $whitelistJSON = Get-Content -Path $localWhitelistPath -Raw -Encoding UTF8

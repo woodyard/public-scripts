@@ -5963,8 +5963,11 @@ if (-not (OOBEComplete)) {
 <# ---------------------------------------------- #>
 
 # Fetch whitelist configuration - try local file first, then GitHub, then fallback
-$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
-$localWhitelistPath = Join-Path $scriptPath "app-whitelist.json"
+$localWhitelistPath = $null
+if ($MyInvocation.MyCommand.Path) {
+    $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $localWhitelistPath = Join-Path $scriptPath "app-whitelist.json"
+}
 if (-not $whitelistUrl) {
     $whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"
 }
@@ -5972,7 +5975,7 @@ if (-not $whitelistUrl) {
 $whitelistJSON = $null
 
 # Try local file first
-if (Test-Path $localWhitelistPath) {
+if ($localWhitelistPath -and (Test-Path $localWhitelistPath)) {
     try {
         Write-Log -Message "Found local whitelist file: $localWhitelistPath"
         $whitelistJSON = Get-Content -Path $localWhitelistPath -Raw -Encoding UTF8
