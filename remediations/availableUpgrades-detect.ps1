@@ -1324,7 +1324,8 @@ function Invoke-WingetUpgradeList {
     if ($Scope) { $wingetArgs += "--scope"; $wingetArgs += $Scope }
 
     Write-Log -Message "Running: $WingetExe $($wingetArgs -join ' ')"
-    $output = & $WingetExe @wingetArgs 2>&1
+    # First run may return only source-update progress output; discard stderr to avoid capturing spinner
+    $output = & $WingetExe @wingetArgs 2>$null
 
     # Validate output contains a separator line (row of dashes below the header)
     $hasSeparator = $false
@@ -1333,16 +1334,8 @@ function Invoke-WingetUpgradeList {
     }
 
     if (-not $hasSeparator) {
-        Write-Log -Message "First winget run produced invalid output (lines: $($output.Count)), retrying... First 5 lines:"
-        $diagCount = 0
-        foreach ($diagLine in $output) {
-            if ($diagCount -ge 5) { break }
-            $lineType = $diagLine.GetType().Name
-            $lineStr = if ($diagLine -is [string]) { $diagLine } else { $diagLine.ToString() }
-            Write-Log -Message "  [$diagCount] ($lineType) '$lineStr'"
-            $diagCount++
-        }
-        $output = & $WingetExe @wingetArgs 2>&1
+        Write-Log -Message "Winget source update in progress, running again..."
+        $output = & $WingetExe @wingetArgs 2>$null
     }
 
     return $output

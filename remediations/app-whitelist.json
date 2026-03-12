@@ -1,6 +1,13 @@
 [
     {
-        "AppID": "Microsoft.Edge",
-        "Disabled": true
+        "AppID": "Google.Chrome*",
+        "FriendlyName": "Chrome",
+        "BlockingProcess": "chrome",
+        "PromptWhenBlocked": true,
+        "DefaultTimeoutAction": false,
+        "TimeoutSeconds": 60,
+        "DeferralEnabled": true,
+        "MaxDeferralDays": 5,
+        "ForcedUpgradeMessage": "Chrome security updates can no longer be deferred."
     }
 ]

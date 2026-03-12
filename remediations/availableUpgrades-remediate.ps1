@@ -2127,6 +2127,11 @@ function Invoke-WingetWithProgress {
         while (-not $proc.HasExited) {
             Start-Sleep -Seconds 2
 
+            # Keep heartbeat alive during long upgrade operations
+            if (Get-Command Update-Heartbeat -ErrorAction SilentlyContinue) {
+                Update-Heartbeat -Stage "WingetUpgradeRunning" -AdditionalData @{ WingetPID = $proc.Id } 2>$null
+            }
+
             if (Test-Path $outFile) {
                 try {
                     # Read stdout using FileStream with shared read to avoid locking conflicts
@@ -6561,10 +6566,10 @@ if ($UserRemediationOnly) {
         }
         $outputValidationTime = (Get-Date) - $outputValidationStart
         Write-Log -Message "Output validation completed in $($outputValidationTime.TotalMilliseconds) ms - Valid: $hasValidOutput"
-        
-        # If first output is nonsense, run again with timeout protection
+
+        # If first output was just source-update progress, run again with timeout protection
         if (-not $hasValidOutput) {
-            Write-Log -Message "First winget run produced invalid output, retrying with timeout protection..."
+            Write-Log -Message "Winget source update in progress, running again..."
             $retryStart = Get-Date
             
             try {
@@ -6638,9 +6643,9 @@ if ($UserRemediationOnly) {
                 if ($line -is [string] -and $line.Trim() -match '^-{10,}$') { $hasValidOutput = $true; break }
             }
 
-            # If first output is invalid, run again
+            # If first output was just source-update progress, run again
             if (-not $hasValidOutput) {
-                Write-Log -Message "First winget run produced invalid output, retrying..."
+                Write-Log -Message "Winget source update in progress, running again..."
                 $OUTPUT = $(& $wingetExe upgrade --accept-source-agreements --source winget)
             }
         } else {
@@ -6667,12 +6672,12 @@ if ($UserRemediationOnly) {
     # Validate output contains separator line
     $hasValidOutput = $false
     foreach ($line in $OUTPUT) {
-        if ($line -match '^-{10,}$') { $hasValidOutput = $true; break }
+        if ($line -is [string] -and $line.Trim() -match '^-{10,}$') { $hasValidOutput = $true; break }
     }
 
-    # If first output is invalid, run again
+    # If first output was just source-update progress, run again
     if (-not $hasValidOutput) {
-        Write-Log -Message "First winget run produced invalid output, retrying..."
+        Write-Log -Message "Winget source update in progress, running again..."
         $OUTPUT = $(winget upgrade --accept-source-agreements --source winget)
     }
 }
@@ -6701,6 +6706,10 @@ if ($LIST -and $LIST.Count -gt 0) {
 
         foreach ($appInfo in $LIST) {
             if ($appInfo.AppID -ne "") {
+                # Keep heartbeat alive during app processing so SYSTEM parent doesn't time out
+                if (Get-Command Update-Heartbeat -ErrorAction SilentlyContinue) {
+                    Update-Heartbeat -Stage "AppProcessing" -AdditionalData @{ AppID = $appInfo.AppID }
+                }
                 $doUpgrade = $false
                 foreach ($okapp in $whitelistConfig) {
                     if ($appInfo.AppID -like $okapp.AppID) {
@@ -6938,7 +6947,13 @@ if ($LIST -and $LIST.Count -gt 0) {
                                 $wingetArgs += @("--scope", "user")
                             }
                         }
+                        if (Get-Command Update-Heartbeat -ErrorAction SilentlyContinue) {
+                            Update-Heartbeat -Stage "UpgradeStarting" -AdditionalData @{ AppID = $appInfo.AppID }
+                        }
                         $upgradeResult = Invoke-WingetWithProgress -WingetExe $wingetExe -Arguments $wingetArgs -SignalFilePath $activeSignalFile -WorkingDirectory $wingetDir
+                        if (Get-Command Update-Heartbeat -ErrorAction SilentlyContinue) {
+                            Update-Heartbeat -Stage "UpgradeComplete" -AdditionalData @{ AppID = $appInfo.AppID }
+                        }
 
                         $upgradeOutput = $upgradeResult -join "`n"
                         # Extract meaningful lines from winget output for logging
