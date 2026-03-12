@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.3
- Tag: 9A
+ Version: 9.4
+ Tag: 9B
     
     Version History:
     1.0 - Initial version
@@ -68,6 +68,7 @@
     9.1 - FIX: Replaced WebClient.DownloadString with Invoke-RestMethod for whitelist loading to avoid AV/AMSI blocks when run via iex bootstrapper
     9.2 - ENHANCEMENT: Direct user-context deferral dialog now stays open in progress mode during upgrades instead of closing immediately; polls for status updates and completion signal
     9.3 - FIX: Added heartbeat updates during app processing loop and Invoke-WingetWithProgress to prevent SYSTEM parent timeout during long upgrades; fixed winget output validation for ErrorRecord objects
+    9.4 - ENHANCEMENT: Added Resolve-FriendlyName function that looks up display names via winget show when FriendlyName is missing from whitelist config; runs lazily only for matched apps being updated
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -5891,7 +5892,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "9A" # Update this tag for each script version
+$ScriptTag = "9B" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6696,6 +6697,50 @@ if ($Script:TestMode) {
     )
 }
 
+function Resolve-FriendlyName {
+    <#
+    .SYNOPSIS
+        Looks up the display name of a winget package when FriendlyName is not set in the whitelist.
+    .DESCRIPTION
+        Queries 'winget show --id <AppID>' and parses the first line for the package display name.
+        Results are cached in a script-scoped hashtable to avoid repeated lookups.
+    .PARAMETER AppID
+        The winget package ID to look up.
+    .OUTPUTS
+        The resolved friendly name string, or $null if lookup fails.
+    #>
+    param([string]$AppID)
+
+    # Initialize cache on first call
+    if (-not $Script:FriendlyNameCache) { $Script:FriendlyNameCache = @{} }
+
+    if ($Script:FriendlyNameCache.ContainsKey($AppID)) {
+        return $Script:FriendlyNameCache[$AppID]
+    }
+
+    try {
+        $wingetExe = if ((Test-RunningAsSystem) -and $WingetPath) { Join-Path $WingetPath "winget.exe" } else { "winget.exe" }
+        $showOutput = & $wingetExe show --id $AppID --accept-source-agreements 2>&1 | Where-Object { $_ -is [string] }
+
+        if ($showOutput -and $showOutput.Count -gt 0) {
+            # First non-empty line typically contains: "Found <DisplayName> [<AppID>]"
+            foreach ($line in $showOutput) {
+                if ($line -match '^Found\s+(.+?)\s+\[') {
+                    $resolvedName = $Matches[1].Trim()
+                    Write-Log -Message "Resolved FriendlyName for $AppID via winget show: $resolvedName" | Out-Null
+                    $Script:FriendlyNameCache[$AppID] = $resolvedName
+                    return $resolvedName
+                }
+            }
+        }
+    } catch {
+        Write-Log -Message "Failed to resolve FriendlyName for ${AppID}: $($_.Exception.Message)" | Out-Null
+    }
+
+    $Script:FriendlyNameCache[$AppID] = $null
+    return $null
+}
+
 # Parse winget output and process apps
 Write-Log -Message "Starting winget output parsing..."
 $parsingStart = Get-Date
@@ -6718,7 +6763,15 @@ if ($LIST -and $LIST.Count -gt 0) {
                 foreach ($okapp in $whitelistConfig) {
                     if ($appInfo.AppID -like $okapp.AppID) {
                         Write-Log -Message "Processing whitelisted app: $($okapp.AppID)" | Out-Null
-                        
+
+                        # Resolve FriendlyName via winget show if not set in whitelist
+                        if ([string]::IsNullOrEmpty($okapp.FriendlyName)) {
+                            $resolved = Resolve-FriendlyName -AppID $appInfo.AppID
+                            if ($resolved) {
+                                $okapp | Add-Member -NotePropertyName FriendlyName -NotePropertyValue $resolved -Force
+                            }
+                        }
+
                         # First, check deferral status if deferrals are enabled
                         if ($okapp.DeferralEnabled -eq $true) {
                             Write-Log -Message "Deferral system enabled for $($okapp.AppID), checking status" | Out-Null
