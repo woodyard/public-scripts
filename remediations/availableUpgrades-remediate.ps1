@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Winget Application Update Remediation Script
-
+    
 .DESCRIPTION
     This script performs application updates using winget based on a whitelist approach.
     It supports both system and user context applications using a dual-context architecture.
@@ -6008,9 +6008,8 @@ if (-not $whitelistJSON) {
     try {
         Write-Log -Message "Fetching whitelist configuration from GitHub: $whitelistUrl"
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        $webClient = New-Object System.Net.WebClient
-        $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/7.1")
-        $whitelistJSON = $webClient.DownloadString($whitelistUrl)
+        $whitelistJSON = Invoke-RestMethod -Uri $whitelistUrl -Headers @{"User-Agent"="PowerShell-WingetScript/7.1"} -ErrorAction Stop
+        if ($whitelistJSON -isnot [string]) { $whitelistJSON = $whitelistJSON | ConvertTo-Json -Depth 10 }
         Write-Log -Message "Successfully downloaded whitelist configuration from GitHub ($($whitelistJSON.Length) bytes)"
     } catch {
         Write-Log -Message "Error downloading whitelist from GitHub: $($_.Exception.Message)"
