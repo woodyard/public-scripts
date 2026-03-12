@@ -1329,11 +1329,19 @@ function Invoke-WingetUpgradeList {
     # Validate output contains a separator line (row of dashes below the header)
     $hasSeparator = $false
     foreach ($line in $output) {
-        if ($line -match '^-{10,}$') { $hasSeparator = $true; break }
+        if ($line -is [string] -and $line.Trim() -match '^-{10,}$') { $hasSeparator = $true; break }
     }
 
     if (-not $hasSeparator) {
-        Write-Log -Message "First winget run produced invalid output, retrying..."
+        Write-Log -Message "First winget run produced invalid output (lines: $($output.Count)), retrying... First 5 lines:"
+        $diagCount = 0
+        foreach ($diagLine in $output) {
+            if ($diagCount -ge 5) { break }
+            $lineType = $diagLine.GetType().Name
+            $lineStr = if ($diagLine -is [string]) { $diagLine } else { $diagLine.ToString() }
+            Write-Log -Message "  [$diagCount] ($lineType) '$lineStr'"
+            $diagCount++
+        }
         $output = & $WingetExe @wingetArgs 2>&1
     }
 

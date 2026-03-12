@@ -3840,12 +3840,20 @@ function Show-DirectDeferralDialog {
     try {
         Write-Log "Showing direct deferral dialog via child process: '$Title'" | Out-Null
 
-        $resultFile = Join-Path $env:TEMP "WingetDialog_$([guid]::NewGuid().ToString('N')).txt"
+        $dialogId = [guid]::NewGuid().ToString('N')
+        $resultFile = Join-Path $env:TEMP "WingetDialog_$dialogId.txt"
+        $signalFile = Join-Path $env:TEMP "WingetDialog_${dialogId}_Complete.json"
+        $statusFile = Join-Path $env:TEMP "WingetDialog_${dialogId}_Complete_Status.txt"
 
-        # Child process script — result written as "Action|DeferralDays|CloseProcess"
+        # Child process script — writes result file immediately on user choice,
+        # then stays open in progress mode polling for completion signal
         $dialogScript = @'
 param($Title, $Question, $TimeoutSeconds, $ResultFile)
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+
+# Derive signal/status file paths from result file
+$signalFile = $ResultFile -replace '\.txt$', '_Complete.json'
+$statusFile = $ResultFile -replace '\.txt$', '_Complete_Status.txt'
 
 # Detect system theme (0 = dark, 1 = light)
 $isDark = $true
@@ -3883,13 +3891,18 @@ $xaml = @"
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
                 <TextBlock Name="QuestionText" Grid.Row="0" Foreground="$questionFg" TextWrapping="Wrap" Margin="0,0,0,20" FontSize="12"/>
-                <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Center">
+                <StackPanel Grid.Row="1" Name="ButtonPanel" Orientation="Horizontal" HorizontalAlignment="Center">
                     <Button Name="DeferButton" Content="Defer" Width="100" Height="28" Margin="0,0,8,0"
                             Background="Transparent" Foreground="$deferFg" BorderBrush="$deferBorder" BorderThickness="1" FontSize="11" Cursor="Hand"/>
                     <Button Name="UpdateButton" Content="Update Now" Width="100" Height="28"
                             Background="#FF0078D4" Foreground="White" BorderBrush="Transparent" BorderThickness="0" FontSize="11" Cursor="Hand"/>
+                </StackPanel>
+                <StackPanel Grid.Row="2" Name="ProgressPanel" Visibility="Collapsed" HorizontalAlignment="Center" Margin="0,5,0,0">
+                    <ProgressBar Name="ProgressBar" IsIndeterminate="True" Width="300" Height="3" Margin="0,0,0,10" Foreground="#FF0078D4"/>
+                    <TextBlock Name="ProgressText" Text="Updating..." Foreground="$questionFg" FontSize="12" HorizontalAlignment="Center"/>
                 </StackPanel>
             </Grid>
         </Grid>
@@ -3915,12 +3928,77 @@ $updateButton = $window.FindName("UpdateButton")
 $deferButton = $window.FindName("DeferButton")
 $closeButton = $window.FindName("CloseButton")
 
-# Shared state hashtable — "Update|0|True" is default (timeout = update)
+# Shared state
 $s = @{
-    result = "Update|0|True"
+    inProgressMode = $false
     timeRemaining = [int]$TimeoutSeconds
     origUpdate = $updateButton.Content
+    lastStatus = ""
+    progressStartTime = $null
 }
+
+# Function to switch dialog to progress mode — keeps window open, polls for completion
+$switchToProgress = {
+    if ($s.inProgressMode) { return }
+    $s.inProgressMode = $true
+
+    # Write result file immediately so parent can proceed
+    "Update|0|True" | Out-File -FilePath $ResultFile -Encoding UTF8 -NoNewline
+
+    # Switch UI to progress mode
+    $window.FindName("ButtonPanel").Visibility = [System.Windows.Visibility]::Collapsed
+    $window.FindName("CloseButton").Visibility = [System.Windows.Visibility]::Collapsed
+    $window.FindName("ProgressPanel").Visibility = [System.Windows.Visibility]::Visible
+    $window.FindName("QuestionText").Text = "Closing application and installing update..."
+
+    $s.progressStartTime = Get-Date
+
+    # Poll timer — checks for status updates and completion signal
+    $pollTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $pollTimer.Interval = [System.TimeSpan]::FromSeconds(2)
+    $pollTimer.Add_Tick({
+        # Check for status updates
+        if (Test-Path $statusFile) {
+            try {
+                $currentStatus = (Get-Content $statusFile -Raw).Trim()
+                if ($currentStatus -and $currentStatus -ne $s.lastStatus) {
+                    $s.lastStatus = $currentStatus
+                    $window.FindName("ProgressText").Text = $currentStatus
+                }
+            } catch {}
+        }
+        # Check for completion signal
+        if (Test-Path $signalFile) {
+            $pollTimer.Stop()
+            try {
+                $signalData = Get-Content $signalFile -Raw | ConvertFrom-Json
+                $pBar = $window.FindName("ProgressBar")
+                $pText = $window.FindName("ProgressText")
+                $pBar.IsIndeterminate = $false
+                $pBar.Value = 100
+                if ($signalData.Success -eq $true) {
+                    $pText.Text = "Update complete!"
+                } else {
+                    $pText.Text = "Update could not be completed."
+                }
+            } catch {
+                $window.FindName("ProgressText").Text = "Update complete!"
+            }
+            # Auto-close after 3 seconds
+            $closeTimer = New-Object System.Windows.Threading.DispatcherTimer
+            $closeTimer.Interval = [System.TimeSpan]::FromSeconds(3)
+            $closeTimer.Add_Tick({
+                $closeTimer.Stop()
+                $window.Close()
+            }.GetNewClosure())
+            $closeTimer.Start()
+        } elseif (((Get-Date) - $s.progressStartTime).TotalMinutes -gt 5) {
+            $pollTimer.Stop()
+            $window.Close()
+        }
+    }.GetNewClosure())
+    $pollTimer.Start()
+}.GetNewClosure()
 
 $countdownTimer = New-Object System.Windows.Threading.DispatcherTimer
 $countdownTimer.Interval = [System.TimeSpan]::FromSeconds(1)
@@ -3933,35 +4011,34 @@ $countdownTimer.Add_Tick({
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [System.TimeSpan]::FromSeconds([int]$TimeoutSeconds)
 $timer.Add_Tick({
-    $s.result = "Update|0|True"
     $timer.Stop(); $countdownTimer.Stop()
-    $window.Close()
+    & $switchToProgress
 }.GetNewClosure())
 
 $updateButton.Add_Click({
-    $s.result = "Update|0|True"
     $timer.Stop(); $countdownTimer.Stop()
-    $window.Close()
+    & $switchToProgress
 }.GetNewClosure())
 $deferButton.Add_Click({
-    $s.result = "Defer|0|False"
+    "Defer|0|False" | Out-File -FilePath $ResultFile -Encoding UTF8 -NoNewline
     $timer.Stop(); $countdownTimer.Stop()
     $window.Close()
 }.GetNewClosure())
 $closeButton.Add_Click({
-    $s.result = "Defer|0|False"
+    "Defer|0|False" | Out-File -FilePath $ResultFile -Encoding UTF8 -NoNewline
     $timer.Stop(); $countdownTimer.Stop()
     $window.Close()
 }.GetNewClosure())
 $window.Add_Closing({
     $timer.Stop(); $countdownTimer.Stop()
-    if (-not $s.result) { $s.result = "Defer|0|False" }
+    if (-not (Test-Path $ResultFile)) {
+        "Defer|0|False" | Out-File -FilePath $ResultFile -Encoding UTF8 -NoNewline
+    }
 }.GetNewClosure())
 
 $timer.Start()
 $countdownTimer.Start()
 $window.ShowDialog()
-$s.result | Out-File -FilePath $ResultFile -Encoding UTF8 -NoNewline
 '@
 
         # Find PowerShell executable
@@ -3974,13 +4051,25 @@ $s.result | Out-File -FilePath $ResultFile -Encoding UTF8 -NoNewline
         Write-Log "Launching deferral dialog child process ($pwsh) from $scriptFile" | Out-Null
 
         $proc = Start-Process $pwsh -ArgumentList "-NoProfile", "-STA", "-File", "`"$scriptFile`"", "-Title", "`"$Title`"", "-Question", "`"$Question`"", "-TimeoutSeconds", $TimeoutSeconds, "-ResultFile", "`"$resultFile`"" -PassThru -WindowStyle Hidden
-        $proc.WaitForExit()
-        Remove-Item $scriptFile -Force -ErrorAction SilentlyContinue
+
+        # Poll for result file instead of blocking on WaitForExit — dialog stays open for progress
+        $pollTimeout = $TimeoutSeconds + 30
+        $pollStart = Get-Date
+        while (-not (Test-Path $resultFile)) {
+            if (((Get-Date) - $pollStart).TotalSeconds -gt $pollTimeout) {
+                Write-Log "Deferral dialog poll timeout after ${pollTimeout}s" | Out-Null
+                break
+            }
+            if ($proc.HasExited) {
+                Write-Log "Dialog process exited before writing result file" | Out-Null
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        }
 
         # Read and parse result (format: "Action|DeferralDays|CloseProcess")
         if (Test-Path $resultFile) {
             $response = (Get-Content $resultFile -Raw).Trim()
-            Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
             Write-Log "Deferral dialog child process returned: $response" | Out-Null
 
             $parts = $response -split '\|'
@@ -3989,10 +4078,23 @@ $s.result | Out-File -FilePath $ResultFile -Encoding UTF8 -NoNewline
                 DeferralDays = if ($parts.Count -gt 1) { [int]$parts[1] } else { 0 }
                 CloseProcess = if ($parts.Count -gt 2) { $parts[2] -eq "True" } else { $true }
             }
+
+            # If user chose Update, pass signal file so upgrade code can notify the dialog
+            if ($deferralResult.Action -eq "Update") {
+                $deferralResult.ProgressSignalFile = $signalFile
+                Write-Log "Direct dialog progress signal file: $signalFile" | Out-Null
+            }
+
+            # Clean up result file (but NOT signal/status files — dialog still needs them)
+            Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
+
             Write-Log "Deferral dialog result parsed: Action=$($deferralResult.Action), Days=$($deferralResult.DeferralDays), CloseProcess=$($deferralResult.CloseProcess)" | Out-Null
             return $deferralResult
         } else {
             Write-Log "Deferral dialog child process produced no result file, using default: Update" | Out-Null
+            # Clean up child process
+            if (-not $proc.HasExited) { $proc.Kill() }
+            Remove-Item $scriptFile -Force -ErrorAction SilentlyContinue
             return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
         }
 
@@ -6455,7 +6557,7 @@ if ($UserRemediationOnly) {
         $outputValidationStart = Get-Date
         $hasValidOutput = $false
         foreach ($line in $OUTPUT) {
-            if ($line -match '^-{10,}$') { $hasValidOutput = $true; break }
+            if ($line -is [string] -and $line.Trim() -match '^-{10,}$') { $hasValidOutput = $true; break }
         }
         $outputValidationTime = (Get-Date) - $outputValidationStart
         Write-Log -Message "Output validation completed in $($outputValidationTime.TotalMilliseconds) ms - Valid: $hasValidOutput"
@@ -6533,7 +6635,7 @@ if ($UserRemediationOnly) {
             # Validate output contains separator line
             $hasValidOutput = $false
             foreach ($line in $OUTPUT) {
-                if ($line -match '^-{10,}$') { $hasValidOutput = $true; break }
+                if ($line -is [string] -and $line.Trim() -match '^-{10,}$') { $hasValidOutput = $true; break }
             }
 
             # If first output is invalid, run again
