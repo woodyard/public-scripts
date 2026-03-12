@@ -19,7 +19,7 @@
 .NOTES
     Author: Henrik Skovgaard
     Version: 5.28
-    Tag: 5D
+    Tag: 5E
     
     Version History:
     1.0 - Initial version
@@ -1152,7 +1152,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "5D" # Update this tag for each script version
+$ScriptTag = "5E" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"

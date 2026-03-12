@@ -20,7 +20,7 @@
 .NOTES
  Author: Henrik Skovgaard
  Version: 9.3
- Tag: 8X
+ Tag: 9A
     
     Version History:
     1.0 - Initial version
@@ -5891,7 +5891,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "8X" # Update this tag for each script version
+$ScriptTag = "9A" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
