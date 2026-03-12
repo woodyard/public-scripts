@@ -19,7 +19,7 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 8.8
+ Version: 9.3
  Tag: 8X
     
     Version History:
@@ -64,6 +64,10 @@
     8.7 - FEATURE: Added per-version failure tracking - counts consecutive install failures per app version in registry, offers user skip dialog after 3 failures; skip auto-clears when a newer version becomes available or upgrade succeeds
     8.8 - FIX: Added post-upgrade verification for exit-code-0 successes: runs winget list after upgrade and checks if "Available" column is still present; if so treats as failure instead of false-positive success (fixes detection loop for apps like Adobe Reader whose installer returns 0 without changing the installed version)
     8.9 - FIX: Removed --scope user from winget upgrade listing in user remediation context; machine-scoped apps were hidden from detection. Added scope detection to upgrade command: machine-scoped apps are skipped in non-admin user context (would require elevation/UAC), user-scoped apps keep --scope user
+    9.0 - FIX: Fixed whitelist loading via iex bootstrapper - added global scope fallback for $whitelistUrl, TLS 1.2 enforcement, and WhitelistUrl parameter documentation
+    9.1 - FIX: Replaced WebClient.DownloadString with Invoke-RestMethod for whitelist loading to avoid AV/AMSI blocks when run via iex bootstrapper
+    9.2 - ENHANCEMENT: Direct user-context deferral dialog now stays open in progress mode during upgrades instead of closing immediately; polls for status updates and completion signal
+    9.3 - FIX: Added heartbeat updates during app processing loop and Invoke-WingetWithProgress to prevent SYSTEM parent timeout during long upgrades; fixed winget output validation for ErrorRecord objects
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete

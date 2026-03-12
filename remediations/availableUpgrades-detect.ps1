@@ -18,7 +18,7 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.25
+    Version: 5.28
     Tag: 5D
     
     Version History:
@@ -72,6 +72,9 @@
     5.23 - ENHANCEMENT: Implemented comprehensive marker file management system with centralized cleanup functions, orphaned file detection, and emergency cleanup handlers to prevent accumulation of .userdetection files; Added hidden console window execution method using cmd.exe with /min flag to eliminate visible console windows during scheduled task execution
     5.24 - PERFORMANCE OPTIMIZATION: Implemented user info caching to eliminate redundant WMI calls, enhanced scheduled task execution with -NoProfile flag for better reliability, eliminated double marker file initialization
     5.25 - ENHANCEMENT: Detection output now reports deferred apps with their deadline in the script tag message, providing visibility into postponed updates in Intune logs
+    5.26 - FIX: Fixed whitelist loading via iex bootstrapper - added global scope fallback for $whitelistUrl and TLS 1.2 enforcement for WebClient downloads
+    5.27 - FIX: Replaced WebClient.DownloadString with Invoke-RestMethod for whitelist loading to avoid AV/AMSI blocks
+    5.28 - FIX: Fixed winget output validation to handle stderr ErrorRecord objects and trailing whitespace; improved retry log message for source updates
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
