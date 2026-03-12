@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.4
- Tag: 9B
+ Version: 9.5
+ Tag: 9C
     
     Version History:
     1.0 - Initial version
@@ -69,6 +69,7 @@
     9.2 - ENHANCEMENT: Direct user-context deferral dialog now stays open in progress mode during upgrades instead of closing immediately; polls for status updates and completion signal
     9.3 - FIX: Added heartbeat updates during app processing loop and Invoke-WingetWithProgress to prevent SYSTEM parent timeout during long upgrades; fixed winget output validation for ErrorRecord objects
     9.4 - ENHANCEMENT: Added Resolve-FriendlyName function that looks up display names via winget show when FriendlyName is missing from whitelist config; runs lazily only for matched apps being updated
+    9.5 - FEATURE: Added category-based whitelist defaults; JSON now supports { CategoryDefaults, Apps } structure where per-category settings (PromptWhenBlocked, TimeoutSeconds, DeferralEnabled, etc.) are inherited by apps in that category; app-level properties override category defaults; backward compatible with legacy flat array format
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -5892,7 +5893,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "9B" # Update this tag for each script version
+$ScriptTag = "9C" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6152,7 +6153,41 @@ if ($ResolveWingetPath) {
 }
 
 try {
-    $whitelistConfig = $whitelistJSON | ConvertFrom-Json -ErrorAction Stop
+    $parsedWhitelist = $whitelistJSON | ConvertFrom-Json -ErrorAction Stop
+
+    # Support both new format { CategoryDefaults, Apps } and legacy flat array
+    if ($parsedWhitelist.Apps) {
+        $categoryDefaults = @{}
+        if ($parsedWhitelist.CategoryDefaults) {
+            $parsedWhitelist.CategoryDefaults.PSObject.Properties | ForEach-Object {
+                $categoryDefaults[$_.Name] = $_.Value
+            }
+            Write-Log -Message "Loaded category defaults for: $($categoryDefaults.Keys -join ', ')"
+        }
+
+        $whitelistConfig = $parsedWhitelist.Apps | ForEach-Object {
+            $app = $_
+            $category = $app.Category
+            if ($category -and $categoryDefaults.ContainsKey($category)) {
+                $defaults = $categoryDefaults[$category]
+                # Merge: category defaults first, then app-level properties override
+                $defaults.PSObject.Properties | ForEach-Object {
+                    $propName = $_.Name
+                    # Only apply default if the app doesn't already define this property
+                    if ($null -eq $app.PSObject.Properties[$propName]) {
+                        $app | Add-Member -NotePropertyName $propName -NotePropertyValue $_.Value -Force
+                    }
+                }
+            }
+            $app
+        }
+        Write-Log -Message "Loaded whitelist with category support ($($whitelistConfig.Count) apps)"
+    } else {
+        # Legacy flat array format
+        $whitelistConfig = $parsedWhitelist
+        Write-Log -Message "Loaded legacy whitelist format ($($whitelistConfig.Count) apps)"
+    }
+
     $whitelistConfig = $whitelistConfig | Where-Object { ($_.Disabled -eq $null -or $_.Disabled -eq $false) }
     Write-Log -Message "Successfully loaded whitelist configuration with $($whitelistConfig.Count) enabled apps"
 } catch {

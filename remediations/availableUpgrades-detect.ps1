@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.28
-    Tag: 5E
+    Version: 5.29
+    Tag: 5F
     
     Version History:
     1.0 - Initial version
@@ -75,6 +75,7 @@
     5.26 - FIX: Fixed whitelist loading via iex bootstrapper - added global scope fallback for $whitelistUrl and TLS 1.2 enforcement for WebClient downloads
     5.27 - FIX: Replaced WebClient.DownloadString with Invoke-RestMethod for whitelist loading to avoid AV/AMSI blocks
     5.28 - FIX: Fixed winget output validation to handle stderr ErrorRecord objects and trailing whitespace; improved retry log message for source updates
+    5.29 - FEATURE: Added category-based whitelist defaults; supports new { CategoryDefaults, Apps } JSON structure with backward compatibility for legacy flat array format
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -1152,7 +1153,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "5E" # Update this tag for each script version
+$ScriptTag = "5F" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -1299,7 +1300,41 @@ if ($ResolveWingetPath) {
 }
 
 try {
-    $whitelistConfig = $whitelistJSON | ConvertFrom-Json -ErrorAction Stop
+    $parsedWhitelist = $whitelistJSON | ConvertFrom-Json -ErrorAction Stop
+
+    # Support both new format { CategoryDefaults, Apps } and legacy flat array
+    if ($parsedWhitelist.Apps) {
+        $categoryDefaults = @{}
+        if ($parsedWhitelist.CategoryDefaults) {
+            $parsedWhitelist.CategoryDefaults.PSObject.Properties | ForEach-Object {
+                $categoryDefaults[$_.Name] = $_.Value
+            }
+            Write-Log -Message "Loaded category defaults for: $($categoryDefaults.Keys -join ', ')"
+        }
+
+        $whitelistConfig = $parsedWhitelist.Apps | ForEach-Object {
+            $app = $_
+            $category = $app.Category
+            if ($category -and $categoryDefaults.ContainsKey($category)) {
+                $defaults = $categoryDefaults[$category]
+                # Merge: category defaults first, then app-level properties override
+                $defaults.PSObject.Properties | ForEach-Object {
+                    $propName = $_.Name
+                    # Only apply default if the app doesn't already define this property
+                    if ($null -eq $app.PSObject.Properties[$propName]) {
+                        $app | Add-Member -NotePropertyName $propName -NotePropertyValue $_.Value -Force
+                    }
+                }
+            }
+            $app
+        }
+        Write-Log -Message "Loaded whitelist with category support ($($whitelistConfig.Count) apps)"
+    } else {
+        # Legacy flat array format
+        $whitelistConfig = $parsedWhitelist
+        Write-Log -Message "Loaded legacy whitelist format ($($whitelistConfig.Count) apps)"
+    }
+
     $whitelistConfig = $whitelistConfig | Where-Object { ($_.Disabled -eq $null -or $_.Disabled -eq $false) }
     Write-Log -Message "Successfully loaded whitelist configuration with $($whitelistConfig.Count) enabled apps"
 } catch {
