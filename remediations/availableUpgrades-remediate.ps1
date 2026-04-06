@@ -70,6 +70,7 @@
     9.3 - FIX: Added heartbeat updates during app processing loop and Invoke-WingetWithProgress to prevent SYSTEM parent timeout during long upgrades; fixed winget output validation for ErrorRecord objects
     9.4 - ENHANCEMENT: Added Resolve-FriendlyName function that looks up display names via winget show when FriendlyName is missing from whitelist config; runs lazily only for matched apps being updated
     9.5 - FEATURE: Added category-based whitelist defaults; JSON now supports { CategoryDefaults, Apps } structure where per-category settings (PromptWhenBlocked, TimeoutSeconds, DeferralEnabled, etc.) are inherited by apps in that category; app-level properties override category defaults; backward compatible with legacy flat array format
+    9.6 - FIX: SYSTEM-side wait now uses idle-based timeout (600s without heartbeat) instead of hard deadline, so active user-context upgrades run indefinitely as long as heartbeat is alive; post-upgrade verification uses --exact flag to prevent substring ID matches and compares available version against target to avoid false failures when a newer release appears in the source after upgrade; added diagnostic logging to success evaluation; pre-update winget source once before the upgrade loop to prevent redundant per-app source refreshes
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -5145,24 +5146,30 @@ function Schedule-UserContextRemediation {
             $statusFile = Join-Path $sharedTempPath "UserRemediation_$randomId.status"
             $heartbeatFile = Join-Path $sharedTempPath "UserRemediation_$randomId.heartbeat"
             
-            # Much longer timeout but with progress monitoring
-            $maxTimeout = 600  # 10 minutes maximum
-            $heartbeatTimeout = 120  # 2 minutes without heartbeat timeout
+            # Idle-based timeout: resets whenever a heartbeat is received, times out after 600s of silence
+            $idleTimeout = 600  # 10 minutes without heartbeat = timeout
+            $heartbeatTimeout = 120  # 2 minutes: max age for a heartbeat to be considered "active"
             $startTime = Get-Date
             $success = $false
-            
+
             Write-Log "Waiting for user remediation results with marker file synchronization" | Out-Null
             Write-Log "Result file expected at: $resultFile" | Out-Null
             Write-Log "Status file: $statusFile" | Out-Null
             Write-Log "Heartbeat file: $heartbeatFile" | Out-Null
-            Write-Log "Maximum timeout: $maxTimeout seconds, Heartbeat timeout: $heartbeatTimeout seconds" | Out-Null
-            
+            Write-Log "Idle timeout: $idleTimeout seconds (resets on heartbeat), Heartbeat active threshold: $heartbeatTimeout seconds" | Out-Null
+
             $waitStartTime = Get-Date
+            $lastHeartbeatTime = Get-Date  # Tracks when we last saw an active heartbeat (or start time)
             $lastStatusLog = Get-Date
             $lastHeartbeatCheck = Get-Date
             $checkCount = 0
-            
-            while ((Get-Date) -lt $waitStartTime.AddSeconds($maxTimeout)) {
+
+            while ($true) {
+                $idleSeconds = ((Get-Date) - $lastHeartbeatTime).TotalSeconds
+                if ($idleSeconds -ge $idleTimeout) {
+                    Write-Log "Idle timeout reached: no heartbeat for $([int]$idleSeconds) seconds (limit: $idleTimeout)" | Out-Null
+                    break
+                }
                 $checkCount++
                 $currentTime = Get-Date
                 $elapsedTotal = ($currentTime - $waitStartTime).TotalSeconds
@@ -5275,6 +5282,11 @@ function Schedule-UserContextRemediation {
                 } elseif ($elapsedTotal -le 30) {
                     $isUserContextActive = $true  # Still within startup grace period
                 }
+
+                # Reset idle timer whenever heartbeat is active
+                if ($isUserContextActive) {
+                    $lastHeartbeatTime = Get-Date
+                }
                 
                 # Check status file for progress updates
                 $statusMessage = ""
@@ -5316,19 +5328,13 @@ function Schedule-UserContextRemediation {
                     $lastStatusLog = $currentTime
                 }
                 
-                # If user context appears to be inactive/hung and we've waited long enough, timeout
-                if (-not $isUserContextActive -and $elapsedTotal -gt 60) {
-                    Write-Log "User context appears inactive (no recent heartbeat) - timing out" | Out-Null
-                    Write-Log "Last heartbeat age: $([int]$heartbeatAge) seconds (max: $heartbeatTimeout)" | Out-Null
-                    break
-                }
-                
                 Start-Sleep -Seconds 3  # Slightly longer sleep since we're monitoring more files
             }
-            
+
             $totalWaitTime = (Get-Date) - $waitStartTime
-            if ((Get-Date) -ge $waitStartTime.AddSeconds($maxTimeout)) {
-                Write-Log "User remediation timed out after $($totalWaitTime.TotalSeconds) seconds (limit: $maxTimeout)" | Out-Null
+            $finalIdleSeconds = ((Get-Date) - $lastHeartbeatTime).TotalSeconds
+            if ($finalIdleSeconds -ge $idleTimeout) {
+                Write-Log "User remediation idle-timed out after $([int]$totalWaitTime.TotalSeconds) seconds total ($([int]$finalIdleSeconds)s since last heartbeat, limit: $idleTimeout)" | Out-Null
                 Write-Log "Total file existence checks performed: $checkCount" | Out-Null
                 
                 # Final check on task status
@@ -5893,7 +5899,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "9C" # Update this tag for each script version
+$ScriptTag = "9D" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6786,6 +6792,23 @@ if ($LIST -and $LIST.Count -gt 0) {
         $count = 0
         $message = ""
         $processingStart = Get-Date
+
+        # Pre-update winget source so individual upgrade commands don't each trigger their own source refresh
+        try {
+            $sourceUpdateExe = if ((Test-RunningAsSystem) -and $WingetPath) { Join-Path $WingetPath "winget.exe" } else { "winget.exe" }
+            $sourceUpdateArgs = @("source", "update", "--name", "winget")
+            Write-Log -Message "Pre-updating winget source to avoid per-app source refreshes..."
+            if ((Test-RunningAsSystem) -and $WingetPath) {
+                Push-Location $WingetPath
+                try { & $sourceUpdateExe @sourceUpdateArgs 2>&1 | Out-Null } finally { Pop-Location }
+            } else {
+                & $sourceUpdateExe @sourceUpdateArgs 2>&1 | Out-Null
+            }
+            Write-Log -Message "Winget source pre-update complete"
+        } catch {
+            Write-Log -Message "Winget source pre-update failed (non-fatal): $($_.Exception.Message)"
+        }
+
         Write-Log -Message "Starting app processing loop..."
 
         foreach ($appInfo in $LIST) {
@@ -7120,30 +7143,56 @@ if ($LIST -and $LIST.Count -gt 0) {
                         # Evaluate success
                         Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Verifying installation..."
                         $isSuccess = $false
+                        $successReason = "none"
                         if ($upgradeOutput -like "*Successfully installed*" -or $upgradeOutput -like "*Successfully updated*") {
                             $isSuccess = $true
+                            $successReason = "output-match"
                         } elseif ($upgradeOutput -like "*No applicable update*" -or $upgradeOutput -like "*No newer version available*") {
                             $isSuccess = $true
+                            $successReason = "already-current"
                         } elseif ($null -ne $LASTEXITCODE -and $LASTEXITCODE -eq 0 -and $upgradeOutput -notlike "*failed*" -and $upgradeOutput -notlike "*error*0x*") {
                             $isSuccess = $true
+                            $successReason = "exit-code-0"
                         }
+                        Write-Log -Message "Initial success evaluation for $($appInfo.AppID): isSuccess=$isSuccess, reason=$successReason, LASTEXITCODE=$LASTEXITCODE, outputLength=$($upgradeOutput.Length)"
 
-                        # Post-upgrade verification: always confirm via winget list that the update actually took effect
+                        # Post-upgrade verification: confirm via winget list --exact that the update actually took effect
                         if ($isSuccess -and -not $Script:TestMode) {
                             try {
                                 $verifyExe = if ((Test-RunningAsSystem) -and $WingetPath) { Join-Path $WingetPath "winget.exe" } else { "winget.exe" }
-                                $verifyArgs = @("list", "--id", $appInfo.AppID, "--source", "winget", "--accept-source-agreements")
+                                $verifyArgs = @("list", "--id", $appInfo.AppID, "--exact", "--source", "winget", "--accept-source-agreements")
                                 if ((Test-RunningAsSystem) -and $WingetPath) {
                                     Push-Location $WingetPath
                                     try { $verifyResult = & $verifyExe @verifyArgs 2>&1 } finally { Pop-Location }
                                 } else {
                                     $verifyResult = & $verifyExe @verifyArgs 2>&1
                                 }
-                                $verifyText = $verifyResult -join "`n"
-                                # If winget list still shows an "Available" upgrade column for this app, the upgrade didn't change the installed version
+                                $verifyText = ($verifyResult | ForEach-Object { "$_" }) -join "`n"
+                                # If winget list still shows an "Available" upgrade column for this exact app, check whether
+                                # it is the SAME version we tried to install (true failure) or a NEWER version (source updated after our upgrade)
                                 if ($verifyText -match "\sAvailable\s" -and $verifyText -like "*$($appInfo.AppID)*") {
-                                    Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) still shows pending update - treating as failure"
-                                    $isSuccess = $false
+                                    # Parse the available version from winget list output to compare
+                                    $verifyAvailableVersion = $null
+                                    foreach ($vLine in ($verifyText -split "`n")) {
+                                        if ($vLine -like "*$($appInfo.AppID)*" -and $vLine -notmatch '^\s*Name\s') {
+                                            # Extract version fields: the line format is "Name  Id  Version  Available  Source"
+                                            # Split on 2+ spaces to get columns
+                                            $vCols = $vLine -split '\s{2,}' | Where-Object { $_ -ne "" }
+                                            if ($vCols.Count -ge 4) {
+                                                $verifyAvailableVersion = $vCols[$vCols.Count - 2]  # Available is second-to-last (before Source)
+                                            }
+                                            break
+                                        }
+                                    }
+                                    Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) shows Available=$verifyAvailableVersion (we upgraded to $($appInfo.AvailableVersion))"
+                                    if ($verifyAvailableVersion -and $verifyAvailableVersion -ne $appInfo.AvailableVersion) {
+                                        # A different (newer) version appeared in the source after our upgrade — our upgrade likely succeeded
+                                        Write-Log -Message "Post-upgrade verification: Available version ($verifyAvailableVersion) differs from target ($($appInfo.AvailableVersion)) - newer release appeared, trusting original success"
+                                    } else {
+                                        # Same version still pending — the upgrade genuinely did not take effect
+                                        Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) still shows same pending update - treating as failure"
+                                        $isSuccess = $false
+                                    }
                                 } else {
                                     Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) confirmed up to date"
                                 }
@@ -7171,7 +7220,7 @@ if ($LIST -and $LIST.Count -gt 0) {
                         } else {
                             # Log full output for debugging (filter out progress bar characters)
                             $debugLines = ($upgradeResult | ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne "" -and $_ -notmatch '^[\u2580-\u259F\s\|/\\-]+$' }) -join " | "
-                            Write-Log -Message "Upgrade failed for $($appInfo.AppID) - Exit code: $LASTEXITCODE - Output: $debugLines"
+                            Write-Log -Message "Upgrade failed for $($appInfo.AppID) - reason=$successReason, Exit code: $LASTEXITCODE - Output: $debugLines"
                             $message += "$($appInfo.AppID) (FAILED)|"
                             $newFailCount = Set-VersionFailure -AppID $appInfo.AppID -Version $appInfo.AvailableVersion
                             Write-Log -Message "Install failure count for $($appInfo.AppID) $($appInfo.AvailableVersion): $newFailCount/3"
