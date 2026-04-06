@@ -70,7 +70,7 @@
     9.3 - FIX: Added heartbeat updates during app processing loop and Invoke-WingetWithProgress to prevent SYSTEM parent timeout during long upgrades; fixed winget output validation for ErrorRecord objects
     9.4 - ENHANCEMENT: Added Resolve-FriendlyName function that looks up display names via winget show when FriendlyName is missing from whitelist config; runs lazily only for matched apps being updated
     9.5 - FEATURE: Added category-based whitelist defaults; JSON now supports { CategoryDefaults, Apps } structure where per-category settings (PromptWhenBlocked, TimeoutSeconds, DeferralEnabled, etc.) are inherited by apps in that category; app-level properties override category defaults; backward compatible with legacy flat array format
-    9.6 - FIX: SYSTEM-side wait now uses idle-based timeout (600s without heartbeat) instead of hard deadline, so active user-context upgrades run indefinitely as long as heartbeat is alive; post-upgrade verification uses --exact flag to prevent substring ID matches and compares available version against target to avoid false failures when a newer release appears in the source after upgrade; added diagnostic logging to success evaluation; pre-update winget source once before the upgrade loop to prevent redundant per-app source refreshes
+    9.6 - FIX: SYSTEM-side wait now uses idle-based timeout (600s without heartbeat) instead of hard deadline, so active user-context upgrades run indefinitely as long as heartbeat is alive; post-upgrade verification uses --exact flag to prevent substring ID matches and compares available version against target to avoid false failures when a newer release appears in the source after upgrade; added diagnostic logging to success evaluation; pre-update winget source once before the upgrade loop to prevent redundant per-app source refreshes; removed misleading "Updating sources..." status from progress dialog during winget preamble
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -2156,12 +2156,7 @@ function Invoke-WingetWithProgress {
                             $foundIndex = $outText.IndexOf($Matches[0])
                             $outText = $outText.Substring($foundIndex)
                         } elseif (-not $pastSourceUpdate) {
-                            # Still in source update phase, show a status but skip download progress
-                            $status = "Updating sources..."
-                            if ($status -ne $lastStatus) {
-                                $lastStatus = $status
-                                Write-InfoDialogStatus -SignalFilePath $SignalFilePath -Status $status
-                            }
+                            # Winget preamble (source check / startup) — don't show misleading "Updating sources"
                             continue
                         } else {
                             # pastSourceUpdate is true but "Found" not in current read (partial read) - skip to avoid showing source index sizes
