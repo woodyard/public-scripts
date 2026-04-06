@@ -70,7 +70,7 @@
     9.3 - FIX: Added heartbeat updates during app processing loop and Invoke-WingetWithProgress to prevent SYSTEM parent timeout during long upgrades; fixed winget output validation for ErrorRecord objects
     9.4 - ENHANCEMENT: Added Resolve-FriendlyName function that looks up display names via winget show when FriendlyName is missing from whitelist config; runs lazily only for matched apps being updated
     9.5 - FEATURE: Added category-based whitelist defaults; JSON now supports { CategoryDefaults, Apps } structure where per-category settings (PromptWhenBlocked, TimeoutSeconds, DeferralEnabled, etc.) are inherited by apps in that category; app-level properties override category defaults; backward compatible with legacy flat array format
-    9.6 - FIX: SYSTEM-side wait now uses idle-based timeout (600s without heartbeat) instead of hard deadline, so active user-context upgrades run indefinitely as long as heartbeat is alive; post-upgrade verification uses --exact flag to prevent substring ID matches and compares available version against target to avoid false failures when a newer release appears in the source after upgrade; added diagnostic logging to success evaluation; pre-update winget source once before the upgrade loop to prevent redundant per-app source refreshes; removed misleading "Updating sources..." status from progress dialog during winget preamble
+    9.6 - FIX: SYSTEM-side wait now uses idle-based timeout (600s without heartbeat) instead of hard deadline, so active user-context upgrades run indefinitely as long as heartbeat is alive; post-upgrade verification uses --exact flag to prevent substring ID matches and compares available version against target to avoid false failures when a newer release appears in the source after upgrade; added diagnostic logging to success evaluation; pre-update winget source once before the upgrade loop to prevent redundant per-app source refreshes; removed misleading "Updating sources..." status from progress dialog; optimized per-app winget commands by dropping unused --log flag, adding --disable-interactivity and --accept-package-agreements to eliminate preamble stalls
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -2106,14 +2106,11 @@ function Invoke-WingetWithProgress {
         }
     }
 
-    $logFile = Join-Path $env:TEMP "winget_progress_$([guid]::NewGuid().ToString('N').Substring(0,8)).log"
     $outFile = Join-Path $env:TEMP "winget_out_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
     $errFile = Join-Path $env:TEMP "winget_err_$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
 
     try {
-        # Build argument string: original args + --log for progress tracking
-        $fullArgs = @($Arguments) + @("--log", $logFile)
-        $argString = $fullArgs -join " "
+        $argString = ($Arguments -join " ")
 
         $startParams = @{
             FilePath = $WingetExe
@@ -2126,7 +2123,7 @@ function Invoke-WingetWithProgress {
         if ($WorkingDirectory) { $startParams.WorkingDirectory = $WorkingDirectory }
 
         $proc = Start-Process @startParams
-        Write-Log "Started winget process (PID: $($proc.Id)) with log: $logFile" | Out-Null
+        Write-Log "Started winget process (PID: $($proc.Id))" | Out-Null
 
         $lastStatus = ""
         $downloadDetected = $false
@@ -2248,17 +2245,8 @@ function Invoke-WingetWithProgress {
             return & $WingetExe @Arguments 2>&1
         }
     } finally {
-        # Clean up temp files; winget may briefly hold a lock on the log file after exit
+        # Clean up temp files
         Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
-        for ($i = 0; $i -lt 3; $i++) {
-            Remove-Item $logFile -Force -ErrorAction SilentlyContinue
-            if (-not (Test-Path $logFile)) { break }
-            Start-Sleep -Milliseconds 500
-        }
-        # Also clean up any orphaned winget_progress files from previous runs
-        Get-ChildItem -Path $env:TEMP -Filter "winget_progress_*.log" -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) } |
-            Remove-Item -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -7037,7 +7025,7 @@ if ($LIST -and $LIST.Count -gt 0) {
                         # First attempt: Standard upgrade with progress monitoring
                         $wingetExe = if ((Test-RunningAsSystem) -and $WingetPath) { Join-Path $WingetPath "winget.exe" } else { "winget.exe" }
                         $wingetDir = if ((Test-RunningAsSystem) -and $WingetPath) { $WingetPath } else { $null }
-                        $wingetArgs = @("upgrade", "--silent", "--accept-source-agreements", "--source", "winget", "--id", $appInfo.AppID)
+                        $wingetArgs = @("upgrade", "--silent", "--disable-interactivity", "--accept-source-agreements", "--accept-package-agreements", "--source", "winget", "--id", $appInfo.AppID)
 
                         # Detect installed scope and add --scope flag accordingly
                         $detectedScope = "unknown"
