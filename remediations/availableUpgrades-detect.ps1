@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.29
-    Tag: 5F
+    Version: 5.30
+    Tag: 60
     
     Version History:
     1.0 - Initial version
@@ -76,6 +76,7 @@
     5.27 - FIX: Replaced WebClient.DownloadString with Invoke-RestMethod for whitelist loading to avoid AV/AMSI blocks
     5.28 - FIX: Fixed winget output validation to handle stderr ErrorRecord objects and trailing whitespace; improved retry log message for source updates
     5.29 - FEATURE: Added category-based whitelist defaults; supports new { CategoryDefaults, Apps } JSON structure with backward compatibility for legacy flat array format
+    5.30 - FIX: Detection script now cleans up stale temp files and orphaned scheduled tasks from both detection and remediation scripts; expanded Remove-OldTempFiles to scan user temp directories with 10-minute cutoff; added Remove-StaleScheduledTasks to remove orphaned tasks from all known prefixes; ensures cleanup runs every Intune check cycle even when remediation is not triggered
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -165,27 +166,114 @@ function Remove-OldLogs {
 function Remove-OldTempFiles {
     <#
     .SYNOPSIS
-        Cleans up stale temp files created by this script in C:\ProgramData\Temp
+        Cleans up stale temp files created by detection and remediation scripts
+    .DESCRIPTION
+        Scans C:\ProgramData\Temp and all user temp directories for leftover files
+        from both the detection and remediation scripts (VBS launchers, dialog scripts,
+        response files, etc.). Uses a 10-minute cutoff since these files are only
+        needed while a dialog or task is active.
     #>
-    $tempPath = "C:\ProgramData\Temp"
-    if (-not (Test-Path $tempPath)) { return }
-
-    $cutoff = (Get-Date).AddMinutes(-30)
+    # 10-minute cutoff: these files are only needed while a task/dialog is active.
+    # Anything older is leftover from a previous run and safe to remove.
+    $cutoff = (Get-Date).AddMinutes(-10)
     $removed = 0
 
-    # Match all file patterns this script creates in C:\ProgramData\Temp
+    # Match file patterns from both detection and remediation scripts
     # Using regex instead of -Filter because Windows filter matching is unreliable with multiple dots (e.g. .ps1.userdetection)
-    $nameRegex = '^(UserDetection_(Fallback_)?\d+\.json$|availableUpgrades-detect_\d+\.ps1|HiddenLaunch_\d+\.vbs$)'
+    $nameRegex = '^(UserDetection_(Fallback_)?\d+\.json$|availableUpgrades-detect_\d+\.ps1|availableUpgrades-remediate_\d+\.ps1|UserRemediation_\d+\.|UserRemediationHeartbeat_|MandatoryPrompt_.*_(Response|Progress)|Show-MandatoryPrompt_|DeferralPrompt_.*_Response|Show-DeferralPrompt_|UserPrompt_.*_Response|Show-UserPrompt_|UpgradeProgress_.*_(Signal|Status)|Show-UpgradeProgress_|CompletionNotification_|Show-CompletionNotification_|SkipPrompt_.*_Response|Show-SkipPrompt_|UserContext_Debug|UserContext_Heartbeat_Error_|HiddenLaunch_\d+\.vbs$)'
 
-    Get-ChildItem -Path $tempPath -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
-        ForEach-Object {
-            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-            $removed++
+    # Scan C:\ProgramData\Temp
+    $tempPath = "C:\ProgramData\Temp"
+    if (Test-Path $tempPath) {
+        Get-ChildItem -Path $tempPath -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
+            ForEach-Object {
+                Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+                $removed++
+            }
+    }
+
+    # Scan user temp directories for VBS launchers and dialog script/response files
+    try {
+        $userTempPaths = Get-ChildItem -Path "C:\Users" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName "AppData\Local\Temp" } |
+            Where-Object { Test-Path $_ }
+
+        foreach ($userTemp in $userTempPaths) {
+            Get-ChildItem -Path $userTemp -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
+                ForEach-Object {
+                    Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+                    $removed++
+                }
         }
+    } catch {
+        # Don't let user temp cleanup failures block the main script
+    }
 
     if ($removed -gt 0) {
-        Write-Log -Message "Cleaned up $removed old temp files from $tempPath"
+        Write-Log -Message "Cleaned up $removed old temp files"
+    }
+}
+
+function Remove-StaleScheduledTasks {
+    <#
+    .SYNOPSIS
+        Removes orphaned scheduled tasks left behind by previous script executions
+    .DESCRIPTION
+        Sweeps Task Scheduler for tasks matching known prefixes from both detection
+        and remediation scripts. Handles cases where cleanup never ran (process
+        terminated or remediation not triggered).
+    #>
+    param(
+        [int]$MaxAgeMinutes = 10
+    )
+
+    $prefixes = @(
+        "UserPrompt_",
+        "UpgradeProgress_",
+        "CompletionNotification_",
+        "MandatoryPrompt_",
+        "DeferralPrompt_",
+        "SkipPrompt_",
+        "UserRemediation_",
+        "UserDetection_"
+    )
+
+    try {
+        $cutoff = (Get-Date).AddMinutes(-$MaxAgeMinutes)
+        $allTasks = Get-ScheduledTask -TaskPath "\" -ErrorAction SilentlyContinue
+        if (-not $allTasks) { return 0 }
+
+        $removed = 0
+        foreach ($task in $allTasks) {
+            $matched = $false
+            foreach ($prefix in $prefixes) {
+                if ($task.TaskName.StartsWith($prefix)) {
+                    $matched = $true
+                    break
+                }
+            }
+            if (-not $matched) { continue }
+
+            try {
+                $taskDate = [datetime]::Parse($task.Date)
+                if ($taskDate -lt $cutoff) {
+                    Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                    $removed++
+                }
+            } catch {
+                Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                $removed++
+            }
+        }
+
+        if ($removed -gt 0) {
+            Write-Log -Message "Cleaned up $removed stale scheduled tasks (older than $MaxAgeMinutes minutes)"
+        }
+        return $removed
+    } catch {
+        return 0
     }
 }
 
@@ -1153,7 +1241,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "5F" # Update this tag for each script version
+$ScriptTag = "60" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -1200,8 +1288,11 @@ if (-not $Script:MarkerSystemInitialized) {
 # Clean up old log files (older than 1 month)
 Remove-OldLogs -LogPath $LogPath
 
-# Clean up stale temp files from previous runs (older than 30 minutes)
+# Clean up stale temp files from previous runs (detection + remediation leftovers)
 Remove-OldTempFiles
+
+# Clean up orphaned scheduled tasks from previous runs (detection + remediation leftovers)
+Remove-StaleScheduledTasks
 
 # Log script start with full date
 Write-Log -Message "Script started on $(Get-Date -Format 'dd.MM.yyyy')"
