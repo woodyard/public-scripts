@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.5
- Tag: 9C
+ Version: 9.7
+ Tag: 9E
     
     Version History:
     1.0 - Initial version
@@ -71,6 +71,7 @@
     9.4 - ENHANCEMENT: Added Resolve-FriendlyName function that looks up display names via winget show when FriendlyName is missing from whitelist config; runs lazily only for matched apps being updated
     9.5 - FEATURE: Added category-based whitelist defaults; JSON now supports { CategoryDefaults, Apps } structure where per-category settings (PromptWhenBlocked, TimeoutSeconds, DeferralEnabled, etc.) are inherited by apps in that category; app-level properties override category defaults; backward compatible with legacy flat array format
     9.6 - FIX: SYSTEM-side wait now uses idle-based timeout (600s without heartbeat) instead of hard deadline, so active user-context upgrades run indefinitely as long as heartbeat is alive; post-upgrade verification uses --exact flag to prevent substring ID matches and compares available version against target to avoid false failures when a newer release appears in the source after upgrade; added diagnostic logging to success evaluation; pre-update winget source once before the upgrade loop to prevent redundant per-app source refreshes; removed misleading "Updating sources..." status from progress dialog; optimized per-app winget commands by dropping unused --log flag, adding --disable-interactivity and --accept-package-agreements to eliminate preamble stalls
+    9.7 - FIX: Fixed orphaned scheduled task cleanup — added Remove-StaleScheduledTasks startup sweep for all task prefixes (UserPrompt_, UpgradeProgress_, CompletionNotification_, MandatoryPrompt_, DeferralPrompt_, SkipPrompt_, UserRemediation_); added task and temp file cleanup to catch blocks in Invoke-SystemUserPrompt, Invoke-SystemCompletionNotification, Invoke-SystemDeferralPrompt, Show-VersionSkipDialog, and Show-MandatoryUpdateDialog that previously leaked tasks on exceptions
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -1405,6 +1406,11 @@ try {
         
     } catch {
         Write-Log -Message "Invoke-SystemUserPrompt failed: $($_.Exception.Message)" | Out-Null
+        if ($createdTaskName) {
+            Remove-UserPromptTask -TaskName $createdTaskName
+        }
+        Remove-Item $userPromptScriptPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
         return $DefaultAction
     }
 }
@@ -2638,6 +2644,13 @@ Write-NotifLog "=== COMPLETION NOTIFICATION ENDED ==="
 
     } catch {
         Write-Log "Error in Invoke-SystemCompletionNotification: $($_.Exception.Message)" | Out-Null
+        if ($taskName) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        Remove-Item $notificationScriptPath -Force -ErrorAction SilentlyContinue
+        if ($notifLaunch -and $notifLaunch.VbsPath) {
+            Remove-Item $notifLaunch.VbsPath -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -3241,6 +3254,15 @@ try {
 
     } catch {
         Write-Log "Error in system mandatory prompt: $($_.Exception.Message)" | Out-Null
+        if ($taskName) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        Remove-Item $mandatoryScriptPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
+        Remove-Item $progressSignalFile -Force -ErrorAction SilentlyContinue
+        if ($mandatoryLaunch -and $mandatoryLaunch.VbsPath) {
+            Remove-Item $mandatoryLaunch.VbsPath -Force -ErrorAction SilentlyContinue
+        }
         return $null
     }
 }
@@ -4544,6 +4566,14 @@ Write-DeferLog "=== DEFERRAL PROMPT SCRIPT ENDED ==="
         
     } catch {
         Write-Log "Error in system deferral prompt: $($_.Exception.Message)" | Out-Null
+        if ($taskName) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        Remove-Item $deferralScriptPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
+        if ($deferralLaunch -and $deferralLaunch.VbsPath) {
+            Remove-Item $deferralLaunch.VbsPath -Force -ErrorAction SilentlyContinue
+        }
         return @{ Action = "Update"; DeferralDays = 0; CloseProcess = $true }
     }
 }
@@ -4898,6 +4928,14 @@ try {
 
     } catch {
         Write-Log "Error showing skip dialog for $AppName`: $($_.Exception.Message)" | Out-Null
+        if ($taskName) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
+        if ($launch -and $launch.VbsPath) {
+            Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue
+        }
         return $false
     }
 }
@@ -5571,6 +5609,69 @@ function Remove-OldTempFiles {
     }
 }
 
+function Remove-StaleScheduledTasks {
+    <#
+    .SYNOPSIS
+        Removes orphaned scheduled tasks left behind by previous script executions
+    .DESCRIPTION
+        Sweeps Task Scheduler for tasks matching known prefixes that are older than
+        the specified age. Handles cases where Start-Job cleanup never ran (process
+        terminated), or an unhandled exception skipped the normal cleanup path.
+    #>
+    param(
+        [int]$MaxAgeMinutes = 30
+    )
+
+    $prefixes = @(
+        "UserPrompt_",
+        "UpgradeProgress_",
+        "CompletionNotification_",
+        "MandatoryPrompt_",
+        "DeferralPrompt_",
+        "SkipPrompt_",
+        "UserRemediation_"
+    )
+
+    try {
+        $cutoff = (Get-Date).AddMinutes(-$MaxAgeMinutes)
+        $allTasks = Get-ScheduledTask -TaskPath "\" -ErrorAction SilentlyContinue
+        if (-not $allTasks) { return 0 }
+
+        $removed = 0
+        foreach ($task in $allTasks) {
+            $matched = $false
+            foreach ($prefix in $prefixes) {
+                if ($task.TaskName.StartsWith($prefix)) {
+                    $matched = $true
+                    break
+                }
+            }
+            if (-not $matched) { continue }
+
+            # Use task registration date to determine age
+            try {
+                $taskDate = [datetime]::Parse($task.Date)
+                if ($taskDate -lt $cutoff) {
+                    Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                    $removed++
+                }
+            } catch {
+                # If we cannot parse the date, remove it as a precaution (it is orphaned if prefix matches)
+                Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                $removed++
+            }
+        }
+
+        if ($removed -gt 0) {
+            Write-Log -Message "Cleaned up $removed stale scheduled tasks (older than $MaxAgeMinutes minutes)"
+        }
+        return $removed
+    } catch {
+        # Don't let cleanup failures block the main script
+        return 0
+    }
+}
+
 # ============================================================================
 # CENTRALIZED MARKER FILE MANAGEMENT SYSTEM
 # Provides robust marker file operations with comprehensive cleanup
@@ -5882,7 +5983,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "9D" # Update this tag for each script version
+$ScriptTag = "9E" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -5936,6 +6037,9 @@ Remove-OldLogs -LogPath $LogPath
 
 # Clean up stale temp files from previous runs (older than 30 minutes)
 Remove-OldTempFiles
+
+# Clean up orphaned scheduled tasks from previous runs (older than 30 minutes)
+Remove-StaleScheduledTasks
 
 # Initialize and clean up deferral system
 Write-Log -Message "Initializing deferral management system" | Out-Null
