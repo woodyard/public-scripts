@@ -19,7 +19,7 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.9
+ Version: 9.10
  Tag: 10
     
     Version History:
@@ -74,6 +74,7 @@
     9.7 - FIX: Fixed orphaned scheduled task cleanup — added Remove-StaleScheduledTasks startup sweep for all task prefixes (UserPrompt_, UpgradeProgress_, CompletionNotification_, MandatoryPrompt_, DeferralPrompt_, SkipPrompt_, UserRemediation_); added task and temp file cleanup to catch blocks in Invoke-SystemUserPrompt, Invoke-SystemCompletionNotification, Invoke-SystemDeferralPrompt, Show-VersionSkipDialog, and Show-MandatoryUpdateDialog that previously leaked tasks on exceptions
     9.8 - FIX: Fixed VBS launcher file accumulation in temp directories — expanded Remove-OldTempFiles to scan user temp directories (not just C:\ProgramData\Temp) for stale HiddenLaunch_*.vbs and dialog script/response files; added VBS cleanup to New-UserPromptTask failure paths (including Azure AD fallback) and Show-UpgradeProgressNotification error/no-principal paths; broadened temp file regex to cover all dialog types (UpgradeProgress_, CompletionNotification_, SkipPrompt_)
     9.9 - FIX: VBS launcher files now self-delete after the child process finishes; eliminates accumulation regardless of caller cleanup path
+    9.10 - FIX: Reduced stale file/task cleanup cutoff from 30 minutes to 10 minutes so the startup sweep removes old leftovers (days/months old) on next run
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -5604,7 +5605,9 @@ function Remove-OldTempFiles {
     .SYNOPSIS
         Cleans up stale temp files created by this script in C:\ProgramData\Temp and user temp directories
     #>
-    $cutoff = (Get-Date).AddMinutes(-30)
+    # 10-minute cutoff: these files are only needed while a dialog is active (a few minutes).
+    # Anything older is leftover from a previous run and safe to remove, including files days/months old.
+    $cutoff = (Get-Date).AddMinutes(-10)
     $removed = 0
 
     # Match all file patterns this script creates (temp files, scripts, VBS launchers)
@@ -5655,7 +5658,7 @@ function Remove-StaleScheduledTasks {
         terminated), or an unhandled exception skipped the normal cleanup path.
     #>
     param(
-        [int]$MaxAgeMinutes = 30
+        [int]$MaxAgeMinutes = 10
     )
 
     $prefixes = @(
@@ -6071,10 +6074,10 @@ if (-not $Script:MarkerSystemInitialized) {
 # Clean up old log files (older than 1 month)
 Remove-OldLogs -LogPath $LogPath
 
-# Clean up stale temp files from previous runs (older than 30 minutes)
+# Clean up stale temp files from previous runs (older than 10 minutes)
 Remove-OldTempFiles
 
-# Clean up orphaned scheduled tasks from previous runs (older than 30 minutes)
+# Clean up orphaned scheduled tasks from previous runs (older than 10 minutes)
 Remove-StaleScheduledTasks
 
 # Initialize and clean up deferral system
