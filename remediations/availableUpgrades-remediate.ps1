@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.8
- Tag: 9F
+ Version: 9.9
+ Tag: 10
     
     Version History:
     1.0 - Initial version
@@ -73,6 +73,7 @@
     9.6 - FIX: SYSTEM-side wait now uses idle-based timeout (600s without heartbeat) instead of hard deadline, so active user-context upgrades run indefinitely as long as heartbeat is alive; post-upgrade verification uses --exact flag to prevent substring ID matches and compares available version against target to avoid false failures when a newer release appears in the source after upgrade; added diagnostic logging to success evaluation; pre-update winget source once before the upgrade loop to prevent redundant per-app source refreshes; removed misleading "Updating sources..." status from progress dialog; optimized per-app winget commands by dropping unused --log flag, adding --disable-interactivity and --accept-package-agreements to eliminate preamble stalls
     9.7 - FIX: Fixed orphaned scheduled task cleanup — added Remove-StaleScheduledTasks startup sweep for all task prefixes (UserPrompt_, UpgradeProgress_, CompletionNotification_, MandatoryPrompt_, DeferralPrompt_, SkipPrompt_, UserRemediation_); added task and temp file cleanup to catch blocks in Invoke-SystemUserPrompt, Invoke-SystemCompletionNotification, Invoke-SystemDeferralPrompt, Show-VersionSkipDialog, and Show-MandatoryUpdateDialog that previously leaked tasks on exceptions
     9.8 - FIX: Fixed VBS launcher file accumulation in temp directories — expanded Remove-OldTempFiles to scan user temp directories (not just C:\ProgramData\Temp) for stale HiddenLaunch_*.vbs and dialog script/response files; added VBS cleanup to New-UserPromptTask failure paths (including Azure AD fallback) and Show-UpgradeProgressNotification error/no-principal paths; broadened temp file regex to cover all dialog types (UpgradeProgress_, CompletionNotification_, SkipPrompt_)
+    9.9 - FIX: VBS launcher files now self-delete after the child process finishes; eliminates accumulation regardless of caller cleanup path
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -225,7 +226,11 @@ function New-HiddenLaunchAction {
 
         # Escape double quotes for VBS string (VBS uses "" to escape quotes)
         $escapedArgs = $PowerShellArguments.Replace('"', '""')
-        $vbsContent = "CreateObject(""WScript.Shell"").Run ""$escapedArgs"", $windowStyle, True"
+        # VBS self-deletes after the child process finishes (.Run with True waits)
+        $vbsContent = @"
+CreateObject("WScript.Shell").Run "$escapedArgs", $windowStyle, True
+CreateObject("Scripting.FileSystemObject").DeleteFile WScript.ScriptFullName, True
+"@
 
         $vbsContent | Out-File -FilePath $vbsPath -Encoding ASCII -Force
 
@@ -6014,7 +6019,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "9F" # Update this tag for each script version
+$ScriptTag = "10" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
