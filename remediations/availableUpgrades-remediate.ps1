@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.7
- Tag: 9E
+ Version: 9.8
+ Tag: 9F
     
     Version History:
     1.0 - Initial version
@@ -72,6 +72,7 @@
     9.5 - FEATURE: Added category-based whitelist defaults; JSON now supports { CategoryDefaults, Apps } structure where per-category settings (PromptWhenBlocked, TimeoutSeconds, DeferralEnabled, etc.) are inherited by apps in that category; app-level properties override category defaults; backward compatible with legacy flat array format
     9.6 - FIX: SYSTEM-side wait now uses idle-based timeout (600s without heartbeat) instead of hard deadline, so active user-context upgrades run indefinitely as long as heartbeat is alive; post-upgrade verification uses --exact flag to prevent substring ID matches and compares available version against target to avoid false failures when a newer release appears in the source after upgrade; added diagnostic logging to success evaluation; pre-update winget source once before the upgrade loop to prevent redundant per-app source refreshes; removed misleading "Updating sources..." status from progress dialog; optimized per-app winget commands by dropping unused --log flag, adding --disable-interactivity and --accept-package-agreements to eliminate preamble stalls
     9.7 - FIX: Fixed orphaned scheduled task cleanup — added Remove-StaleScheduledTasks startup sweep for all task prefixes (UserPrompt_, UpgradeProgress_, CompletionNotification_, MandatoryPrompt_, DeferralPrompt_, SkipPrompt_, UserRemediation_); added task and temp file cleanup to catch blocks in Invoke-SystemUserPrompt, Invoke-SystemCompletionNotification, Invoke-SystemDeferralPrompt, Show-VersionSkipDialog, and Show-MandatoryUpdateDialog that previously leaked tasks on exceptions
+    9.8 - FIX: Fixed VBS launcher file accumulation in temp directories — expanded Remove-OldTempFiles to scan user temp directories (not just C:\ProgramData\Temp) for stale HiddenLaunch_*.vbs and dialog script/response files; added VBS cleanup to New-UserPromptTask failure paths (including Azure AD fallback) and Show-UpgradeProgressNotification error/no-principal paths; broadened temp file regex to cover all dialog types (UpgradeProgress_, CompletionNotification_, SkipPrompt_)
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -622,7 +623,7 @@ function New-UserPromptTask {
                 try {
                     # Create a SYSTEM principal that will launch the script and let it handle user context
                     $fallbackPrincipal = New-ScheduledTaskPrincipal -UserID "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-                    
+
                     # Create hidden launch action for Azure AD fallback using VBS wrapper
                     $fallbackPsArgs = "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`""
                     $fallbackLaunch = New-HiddenLaunchAction -PowerShellArguments $fallbackPsArgs -VbsDirectory $vbsDir -AllowUI
@@ -631,27 +632,34 @@ function New-UserPromptTask {
                     } else {
                         $fallbackAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -ResponseFilePath `"$ResponseFile`" -Question `"$QuestionText`" -Title `"$TitleText`""
                     }
-                    
+
                     $fallbackTask = New-ScheduledTask -Action $fallbackAction -Principal $fallbackPrincipal -Settings $settings -Description "Interactive user prompt for system operations (Azure AD SYSTEM fallback)"
-                    
+
                     $registeredTask = Register-ScheduledTask -TaskName $taskName -InputObject $fallbackTask -Force -ErrorAction Stop
                     Write-Log "Scheduled task created successfully using Azure AD SYSTEM fallback: $taskName" | Out-Null
-                    # Update VBS tracking for fallback path
+                    # Clean up the original VBS (replaced by fallback) and update tracking
+                    if ($launch.VbsPath -and $launch.VbsPath -ne ($fallbackLaunch.VbsPath)) {
+                        Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue
+                    }
                     if ($fallbackLaunch) { $Script:LastCreatedVbsPath = $fallbackLaunch.VbsPath }
                     return $taskName
-                    
+
                 } catch {
                     Write-Log "Azure AD SYSTEM fallback also failed: $($_.Exception.Message)" | Out-Null
+                    if ($fallbackLaunch -and $fallbackLaunch.VbsPath) { Remove-Item $fallbackLaunch.VbsPath -Force -ErrorAction SilentlyContinue }
+                    if ($launch.VbsPath) { Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue }
                     return $null
                 }
             } else {
                 Write-Log "Final failure to register scheduled task (non-Azure AD)" | Out-Null
+                if ($launch.VbsPath) { Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue }
                 return $null
             }
         }
-        
+
     } catch {
         Write-Log "Error creating scheduled task: $($_.Exception.Message)" | Out-Null
+        if ($launch -and $launch.VbsPath) { Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue }
         return $null
     }
 }
@@ -1999,11 +2007,15 @@ Write-ProgLog "=== UPGRADE PROGRESS DIALOG ENDED ==="
             return $signalFile
         } else {
             Write-Log "Could not create principal for progress notification" | Out-Null
+            Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+            if ($launch -and $launch.VbsPath) { Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue }
             return $null
         }
 
     } catch {
         Write-Log "Error in Show-UpgradeProgressNotification: $($_.Exception.Message)" | Out-Null
+        Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+        if ($launch -and $launch.VbsPath) { Remove-Item $launch.VbsPath -Force -ErrorAction SilentlyContinue }
         return $null
     }
 }
@@ -5585,27 +5597,46 @@ function Remove-OldLogs {
 function Remove-OldTempFiles {
     <#
     .SYNOPSIS
-        Cleans up stale temp files created by this script in C:\ProgramData\Temp
+        Cleans up stale temp files created by this script in C:\ProgramData\Temp and user temp directories
     #>
-    $tempPath = "C:\ProgramData\Temp"
-    if (-not (Test-Path $tempPath)) { return }
-
     $cutoff = (Get-Date).AddMinutes(-30)
     $removed = 0
 
-    # Match all file patterns this script creates in C:\ProgramData\Temp
+    # Match all file patterns this script creates (temp files, scripts, VBS launchers)
     # Using regex instead of -Filter because Windows filter matching is unreliable with multiple dots (e.g. .heartbeat.error)
-    $nameRegex = '^(UserRemediation_\d+\.|UserRemediationHeartbeat_|availableUpgrades-remediate_\d+\.ps1|MandatoryPrompt_.*_(Response|Progress)|Show-MandatoryPrompt_|DeferralPrompt_.*_Response|Show-DeferralPrompt_|UserPrompt_.*_Response|Show-UserPrompt_|UserContext_Debug|UserContext_Heartbeat_Error_|HiddenLaunch_\d+\.vbs$)'
+    $nameRegex = '^(UserRemediation_\d+\.|UserRemediationHeartbeat_|availableUpgrades-remediate_\d+\.ps1|MandatoryPrompt_.*_(Response|Progress)|Show-MandatoryPrompt_|DeferralPrompt_.*_Response|Show-DeferralPrompt_|UserPrompt_.*_Response|Show-UserPrompt_|UpgradeProgress_.*_(Signal|Status)|Show-UpgradeProgress_|CompletionNotification_|Show-CompletionNotification_|SkipPrompt_.*_Response|Show-SkipPrompt_|UserContext_Debug|UserContext_Heartbeat_Error_|HiddenLaunch_\d+\.vbs$)'
 
-    Get-ChildItem -Path $tempPath -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
-        ForEach-Object {
-            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-            $removed++
+    # Scan C:\ProgramData\Temp
+    $tempPath = "C:\ProgramData\Temp"
+    if (Test-Path $tempPath) {
+        Get-ChildItem -Path $tempPath -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
+            ForEach-Object {
+                Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+                $removed++
+            }
+    }
+
+    # Scan user temp directories for VBS launchers and dialog script/response files
+    try {
+        $userTempPaths = Get-ChildItem -Path "C:\Users" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName "AppData\Local\Temp" } |
+            Where-Object { Test-Path $_ }
+
+        foreach ($userTemp in $userTempPaths) {
+            Get-ChildItem -Path $userTemp -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match $nameRegex -and $_.LastWriteTime -lt $cutoff } |
+                ForEach-Object {
+                    Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+                    $removed++
+                }
         }
+    } catch {
+        # Don't let user temp cleanup failures block the main script
+    }
 
     if ($removed -gt 0) {
-        Write-Log -Message "Cleaned up $removed old temp files from $tempPath"
+        Write-Log -Message "Cleaned up $removed old temp files"
     }
 }
 
@@ -5983,7 +6014,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "9E" # Update this tag for each script version
+$ScriptTag = "9F" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
