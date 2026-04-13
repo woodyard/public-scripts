@@ -18,7 +18,7 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.31
+    Version: 5.32
     Tag: 60
     
     Version History:
@@ -78,6 +78,7 @@
     5.29 - FEATURE: Added category-based whitelist defaults; supports new { CategoryDefaults, Apps } JSON structure with backward compatibility for legacy flat array format
     5.30 - FIX: Detection script now cleans up stale temp files and orphaned scheduled tasks from both detection and remediation scripts; expanded Remove-OldTempFiles to scan user temp directories with 10-minute cutoff; added Remove-StaleScheduledTasks to remove orphaned tasks from all known prefixes; ensures cleanup runs every Intune check cycle even when remediation is not triggered
     5.31 - FIX: Added --scope user dual-listing to SYSTEM context detection so apps like Perplexity.Comet (user-scoped in winget but installed to Program Files) are detected and trigger remediation in SYSTEM context
+    5.32 - REVERT: Removed --scope user from SYSTEM context detection — SYSTEM cannot see user-registered winget packages; user context detection already handles this via scheduled task
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -1242,7 +1243,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "61" # Update this tag for each script version
+$ScriptTag = "62" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -1609,17 +1610,6 @@ if ($UserDetectionOnly -eq "true" -or $isUserDetectionTask) {
         Write-Log -Message "Using winget path: $WingetPath"
         $wingetExe = Join-Path $WingetPath "winget.exe"
         $OUTPUT = Invoke-WingetUpgradeList -WingetExe $wingetExe
-
-        # Second run with --scope user to capture user-scoped apps that install machine-wide
-        # (e.g. Perplexity.Comet installs to Program Files but winget considers it user-scoped)
-        $OUTPUT_USER_SCOPE = @()
-        try {
-            Write-Log -Message "Running winget with --scope user to detect user-scoped apps in SYSTEM context..."
-            $OUTPUT_USER_SCOPE = Invoke-WingetUpgradeList -WingetExe $wingetExe -Scope "user"
-            Write-Log -Message "Winget (user scope, SYSTEM context) completed, output lines: $($OUTPUT_USER_SCOPE.Count)"
-        } catch {
-            Write-Log -Message "Winget --scope user in SYSTEM context failed (non-fatal): $($_.Exception.Message)"
-        }
     } else {
         Write-Log -Message "Winget not detected in SYSTEM context"
         Invoke-MarkerFileEmergencyCleanup -Reason "Winget not detected in SYSTEM context"
@@ -1637,26 +1627,6 @@ if ($UserDetectionOnly -eq "true" -or $isUserDetectionTask) {
 
 # Parse winget output and process apps
 $LIST = ConvertFrom-WingetOutput -Output $OUTPUT
-
-# Merge user-scoped apps discovered via --scope user into the main list (dedup by AppID)
-if ($OUTPUT_USER_SCOPE -and $OUTPUT_USER_SCOPE.Count -gt 0) {
-    $userScopeList = ConvertFrom-WingetOutput -Output $OUTPUT_USER_SCOPE
-    if ($userScopeList -and $userScopeList.Count -gt 0) {
-        $seenAppIDs = @{}
-        foreach ($app in $LIST) { if ($app) { $seenAppIDs["$app"] = $true } }
-        $addedCount = 0
-        foreach ($app in $userScopeList) {
-            if ($app -and -not $seenAppIDs.ContainsKey("$app")) {
-                $LIST += $app
-                $seenAppIDs["$app"] = $true
-                $addedCount++
-            }
-        }
-        if ($addedCount -gt 0) {
-            Write-Log -Message "Merged $addedCount user-scoped apps into detection list (total: $($LIST.Count))"
-        }
-    }
-}
 
 if ($LIST -and $LIST.Count -gt 0) {
 

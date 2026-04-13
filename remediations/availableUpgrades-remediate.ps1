@@ -19,7 +19,7 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.16
+ Version: 9.17
  Tag: 10
     
     Version History:
@@ -81,6 +81,7 @@
     9.14 - FIX: Direct download fallback now uses WebClient.DownloadFile in a background job instead of Invoke-WebRequest (which is extremely slow for large files in PS 5.1); heartbeats continue during both download and install phases preventing SYSTEM parent timeout; added 5-minute timeout for each phase with progress reporting to dialog
     9.15 - FIX: Direct install fallback now calls WaitForExit() before reading exit code and treats null exit code as success; Chromium-based installers fork a child process and the parent exits immediately with no exit code, which was incorrectly treated as failure
     9.16 - FIX: Added --scope user dual-listing to SYSTEM context so apps like Perplexity.Comet (user-scoped in winget but installed to Program Files) are discovered and upgraded with SYSTEM privileges; prevents failed upgrades from user context lacking write access to Program Files
+    9.17 - REVERT: Removed --scope user from SYSTEM context — SYSTEM cannot see user-registered winget packages; dual-scope listing remains in user context only where it is effective
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6032,7 +6033,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "16" # Update this tag for each script version
+$ScriptTag = "17" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6883,27 +6884,6 @@ if ($UserRemediationOnly) {
             if (-not $hasValidOutput) {
                 Write-Log -Message "Winget source update in progress, running again..."
                 $OUTPUT = $(& $wingetExe upgrade --accept-source-agreements --source winget)
-            }
-
-            # Second run with --scope user to capture user-scoped apps that install machine-wide
-            # (e.g. Perplexity.Comet installs to Program Files but winget considers it user-scoped)
-            # SYSTEM context has write access to Program Files so it can actually upgrade these
-            $OUTPUT_USER_SCOPE = @()
-            try {
-                Write-Log -Message "Running winget with --scope user to detect user-scoped apps in SYSTEM context..."
-                $OUTPUT_USER_SCOPE = $(& $wingetExe upgrade --accept-source-agreements --source winget --scope user)
-                Write-Log -Message "Winget (user scope, SYSTEM context) completed, output lines: $($OUTPUT_USER_SCOPE.Count)"
-
-                $hasValidUserOutput = $false
-                foreach ($line in $OUTPUT_USER_SCOPE) {
-                    if ($line -is [string] -and $line.Trim() -match '^-{10,}$') { $hasValidUserOutput = $true; break }
-                }
-                if (-not $hasValidUserOutput) {
-                    Write-Log -Message "Winget user-scope output invalid (source update?), retrying..."
-                    $OUTPUT_USER_SCOPE = $(& $wingetExe upgrade --accept-source-agreements --source winget --scope user)
-                }
-            } catch {
-                Write-Log -Message "Winget --scope user in SYSTEM context failed (non-fatal): $($_.Exception.Message)"
             }
         } else {
             Write-Log -Message "Winget not detected in SYSTEM context"
