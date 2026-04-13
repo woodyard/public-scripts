@@ -19,7 +19,7 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.11
+ Version: 9.12
  Tag: 10
     
     Version History:
@@ -76,6 +76,7 @@
     9.9 - FIX: VBS launcher files now self-delete after the child process finishes; eliminates accumulation regardless of caller cleanup path
     9.10 - FIX: Reduced stale file/task cleanup cutoff from 30 minutes to 10 minutes so the startup sweep removes old leftovers (days/months old) on next run
     9.11 - FIX: Wrapped VBS self-delete in On Error Resume Next to prevent "Permission denied" dialog when user context cannot delete SYSTEM-owned launcher file; Fixed user-context remediation missing user-scoped apps (e.g. Perplexity.Comet) by running winget twice — default listing for machine-scoped apps plus --scope user for user-scoped apps — and merging results by AppID before processing
+    9.12 - FIX: Fixed Update-Heartbeat Boolean return value leaking into Invoke-WingetWithProgress output, causing "[System.Boolean] does not contain a method named 'Trim'" error during post-upgrade result parsing; added type guard in upgrade output iteration to skip non-string elements
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -2160,8 +2161,9 @@ function Invoke-WingetWithProgress {
             Start-Sleep -Seconds 2
 
             # Keep heartbeat alive during long upgrade operations
+            # Pipe to Out-Null to prevent Boolean return value from contaminating function output
             if (Get-Command Update-Heartbeat -ErrorAction SilentlyContinue) {
-                Update-Heartbeat -Stage "WingetUpgradeRunning" -AdditionalData @{ WingetPID = $proc.Id } 2>$null
+                Update-Heartbeat -Stage "WingetUpgradeRunning" -AdditionalData @{ WingetPID = $proc.Id } 2>$null | Out-Null
             }
 
             if (Test-Path $outFile) {
@@ -6026,7 +6028,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "11" # Update this tag for each script version
+$ScriptTag = "12" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -7302,6 +7304,7 @@ if ($LIST -and $LIST.Count -gt 0) {
                         # Extract meaningful lines from winget output for logging
                         $meaningfulLines = @()
                         foreach ($line in $upgradeResult) {
+                            if ($line -isnot [string]) { continue }
                             $cleanLine = $line.Trim()
                             if ($cleanLine -ne "" -and $cleanLine.Length -gt 10 -and 
                                 $cleanLine -notmatch '^[\-\\\|\/\s]*$' -and 
