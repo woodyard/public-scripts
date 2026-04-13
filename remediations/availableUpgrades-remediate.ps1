@@ -19,7 +19,7 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.12
+ Version: 9.13
  Tag: 10
     
     Version History:
@@ -77,6 +77,7 @@
     9.10 - FIX: Reduced stale file/task cleanup cutoff from 30 minutes to 10 minutes so the startup sweep removes old leftovers (days/months old) on next run
     9.11 - FIX: Wrapped VBS self-delete in On Error Resume Next to prevent "Permission denied" dialog when user context cannot delete SYSTEM-owned launcher file; Fixed user-context remediation missing user-scoped apps (e.g. Perplexity.Comet) by running winget twice — default listing for machine-scoped apps plus --scope user for user-scoped apps — and merging results by AppID before processing
     9.12 - FIX: Fixed Update-Heartbeat Boolean return value leaking into Invoke-WingetWithProgress output, causing "[System.Boolean] does not contain a method named 'Trim'" error during post-upgrade result parsing; added type guard in upgrade output iteration to skip non-string elements
+    9.13 - FEATURE: Added direct-download installer fallback when winget fails with "Installer hash does not match" (common with rolling installer URLs like Perplexity Comet); resolves installer URL from whitelist InstallerUrl field or winget show output; downloads and runs installer silently; whitelist gains optional InstallerUrl and InstallerArgs fields for per-app configuration
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6028,7 +6029,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "12" # Update this tag for each script version
+$ScriptTag = "13" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -7357,7 +7358,7 @@ if ($LIST -and $LIST.Count -gt 0) {
                         } elseif ($upgradeOutput -like "*Uninstall failed*") {
                             Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Retrying installation..."
                             Write-Log -Message "Uninstall failure detected for $($appInfo.AppID). Trying alternative approaches."
-                            
+
                             # Try install with --force to override - use detected scope
                             $scopeArgs = if ($detectedScope -eq "user" -or (-not (Test-RunningAsSystem) -and -not $userIsAdmin)) { @("--scope", "user") } else { @() }
                             if ((Test-RunningAsSystem) -and $WingetPath) {
@@ -7365,9 +7366,78 @@ if ($LIST -and $LIST.Count -gt 0) {
                             } else {
                                 $upgradeResult = & winget install --silent --accept-source-agreements --force @scopeArgs --id $appInfo.AppID 2>&1
                             }
-                            
+
                             $upgradeOutput = $upgradeResult -join "`n"
                             Write-Log -Message "Force install completed for $($appInfo.AppID)"
+
+                        } elseif ($upgradeOutput -like "*hash does not match*") {
+                            # Hash mismatch: winget manifest hash is stale (common with rolling installer URLs).
+                            # --ignore-security-hash is blocked by admin policy, so download and run the installer directly.
+                            Write-Log -Message "Installer hash mismatch for $($appInfo.AppID). Attempting direct download fallback."
+
+                            # Resolve installer URL: whitelist InstallerUrl takes precedence, otherwise parse winget show
+                            $installerUrl = $okapp.InstallerUrl
+                            if (-not $installerUrl) {
+                                try {
+                                    $showExe = if ((Test-RunningAsSystem) -and $WingetPath) { Join-Path $WingetPath "winget.exe" } else { "winget.exe" }
+                                    $showOutput = & $showExe show --id $appInfo.AppID --source winget --accept-source-agreements 2>&1
+                                    foreach ($showLine in $showOutput) {
+                                        if ("$showLine" -match '^\s*Installer Url:\s*(.+)$') {
+                                            $installerUrl = $Matches[1].Trim()
+                                            Write-Log -Message "Resolved installer URL from winget show: $installerUrl" | Out-Null
+                                            break
+                                        }
+                                    }
+                                } catch {
+                                    Write-Log -Message "Failed to query winget show for installer URL: $($_.Exception.Message)"
+                                }
+                            }
+
+                            if ($installerUrl) {
+                                Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Downloading installer directly..."
+                                Write-Log -Message "Downloading installer from: $installerUrl"
+
+                                $installerExt = if ($installerUrl -match '\.(msi|msix)(\?|$)') { ".$($Matches[1])" } else { ".exe" }
+                                $installerPath = Join-Path $env:TEMP "DirectInstall_$($appInfo.AppID -replace '[^a-zA-Z0-9.]','_')_$(Get-Random)$installerExt"
+
+                                try {
+                                    if (Get-Command Update-Heartbeat -ErrorAction SilentlyContinue) {
+                                        Update-Heartbeat -Stage "DirectDownload" -AdditionalData @{ AppID = $appInfo.AppID } | Out-Null
+                                    }
+                                    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                                    Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
+                                    $dlSize = (Get-Item $installerPath).Length
+                                    Write-Log -Message "Downloaded installer: $([Math]::Round($dlSize / 1MB, 1)) MB"
+
+                                    # Determine silent install arguments (whitelist override or sensible default)
+                                    $installerArgs = if ($okapp.InstallerArgs) { $okapp.InstallerArgs } else { "--silent" }
+                                    Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Installing update..."
+                                    Write-Log -Message "Running installer: $installerPath $installerArgs"
+
+                                    if (Get-Command Update-Heartbeat -ErrorAction SilentlyContinue) {
+                                        Update-Heartbeat -Stage "DirectInstall" -AdditionalData @{ AppID = $appInfo.AppID } | Out-Null
+                                    }
+
+                                    $installProc = Start-Process -FilePath $installerPath -ArgumentList $installerArgs -Wait -PassThru -NoNewWindow -ErrorAction Stop
+                                    $installExitCode = $installProc.ExitCode
+                                    Write-Log -Message "Direct installer exited with code: $installExitCode"
+
+                                    if ($installExitCode -eq 0) {
+                                        $upgradeOutput = "Successfully installed (direct download fallback)"
+                                        Write-Log -Message "Direct install succeeded for $($appInfo.AppID)"
+                                    } else {
+                                        $upgradeOutput = "Direct installer failed with exit code $installExitCode"
+                                        Write-Log -Message "Direct install failed for $($appInfo.AppID) - exit code: $installExitCode"
+                                    }
+                                } catch {
+                                    Write-Log -Message "Direct download/install failed for $($appInfo.AppID): $($_.Exception.Message)"
+                                    # Keep original upgradeOutput so the failure is reported as hash mismatch
+                                } finally {
+                                    Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+                                }
+                            } else {
+                                Write-Log -Message "No installer URL available for $($appInfo.AppID) - cannot attempt direct download fallback"
+                            }
                         }
                         } # end else (non-test mode winget upgrade)
 
