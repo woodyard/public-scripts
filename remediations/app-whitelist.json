@@ -430,6 +430,7 @@
             "AppID": "Perplexity.Comet",
             "FriendlyName": "Perplexity Comet",
             "Category": "AI",
+            "Disabled": true,
             "BlockingProcess": "Comet",
             "InstallerUrl": "https://www.perplexity.ai/rest/browser/download?platform=win_x64&channel=stable",
             "InstallerArgs": "--silent"
