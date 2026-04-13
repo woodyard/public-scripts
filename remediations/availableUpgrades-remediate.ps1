@@ -19,7 +19,7 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.13
+ Version: 9.14
  Tag: 10
     
     Version History:
@@ -78,6 +78,7 @@
     9.11 - FIX: Wrapped VBS self-delete in On Error Resume Next to prevent "Permission denied" dialog when user context cannot delete SYSTEM-owned launcher file; Fixed user-context remediation missing user-scoped apps (e.g. Perplexity.Comet) by running winget twice — default listing for machine-scoped apps plus --scope user for user-scoped apps — and merging results by AppID before processing
     9.12 - FIX: Fixed Update-Heartbeat Boolean return value leaking into Invoke-WingetWithProgress output, causing "[System.Boolean] does not contain a method named 'Trim'" error during post-upgrade result parsing; added type guard in upgrade output iteration to skip non-string elements
     9.13 - FEATURE: Added direct-download installer fallback when winget fails with "Installer hash does not match" (common with rolling installer URLs like Perplexity Comet); resolves installer URL from whitelist InstallerUrl field or winget show output; downloads and runs installer silently; whitelist gains optional InstallerUrl and InstallerArgs fields for per-app configuration
+    9.14 - FIX: Direct download fallback now uses WebClient.DownloadFile in a background job instead of Invoke-WebRequest (which is extremely slow for large files in PS 5.1); heartbeats continue during both download and install phases preventing SYSTEM parent timeout; added 5-minute timeout for each phase with progress reporting to dialog
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6029,7 +6030,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "13" # Update this tag for each script version
+$ScriptTag = "14" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -7405,7 +7406,34 @@ if ($LIST -and $LIST.Count -gt 0) {
                                         Update-Heartbeat -Stage "DirectDownload" -AdditionalData @{ AppID = $appInfo.AppID } | Out-Null
                                     }
                                     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-                                    Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
+
+                                    # Use WebClient.DownloadFile in a background job so heartbeats stay alive
+                                    # (Invoke-WebRequest is extremely slow for large files in PS 5.1)
+                                    $dlJob = Start-Job -ScriptBlock {
+                                        param($url, $dest)
+                                        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                                        (New-Object System.Net.WebClient).DownloadFile($url, $dest)
+                                    } -ArgumentList $installerUrl, $installerPath
+
+                                    $dlTimeout = 300  # 5 minutes max for download
+                                    $dlWaitStart = Get-Date
+                                    while ((Get-Date) -lt $dlWaitStart.AddSeconds($dlTimeout) -and $dlJob.State -eq "Running") {
+                                        if (Wait-Job $dlJob -Timeout 10) { break }
+                                        if (Get-Command Update-Heartbeat -ErrorAction SilentlyContinue) {
+                                            $dlProgress = if (Test-Path $installerPath) { [Math]::Round((Get-Item $installerPath).Length / 1MB, 1) } else { 0 }
+                                            Update-Heartbeat -Stage "DirectDownload" -AdditionalData @{ AppID = $appInfo.AppID; DownloadedMB = $dlProgress } | Out-Null
+                                            Write-InfoDialogStatus -SignalFilePath $activeSignalFile -Status "Downloading installer... ${dlProgress} MB"
+                                        }
+                                    }
+
+                                    if ($dlJob.State -ne "Completed") {
+                                        Remove-Job $dlJob -Force
+                                        throw "Download timed out after $dlTimeout seconds"
+                                    }
+                                    # Check for job errors
+                                    Receive-Job $dlJob -ErrorAction Stop | Out-Null
+                                    Remove-Job $dlJob -Force
+
                                     $dlSize = (Get-Item $installerPath).Length
                                     Write-Log -Message "Downloaded installer: $([Math]::Round($dlSize / 1MB, 1)) MB"
 
@@ -7418,7 +7446,21 @@ if ($LIST -and $LIST.Count -gt 0) {
                                         Update-Heartbeat -Stage "DirectInstall" -AdditionalData @{ AppID = $appInfo.AppID } | Out-Null
                                     }
 
-                                    $installProc = Start-Process -FilePath $installerPath -ArgumentList $installerArgs -Wait -PassThru -NoNewWindow -ErrorAction Stop
+                                    # Run installer in background too so heartbeats stay alive
+                                    $installProc = Start-Process -FilePath $installerPath -ArgumentList $installerArgs -PassThru -NoNewWindow -ErrorAction Stop
+                                    $installTimeout = 300  # 5 minutes max for install
+                                    $installWaitStart = Get-Date
+                                    while (-not $installProc.HasExited -and (Get-Date) -lt $installWaitStart.AddSeconds($installTimeout)) {
+                                        Start-Sleep -Seconds 5
+                                        if (Get-Command Update-Heartbeat -ErrorAction SilentlyContinue) {
+                                            Update-Heartbeat -Stage "DirectInstall" -AdditionalData @{ AppID = $appInfo.AppID; InstallerPID = $installProc.Id } | Out-Null
+                                        }
+                                    }
+                                    if (-not $installProc.HasExited) {
+                                        $installProc.Kill()
+                                        throw "Installer timed out after $installTimeout seconds"
+                                    }
+
                                     $installExitCode = $installProc.ExitCode
                                     Write-Log -Message "Direct installer exited with code: $installExitCode"
 
