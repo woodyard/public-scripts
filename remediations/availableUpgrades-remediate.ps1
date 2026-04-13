@@ -19,7 +19,7 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.14
+ Version: 9.15
  Tag: 10
     
     Version History:
@@ -79,6 +79,7 @@
     9.12 - FIX: Fixed Update-Heartbeat Boolean return value leaking into Invoke-WingetWithProgress output, causing "[System.Boolean] does not contain a method named 'Trim'" error during post-upgrade result parsing; added type guard in upgrade output iteration to skip non-string elements
     9.13 - FEATURE: Added direct-download installer fallback when winget fails with "Installer hash does not match" (common with rolling installer URLs like Perplexity Comet); resolves installer URL from whitelist InstallerUrl field or winget show output; downloads and runs installer silently; whitelist gains optional InstallerUrl and InstallerArgs fields for per-app configuration
     9.14 - FIX: Direct download fallback now uses WebClient.DownloadFile in a background job instead of Invoke-WebRequest (which is extremely slow for large files in PS 5.1); heartbeats continue during both download and install phases preventing SYSTEM parent timeout; added 5-minute timeout for each phase with progress reporting to dialog
+    9.15 - FIX: Direct install fallback now calls WaitForExit() before reading exit code and treats null exit code as success; Chromium-based installers fork a child process and the parent exits immediately with no exit code, which was incorrectly treated as failure
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6030,7 +6031,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "14" # Update this tag for each script version
+$ScriptTag = "15" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -7461,10 +7462,13 @@ if ($LIST -and $LIST.Count -gt 0) {
                                         throw "Installer timed out after $installTimeout seconds"
                                     }
 
+                                    # Ensure exit code is populated (Chromium installers fork and parent exits fast)
+                                    $installProc.WaitForExit()
                                     $installExitCode = $installProc.ExitCode
                                     Write-Log -Message "Direct installer exited with code: $installExitCode"
 
-                                    if ($installExitCode -eq 0) {
+                                    # Treat null/0 as success — Chromium installers often return null (parent forks)
+                                    if ($null -eq $installExitCode -or $installExitCode -eq 0) {
                                         $upgradeOutput = "Successfully installed (direct download fallback)"
                                         Write-Log -Message "Direct install succeeded for $($appInfo.AppID)"
                                     } else {
