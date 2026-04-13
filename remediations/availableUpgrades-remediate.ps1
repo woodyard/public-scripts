@@ -19,7 +19,7 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.10
+ Version: 9.11
  Tag: 10
     
     Version History:
@@ -75,6 +75,7 @@
     9.8 - FIX: Fixed VBS launcher file accumulation in temp directories — expanded Remove-OldTempFiles to scan user temp directories (not just C:\ProgramData\Temp) for stale HiddenLaunch_*.vbs and dialog script/response files; added VBS cleanup to New-UserPromptTask failure paths (including Azure AD fallback) and Show-UpgradeProgressNotification error/no-principal paths; broadened temp file regex to cover all dialog types (UpgradeProgress_, CompletionNotification_, SkipPrompt_)
     9.9 - FIX: VBS launcher files now self-delete after the child process finishes; eliminates accumulation regardless of caller cleanup path
     9.10 - FIX: Reduced stale file/task cleanup cutoff from 30 minutes to 10 minutes so the startup sweep removes old leftovers (days/months old) on next run
+    9.11 - FIX: Wrapped VBS self-delete in On Error Resume Next to prevent "Permission denied" dialog when user context cannot delete SYSTEM-owned launcher file; Fixed user-context remediation missing user-scoped apps (e.g. Perplexity.Comet) by running winget twice — default listing for machine-scoped apps plus --scope user for user-scoped apps — and merging results by AppID before processing
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -228,7 +229,10 @@ function New-HiddenLaunchAction {
         # Escape double quotes for VBS string (VBS uses "" to escape quotes)
         $escapedArgs = $PowerShellArguments.Replace('"', '""')
         # VBS self-deletes after the child process finishes (.Run with True waits)
+        # On Error Resume Next prevents "Permission denied" dialog when SYSTEM owns the file
+        # and the user context cannot delete it (the SYSTEM parent cleans up regardless)
         $vbsContent = @"
+On Error Resume Next
 CreateObject("WScript.Shell").Run "$escapedArgs", $windowStyle, True
 CreateObject("Scripting.FileSystemObject").DeleteFile WScript.ScriptFullName, True
 "@
@@ -6022,7 +6026,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "10" # Update this tag for each script version
+$ScriptTag = "11" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6647,8 +6651,8 @@ if ($UserRemediationOnly) {
         
         try {
             # Use background job with timeout to prevent winget hanging
-            # Note: No --scope filter here - we need to see ALL upgradeable apps (both user and machine scoped)
-            # The --scope user filter is only applied during the actual upgrade command for non-admin users
+            # Default listing (no --scope) sees machine-scoped apps; a second --scope user run
+            # is added after this block to also capture user-scoped apps (see below)
             $wingetJob = Start-Job -ScriptBlock {
                 winget upgrade --accept-source-agreements --source winget
             }
@@ -6787,6 +6791,60 @@ if ($UserRemediationOnly) {
             }
         }
         
+        # Second winget run: --scope user reveals user-scoped apps that are invisible
+        # to the default listing (e.g. Perplexity.Comet). Non-fatal if this fails.
+        $OUTPUT_USER_SCOPE = @()
+        Write-Log -Message "Running winget with --scope user to detect user-scoped apps..."
+        try {
+            $userScopeStart = Get-Date
+            $userScopeJob = Start-Job -ScriptBlock {
+                winget upgrade --accept-source-agreements --source winget --scope user
+            }
+
+            $userScopeWaitStart = Get-Date
+            while ((Get-Date) -lt $userScopeWaitStart.AddSeconds($wingetTimeout) -and $userScopeJob.State -eq "Running") {
+                if (Wait-Job $userScopeJob -Timeout 30) { break }
+                $elapsedUserScope = [int]((Get-Date) - $userScopeWaitStart).TotalSeconds
+                Update-Heartbeat -Stage "WingetUserScopeExecution" -AdditionalData @{
+                    ElapsedSeconds = $elapsedUserScope
+                    JobState = $userScopeJob.State
+                }
+                Write-Log -Message "Winget (user scope) still running... ${elapsedUserScope}s elapsed" | Out-Null
+            }
+
+            if ($userScopeJob.State -eq "Completed") {
+                $OUTPUT_USER_SCOPE = Receive-Job $userScopeJob
+                $userScopeTime = (Get-Date) - $userScopeStart
+                Write-Log -Message "Winget (user scope) completed in $($userScopeTime.TotalSeconds) seconds, output lines: $($OUTPUT_USER_SCOPE.Count)"
+
+                # Validate output — retry once if it was just a source update
+                $hasValidUserOutput = $false
+                foreach ($line in $OUTPUT_USER_SCOPE) {
+                    if ($line -is [string] -and $line.Trim() -match '^-{10,}$') { $hasValidUserOutput = $true; break }
+                }
+                if (-not $hasValidUserOutput) {
+                    Write-Log -Message "Winget user-scope output invalid (source update?), retrying..."
+                    $retryUserJob = Start-Job -ScriptBlock {
+                        winget upgrade --accept-source-agreements --source winget --scope user
+                    }
+                    if (Wait-Job $retryUserJob -Timeout $wingetTimeout) {
+                        $OUTPUT_USER_SCOPE = Receive-Job $retryUserJob
+                    } else {
+                        Write-Log -Message "Winget user-scope retry timed out"
+                        $OUTPUT_USER_SCOPE = @()
+                        Remove-Job $retryUserJob -Force
+                    }
+                    Remove-Job $retryUserJob -Force -ErrorAction SilentlyContinue
+                }
+            } else {
+                Write-Log -Message "Winget (user scope) timed out, proceeding without user-scoped apps"
+                Remove-Job $userScopeJob -Force
+            }
+            Remove-Job $userScopeJob -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Log -Message "Error running winget with --scope user (non-fatal): $($_.Exception.Message)"
+        }
+
         Write-Log -Message "User context remediation - processing user-scoped apps only"
 
 } elseif (Test-RunningAsSystem) {
@@ -6852,6 +6910,25 @@ if ($UserRemediationOnly) {
         Write-Log -Message "Winget source update in progress, running again..."
         $OUTPUT = $(winget upgrade --accept-source-agreements --source winget)
     }
+
+    # Second run with --scope user to capture user-scoped apps invisible to default listing
+    $OUTPUT_USER_SCOPE = @()
+    try {
+        Write-Log -Message "Running winget with --scope user to detect user-scoped apps..."
+        $OUTPUT_USER_SCOPE = $(winget upgrade --accept-source-agreements --source winget --scope user)
+        Write-Log -Message "Winget (user scope) completed, output lines: $($OUTPUT_USER_SCOPE.Count)"
+
+        $hasValidUserOutput = $false
+        foreach ($line in $OUTPUT_USER_SCOPE) {
+            if ($line -is [string] -and $line.Trim() -match '^-{10,}$') { $hasValidUserOutput = $true; break }
+        }
+        if (-not $hasValidUserOutput) {
+            Write-Log -Message "Winget user-scope output invalid (source update?), retrying..."
+            $OUTPUT_USER_SCOPE = $(winget upgrade --accept-source-agreements --source winget --scope user)
+        }
+    } catch {
+        Write-Log -Message "Error running winget with --scope user (non-fatal): $($_.Exception.Message)"
+    }
 }
 
 # TEST MODE: Replace winget output with simulated upgrade data
@@ -6913,6 +6990,31 @@ Write-Log -Message "Starting winget output parsing..."
 $parsingStart = Get-Date
 
 $LIST = ConvertFrom-WingetOutput -Output $OUTPUT
+
+# Merge user-scoped apps discovered via --scope user into the main list (dedup by AppID)
+if ($OUTPUT_USER_SCOPE -and $OUTPUT_USER_SCOPE.Count -gt 0) {
+    $userScopeList = ConvertFrom-WingetOutput -Output $OUTPUT_USER_SCOPE
+    if ($userScopeList -and $userScopeList.Count -gt 0) {
+        $seenAppIDs = @{}
+        $mergedList = [System.Collections.ArrayList]::new()
+        foreach ($app in $LIST) {
+            if ($app.AppID) { $seenAppIDs[$app.AppID] = $true }
+            $null = $mergedList.Add($app)
+        }
+        $addedCount = 0
+        foreach ($app in $userScopeList) {
+            if ($app.AppID -and -not $seenAppIDs.ContainsKey($app.AppID)) {
+                $null = $mergedList.Add($app)
+                $seenAppIDs[$app.AppID] = $true
+                $addedCount++
+            }
+        }
+        if ($addedCount -gt 0) {
+            Write-Log -Message "Merged $addedCount user-scoped apps into upgrade list (total: $($mergedList.Count))"
+        }
+        $LIST = $mergedList
+    }
+}
 
 if ($LIST -and $LIST.Count -gt 0) {
         $count = 0
