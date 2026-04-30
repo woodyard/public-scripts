@@ -83,7 +83,8 @@
     9.16 - FIX: Added --scope user dual-listing to SYSTEM context so apps like Perplexity.Comet (user-scoped in winget but installed to Program Files) are discovered and upgraded with SYSTEM privileges; prevents failed upgrades from user context lacking write access to Program Files
     9.17 - REVERT: Removed --scope user from SYSTEM context — SYSTEM cannot see user-registered winget packages; dual-scope listing remains in user context only where it is effective
     9.18 - FIX: Prevent unintended UAC prompts during user-context upgrades. Scope detection correctly identified machine-scoped apps (e.g. Mozilla.Firefox) but the resulting `$doUpgrade = $false` had no effect because it was set inside the `if ($doUpgrade)` block, so winget still ran and the installer triggered UAC. Now the user-context flow signals dialogs cleanly and `continue`s to the next app, leaving machine-scoped upgrades to the SYSTEM context.
-    9.19 - FIX: Post-upgrade verification was producing false-positive failures. Whitespace-split column extraction misclassified columns when winget list returns no Available column after a successful upgrade — empty parse fell into the failure branch. Replaced ad-hoc parsing with the existing header-position parser (ConvertFrom-WingetOutput) and now treats only an EXACT match between parsed Available and our target version as a true failure; empty/different Available is treated as success. Also: SYSTEM context now augments its `winget upgrade` listing by querying `winget list --id <id>` for each whitelisted machine-scoped app missing from the upgrade list — picks up apps like Mozilla.Firefox that winget tracks under user accounts but which actually live in C:\Program Files, so SYSTEM can upgrade them without UAC.
+    9.19 - FIX: Post-upgrade verification was producing false-positive failures. Whitespace-split column extraction misclassified columns when winget list returns no Available column after a successful upgrade — empty parse fell into the failure branch. Replaced ad-hoc parsing with the existing header-position parser (ConvertFrom-WingetOutput) and now treats only an EXACT match between parsed Available and our target version as a true failure; empty/different Available is treated as success. Also: SYSTEM context now augments its `winget upgrade` listing by querying `winget list --id ID` for each whitelisted machine-scoped app missing from the upgrade list — picks up apps like Mozilla.Firefox that winget tracks under user accounts but which actually live in C:\Program Files, so SYSTEM can upgrade them without UAC.
+    9.20 - REFACTOR: Detection now writes a static task file (C:\ProgramData\Temp\availableUpgrades-tasks.json) with the apps it found pending upgrade. Remediation reads that file as the authoritative work list and removes entries as each app is processed (success or final-failure). Eliminates the need for SYSTEM-context augmentation to walk every whitelisted machine-scoped app querying `winget list` per app — detection has already done the discovery via its dual `winget upgrade` listing. The augmentation pass remains as a fallback for when the task file is missing or older than 6 hours. User-context "skip machine-scoped to avoid UAC" leaves the entry in the task file so SYSTEM picks it up next cycle.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6035,7 +6036,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "19" # Update this tag for each script version
+$ScriptTag = "20" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6448,6 +6449,96 @@ function ConvertFrom-WingetOutput {
     return $apps
 }
 
+# Static task file shared with detect.ps1.
+# Detection writes this file when upgrades are found; remediation reads it as the authoritative
+# work list and removes entries as each app is processed (success or final-failure).
+$Script:UpgradeTaskFile = "C:\ProgramData\Temp\availableUpgrades-tasks.json"
+# Refuse to use the task file beyond this age — guards against acting on stale detections after
+# a missed Intune cycle. Tunable; 6 h is comfortably longer than a normal detect→remediate gap.
+$Script:UpgradeTaskFileMaxAgeHours = 6
+
+function Read-UpgradeTaskFile {
+    <#
+    .SYNOPSIS
+        Reads the static upgrade task file written by detect.ps1.
+    .OUTPUTS
+        ArrayList of @{ AppID; FriendlyName; CurrentVersion; AvailableVersion } records, or $null
+        if the file is missing, malformed, or older than UpgradeTaskFileMaxAgeHours.
+    .NOTES
+        All Write-Log calls in this function are piped to Out-Null because Write-Log emits the
+        formatted console line to the success stream — without suppression that string leaks
+        into the function's return value alongside the ArrayList.
+    #>
+    if (-not (Test-Path $Script:UpgradeTaskFile)) { return $null }
+    try {
+        $raw = Get-Content $Script:UpgradeTaskFile -Raw -ErrorAction Stop
+        $payload = $raw | ConvertFrom-Json -ErrorAction Stop
+        if (-not $payload.Tasks) { return $null }
+
+        if ($payload.Generated) {
+            try {
+                $gen = [DateTime]::Parse($payload.Generated)
+                $age = (Get-Date) - $gen
+                $ageHours = [int]$age.TotalHours
+                $ageMinutes = [int]$age.TotalMinutes
+                $maxHours = $Script:UpgradeTaskFileMaxAgeHours
+                if ($age.TotalHours -gt $maxHours) {
+                    Write-Log -Message "Upgrade task file is stale - age $ageHours h, max $maxHours h - ignoring" | Out-Null
+                    return $null
+                }
+                $taskCount = $payload.Tasks.Count
+                Write-Log -Message "Upgrade task file age $ageMinutes min, $taskCount tasks" | Out-Null
+            } catch {
+                Write-Log -Message "Could not parse task file Generated timestamp - proceeding regardless" | Out-Null
+            }
+        }
+
+        $list = [System.Collections.ArrayList]::new()
+        foreach ($t in $payload.Tasks) {
+            if (-not $t.AppID) { continue }
+            $null = $list.Add(@{
+                AppID = [string]$t.AppID
+                FriendlyName = [string]$t.FriendlyName
+                CurrentVersion = [string]$t.CurrentVersion
+                AvailableVersion = [string]$t.AvailableVersion
+            })
+        }
+        return $list
+    } catch {
+        Write-Log -Message "Error reading upgrade task file (will fall back to winget discovery): $($_.Exception.Message)" | Out-Null
+        return $null
+    }
+}
+
+function Remove-UpgradeTaskEntry {
+    <#
+    .SYNOPSIS
+        Removes the entry for a given AppID from the static task file. Called after an app is
+        finally processed (success or final-failure) so subsequent runs do not retry it.
+        If the file becomes empty, deletes the file entirely.
+    #>
+    param([Parameter(Mandatory)][string]$AppID)
+    if (-not (Test-Path $Script:UpgradeTaskFile)) { return }
+    try {
+        $raw = Get-Content $Script:UpgradeTaskFile -Raw -ErrorAction Stop
+        $payload = $raw | ConvertFrom-Json -ErrorAction Stop
+        if (-not $payload.Tasks) { return }
+
+        $kept = @($payload.Tasks | Where-Object { $_.AppID -ne $AppID })
+        if ($kept.Count -eq 0) {
+            Remove-Item -Path $Script:UpgradeTaskFile -Force -ErrorAction SilentlyContinue
+            Write-Log -Message "Removed upgrade task file (last task '$AppID' processed)" | Out-Null
+            return
+        }
+        $payload.Tasks = $kept
+        $payload | ConvertTo-Json -Depth 4 | Out-File -FilePath $Script:UpgradeTaskFile -Encoding UTF8 -Force
+        $remainingCount = $kept.Count
+        Write-Log -Message "Removed task '$AppID' from task file - $remainingCount remaining" | Out-Null
+    } catch {
+        Write-Log -Message "ERROR removing task '$AppID' from task file: $($_.Exception.Message)" | Out-Null
+    }
+}
+
 function Get-MissingMachineUpgrades {
     <#
     .SYNOPSIS
@@ -6457,7 +6548,7 @@ function Get-MissingMachineUpgrades {
         winget tracks installed packages per-account: an app the user installed (e.g. Mozilla.Firefox)
         ends up registered in the user's tracking database, so `winget upgrade` run as SYSTEM does
         not list it — even though the binary lives in C:\Program Files and the SYSTEM account has
-        full write access to it. `winget list --id <id>` does correlate against ARP (machine-wide),
+        full write access to it. `winget list --id ID` does correlate against ARP (machine-wide),
         so this helper queries each whitelisted machine-scoped app individually and reports any
         pending upgrade so the main loop can apply it from SYSTEM context (no UAC).
     .PARAMETER Whitelist
@@ -6515,7 +6606,9 @@ function Get-MissingMachineUpgrades {
                         CurrentVersion = $p.CurrentVersion
                         AvailableVersion = $p.AvailableVersion
                     })
-                    Write-Log -Message "SYSTEM augmentation: discovered pending upgrade for $($entry.AppID) ($($p.CurrentVersion) -> $($p.AvailableVersion))"
+                    $augFromVer = $p.CurrentVersion
+                    $augToVer = $p.AvailableVersion
+                    Write-Log -Message "SYSTEM augmentation: discovered pending upgrade for $($entry.AppID) - $augFromVer to $augToVer"
                     break
                 }
             }
@@ -7106,12 +7199,22 @@ if ($OUTPUT_USER_SCOPE -and $OUTPUT_USER_SCOPE.Count -gt 0) {
     }
 }
 
-# SYSTEM-context augmentation: pick up whitelisted machine-scoped apps that `winget upgrade`
-# missed because winget's per-account package tracking does not include them under SYSTEM
-# (e.g. user-installed Mozilla.Firefox in C:\Program Files). Apps discovered here will be
-# upgraded later in the main loop with full SYSTEM privileges, avoiding the UAC prompt that
-# would otherwise hit the user when machine-scoped upgrades fall through to user context.
-if ((Test-RunningAsSystem) -and -not $UserRemediationOnly -and $whitelistConfig -and $WingetPath) {
+# Authoritative work list: prefer the static task file written by detect.ps1.
+# When present and fresh, it tells us exactly which apps need upgrading — discovered via the
+# user-context dual `winget upgrade` listing during detection — and we can skip the
+# SYSTEM-context augmentation pass below entirely.
+$Script:UsingTaskFile = $false
+$taskFileList = @(Read-UpgradeTaskFile)
+if ($taskFileList -and $taskFileList.Count -gt 0) {
+    $taskListCount = $taskFileList.Count
+    Write-Log -Message "Loaded upgrade task file as authoritative work list - $taskListCount entries; skipping winget-discovery augmentation"
+    $LIST = $taskFileList
+    $Script:UsingTaskFile = $true
+}
+
+# SYSTEM-context augmentation (fallback only): pick up whitelisted machine-scoped apps that
+# `winget upgrade` missed. Skipped when the task file is the source of truth.
+if (-not $Script:UsingTaskFile -and (Test-RunningAsSystem) -and -not $UserRemediationOnly -and $whitelistConfig -and $WingetPath) {
     $existingIdMap = @{}
     foreach ($a in $LIST) { if ($a.AppID) { $existingIdMap[$a.AppID] = $true } }
 
@@ -7667,6 +7770,8 @@ if ($LIST -and $LIST.Count -gt 0) {
                             Write-Log -Message "Upgrade completed successfully for: $($appInfo.AppID)"
                             Clear-VersionFailureData -AppID $appInfo.AppID
                             $message += "$($appInfo.AppID)|"
+                            # Done with this entry \u2014 drop it from the static task file.
+                            Remove-UpgradeTaskEntry -AppID $appInfo.AppID
 
                             if ($dialogResult -and $dialogResult.ProgressSignalFile) {
                                 # Signal the deferral dialog's progress mode
@@ -7693,6 +7798,8 @@ if ($LIST -and $LIST.Count -gt 0) {
                                 if ($skipChoice) {
                                     Set-VersionSkipped -AppID $appInfo.AppID -Version $appInfo.AvailableVersion
                                 }
+                                # Final-failure for this version: drop from task file so we do not retry every cycle.
+                                Remove-UpgradeTaskEntry -AppID $appInfo.AppID
                             }
                             if ($dialogResult -and $dialogResult.ProgressSignalFile) {
                                 @{ Success = $false; Message = "Update failed" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8

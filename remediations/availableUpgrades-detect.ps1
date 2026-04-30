@@ -80,6 +80,7 @@
     5.31 - FIX: Added --scope user dual-listing to SYSTEM context detection so apps like Perplexity.Comet (user-scoped in winget but installed to Program Files) are detected and trigger remediation in SYSTEM context
     5.32 - REVERT: Removed --scope user from SYSTEM context detection — SYSTEM cannot see user-registered winget packages; user context detection already handles this via scheduled task
     5.33 - FIX: User-context detection now runs BOTH the default `winget upgrade` listing AND `--scope user`, then merges by AppID. Previously it only ran `--scope user`, which misses apps like Mozilla.Firefox that winget tracks under the user account but installs machine-wide (C:\Program Files). Such apps were invisible to BOTH SYSTEM (per-user tracking gap) and user `--scope user` (filter excludes machine-installed binaries), so detection never reported them and remediation was never triggered. Mirrors the dual-listing logic remediate.ps1 has used since v9.11.
+    5.34 - REFACTOR: Detection now writes a static task file (C:\ProgramData\Temp\availableUpgrades-tasks.json) listing the upgrades it found, so remediate.ps1 can use it as an authoritative work list and skip its own discovery pass. ConvertFrom-WingetOutput now returns full records (AppID + CurrentVersion + AvailableVersion) so the task file carries version info for dialogs without a second winget query. Added Get-RecordAppId and Format-AppList helpers to keep logging readable across the heterogeneous record types (string, hashtable, PSCustomObject from ConvertFrom-Json).
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -794,6 +795,103 @@ function Get-InteractiveUser {
     }
 }
 
+function Get-RecordAppId {
+    <#
+    .SYNOPSIS
+        Extracts the AppID from an upgrade record regardless of whether it is a string,
+        hashtable, or PSCustomObject (ConvertFrom-Json output).
+    #>
+    param($Record)
+    if ($null -eq $Record) { return "" }
+    if ($Record -is [string]) { return $Record }
+    if ($Record -is [hashtable] -or $Record -is [System.Collections.IDictionary]) { return [string]$Record['AppID'] }
+    if ($Record.PSObject -and $Record.PSObject.Properties['AppID']) { return [string]$Record.AppID }
+    return ""
+}
+
+function Format-AppList {
+    <#
+    .SYNOPSIS
+        Formats a heterogeneous app list (strings, hashtables, PSCustomObjects) as a
+        comma-separated AppID string for logging — avoids "System.Collections.Hashtable" noise.
+    #>
+    param([object[]]$Apps)
+    if (-not $Apps -or $Apps.Count -eq 0) { return "" }
+    return (($Apps | ForEach-Object { Get-RecordAppId -Record $_ } | Where-Object { $_ }) -join ', ')
+}
+
+# Static task file shared between detect.ps1 and remediate.ps1.
+# Detection writes this file when upgrades are found; remediation reads it as the
+# authoritative work list and removes entries as they are processed (success or final-failure).
+$Script:UpgradeTaskFile = "C:\ProgramData\Temp\availableUpgrades-tasks.json"
+
+function Write-UpgradeTaskFile {
+    <#
+    .SYNOPSIS
+        Writes the current set of detected upgrades to the static task file consumed by
+        the remediation script. Overwrites any existing content.
+    .PARAMETER Records
+        Array of upgrade records (hashtables / PSCustomObjects with at least AppID;
+        CurrentVersion / AvailableVersion / FriendlyName preserved when present).
+    #>
+    param([object[]]$Records)
+
+    try {
+        $taskDir = Split-Path -Parent $Script:UpgradeTaskFile
+        if (-not (Test-Path $taskDir)) {
+            New-Item -Path $taskDir -ItemType Directory -Force | Out-Null
+        }
+
+        $entries = @()
+        foreach ($r in $Records) {
+            if (-not $r) { continue }
+            $appId = Get-RecordAppId -Record $r
+            if ([string]::IsNullOrEmpty($appId)) { continue }
+            $current = ""
+            $available = ""
+            $friendly = ""
+            if ($r -is [hashtable] -or $r -is [System.Collections.IDictionary]) {
+                $current = [string]$r['CurrentVersion']
+                $available = [string]$r['AvailableVersion']
+                $friendly = [string]$r['FriendlyName']
+            } elseif ($r.PSObject) {
+                if ($r.PSObject.Properties['CurrentVersion']) { $current = [string]$r.CurrentVersion }
+                if ($r.PSObject.Properties['AvailableVersion']) { $available = [string]$r.AvailableVersion }
+                if ($r.PSObject.Properties['FriendlyName']) { $friendly = [string]$r.FriendlyName }
+            }
+            $entries += [pscustomobject]@{
+                AppID = $appId
+                FriendlyName = $friendly
+                CurrentVersion = $current
+                AvailableVersion = $available
+                DiscoveredAt = (Get-Date).ToString("o")
+            }
+        }
+
+        $payload = [pscustomobject]@{
+            Generated = (Get-Date).ToString("o")
+            GeneratedByScriptTag = $ScriptTag
+            Tasks = @($entries)
+        }
+        $payload | ConvertTo-Json -Depth 4 | Out-File -FilePath $Script:UpgradeTaskFile -Encoding UTF8 -Force
+        Write-Log -Message "Wrote upgrade task file with $($entries.Count) tasks: $Script:UpgradeTaskFile"
+    } catch {
+        Write-Log -Message "ERROR writing upgrade task file: $($_.Exception.Message)"
+    }
+}
+
+function Remove-UpgradeTaskFile {
+    param([string]$Reason = "")
+    try {
+        if (Test-Path $Script:UpgradeTaskFile) {
+            Remove-Item -Path $Script:UpgradeTaskFile -Force -ErrorAction Stop
+            Write-Log -Message "Removed upgrade task file ($Reason): $Script:UpgradeTaskFile"
+        }
+    } catch {
+        Write-Log -Message "ERROR removing upgrade task file: $($_.Exception.Message)"
+    }
+}
+
 function Write-DetectionResults {
     param(
         [array]$Apps,
@@ -804,7 +902,7 @@ function Write-DetectionResults {
         Write-Log "DEBUG: Write-DetectionResults function entered" -IsDebug
         Write-Log "DEBUG: Target file path: $FilePath" -IsDebug
         Write-Log "DEBUG: Apps to write: $($Apps.Count)" -IsDebug
-        Write-Log "DEBUG: Apps list: $($Apps -join ', ')" -IsDebug
+        Write-Log "DEBUG: Apps list: $(Format-AppList $Apps)" -IsDebug
         
         $results = @{
             Apps = $Apps
@@ -1110,7 +1208,7 @@ function Invoke-UserContextDetection {
                         $apps = $results.Apps
                         Write-Log "User detection completed: $($apps.Count) apps found" | Out-Null
                         if ($apps.Count -gt 0) {
-                            Write-Log "DEBUG: User context apps found: $($apps -join ', ')" -IsDebug | Out-Null
+                            Write-Log "DEBUG: User context apps found: $(Format-AppList $apps)" -IsDebug | Out-Null
                         } else {
                             Write-Log "DEBUG: No apps found in parsed results - Apps array is empty" -IsDebug | Out-Null
                         }
@@ -1244,7 +1342,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "63" # Update this tag for each script version
+$ScriptTag = "64" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -1530,8 +1628,11 @@ function ConvertFrom-WingetOutput {
 
     $idPos = $columns["Id"]
     $idEnd = if ($columns.ContainsKey("Version")) { $columns["Version"] - 1 } else { $headerLine.Length - 1 }
+    $versionPos = if ($columns.ContainsKey("Version")) { $columns["Version"] } else { -1 }
+    $availablePos = if ($columns.ContainsKey("Available")) { $columns["Available"] } else { -1 }
+    $sourcePos = if ($columns.ContainsKey("Source")) { $columns["Source"] } else { -1 }
 
-    Write-Log -Message "Column positions - Id: $idPos, end: $idEnd"
+    Write-Log -Message "Column positions - Id: $idPos, end: $idEnd, Version: $versionPos, Available: $availablePos"
 
     $apps = [System.Collections.ArrayList]::new()
     for ($i = $separatorIndex + 1; $i -lt $Output.Count; $i++) {
@@ -1543,10 +1644,25 @@ function ConvertFrom-WingetOutput {
         if ($line.Length -le $idPos) { continue }
 
         $appId = ($line[$idPos..$idEnd] -join "").Trim()
-        if ($appId -ne "") {
-            $null = $apps.Add($appId)
-            Write-Log -Message "DEBUG: Found app: $appId" -IsDebug
+        if ($appId -eq "") { continue }
+
+        $currentVersion = ""
+        $availableVersion = ""
+        if ($versionPos -ge 0 -and $availablePos -gt $versionPos -and $line.Length -gt $versionPos) {
+            $verEnd = $availablePos - 1
+            $currentVersion = ($line[$versionPos..$verEnd] -join "").Trim()
         }
+        if ($availablePos -ge 0 -and $line.Length -gt $availablePos) {
+            $avEnd = if ($sourcePos -gt $availablePos) { $sourcePos - 1 } else { $line.Length - 1 }
+            $availableVersion = ($line[$availablePos..$avEnd] -join "").Trim()
+        }
+
+        $null = $apps.Add(@{
+            AppID = $appId
+            CurrentVersion = $currentVersion
+            AvailableVersion = $availableVersion
+        })
+        Write-Log -Message "DEBUG: Found app: $appId ($currentVersion -> $availableVersion)" -IsDebug
     }
 
     Write-Log -Message "Parsed $($apps.Count) apps from winget output"
@@ -1677,15 +1793,16 @@ if ($LIST -and $LIST.Count -gt 0) {
         $deferredApps = @()
 
         foreach ($app in $LIST) {
-            if ($app -ne "") {
+            $appId = if ($app -is [hashtable] -or $app -is [System.Collections.IDictionary]) { $app.AppID } else { $app }
+            if (-not [string]::IsNullOrEmpty($appId)) {
                 $doUpgrade = $false
                 foreach ($okapp in $whitelistConfig) {
-                    if ($app -like $okapp.AppID) {
+                    if ($appId -like $okapp.AppID) {
                         # FAST DEFERRAL CHECK - Only check existing registry data (no expensive winget queries)
                         if ($okapp.DeferralEnabled -eq $true) {
-                            $deferralPath = "HKLM:\SOFTWARE\WingetUpgradeManager\Deferrals\$app"
+                            $deferralPath = "HKLM:\SOFTWARE\WingetUpgradeManager\Deferrals\$appId"
                             $now = Get-Date
-                            
+
                             # Quick check - only look at existing user deadline (no expensive admin deadline calculation)
                             if (Test-Path $deferralPath) {
                                 try {
@@ -1701,12 +1818,12 @@ if ($LIST -and $LIST.Count -gt 0) {
                                         }
                                     }
                                 } catch {
-                                    Write-Log -Message "Error reading deferral data for $app : $($_.Exception.Message)"
+                                    Write-Log -Message "Error reading deferral data for $appId : $($_.Exception.Message)"
                                     # On error, allow detection to proceed
                                 }
                             }
                         }
-                        
+
                         # Check for blocking processes
                         $blockingProcessNames = $okapp.BlockingProcess
                         if (-not [string]::IsNullOrEmpty($blockingProcessNames)) {
@@ -1731,17 +1848,21 @@ if ($LIST -and $LIST.Count -gt 0) {
                                 }
                             }
                         }
-                        
+
                         $doUpgrade = $true
+                        # Capture friendlyName onto the record so the task file gets it without another whitelist lookup
+                        if ($app -is [hashtable] -or $app -is [System.Collections.IDictionary]) {
+                            $app['FriendlyName'] = $okapp.FriendlyName
+                        }
                         break
                     }
                 }
 
                 if ($doUpgrade) {
                     $contextApps += $app
-                    Write-Log -Message "DEBUG: App '$app' added to context apps (whitelisted)" -IsDebug
+                    Write-Log -Message "DEBUG: App '$appId' added to context apps (whitelisted)" -IsDebug
                 } else {
-                    Write-Log -Message "DEBUG: App '$app' not in whitelist, skipping" -IsDebug
+                    Write-Log -Message "DEBUG: App '$appId' not in whitelist, skipping" -IsDebug
                 }
             }
         }
@@ -1758,7 +1879,7 @@ if ($LIST -and $LIST.Count -gt 0) {
             # User context scheduled task - write results and exit
             Write-Log -Message "User detection found $($contextApps.Count) apps"
             if ($contextApps.Count -gt 0) {
-                Write-Log -Message "DEBUG: User context apps: $($contextApps -join ', ')" -IsDebug
+                Write-Log -Message "DEBUG: User context apps: $(Format-AppList $contextApps)" -IsDebug
             }
             Write-Log -Message "*** USER CONTEXT DETECTION COMPLETE - WRITING RESULTS ***"
             
@@ -1772,7 +1893,7 @@ if ($LIST -and $LIST.Count -gt 0) {
                 Write-Log -Message "DEBUG: File name: $(Split-Path $effectiveResultFile -Leaf)" -IsDebug
                 Write-Log -Message "DEBUG: Directory exists: $(Test-Path $targetDir)" -IsDebug
                 Write-Log -Message "DEBUG: About to write $($contextApps.Count) apps to result file" -IsDebug
-                Write-Log -Message "DEBUG: Apps to write: $($contextApps -join ', ')" -IsDebug
+                Write-Log -Message "DEBUG: Apps to write: $(Format-AppList $contextApps)" -IsDebug
                 Write-Log -Message "Writing results to file: $effectiveResultFile"
                 
                 # COMPREHENSIVE PERMISSIONS TESTING FROM SCHEDULED TASK CONTEXT
@@ -1900,15 +2021,16 @@ if ($LIST -and $LIST.Count -gt 0) {
 
             # PERFORMANCE OPTIMIZATION: Exit immediately if system apps are found
             if ($systemApps.Count -gt 0) {
-                Write-Log -Message "[$ScriptTag] $($systemApps -join ', ')"
+                Write-Log -Message "[$ScriptTag] $(Format-AppList $systemApps)"
                 if ($deferredApps.Count -gt 0) {
                     Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
                 }
+                Write-UpgradeTaskFile -Records $systemApps
                 Write-Log -Message "Performing marker file cleanup before exit (system apps found)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "System apps found, triggering remediation"
                 exit 1  # Trigger remediation immediately
             }
-            
+
             # Only run user detection if no system apps were found AND interactive session exists
             Write-Log -Message "No system apps found - checking for interactive session before user context detection"
             if (-not (Test-InteractiveSession)) {
@@ -1917,6 +2039,7 @@ if ($LIST -and $LIST.Count -gt 0) {
                 }
                 Write-Log -Message "[$ScriptTag] No interactive session detected - skipping user context detection"
                 Write-Log -Message "[$ScriptTag] No upgrades available in any context (no system apps, no interactive session)"
+                Remove-UpgradeTaskFile -Reason "No interactive session, no upgrades"
                 Write-Log -Message "Performing marker file cleanup before exit (no interactive session)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "No interactive session"
                 exit 0
@@ -1926,13 +2049,13 @@ if ($LIST -and $LIST.Count -gt 0) {
             Write-Log -Message "DEBUG: About to call Invoke-UserContextDetection function" -IsDebug
             $userApps = Invoke-UserContextDetection
             Write-Log -Message "DEBUG: Invoke-UserContextDetection returned $($userApps.Count) apps" -IsDebug
-            # Write-Log -Message "User detection found $($userApps.Count) apps: $($userApps -join ', ')"
-            
+
             if ($userApps.Count -gt 0) {
-                Write-Log -Message "[$ScriptTag] $($userApps -join ', ')"
+                Write-Log -Message "[$ScriptTag] $(Format-AppList $userApps)"
                 if ($deferredApps.Count -gt 0) {
                     Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
                 }
+                Write-UpgradeTaskFile -Records $userApps
                 Write-Log -Message "Performing marker file cleanup before exit (user apps found)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "User apps found, triggering remediation"
                 exit 1  # Trigger remediation
@@ -1941,6 +2064,7 @@ if ($LIST -and $LIST.Count -gt 0) {
                     Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
                 }
                 Write-Log -Message "[$ScriptTag] No upgrades available in any context"
+                Remove-UpgradeTaskFile -Reason "No upgrades available"
                 Write-Log -Message "Performing marker file cleanup before exit (no upgrades found)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "No upgrades available in any context"
                 exit 0
@@ -1951,10 +2075,11 @@ if ($LIST -and $LIST.Count -gt 0) {
             Write-Log -Message "DEBUG: This path is for direct user context execution (not scheduled task)" -IsDebug
             # Direct user context execution
             if ($contextApps.Count -gt 0) {
-                Write-Log -Message "[$ScriptTag] $($contextApps -join ', ')"
+                Write-Log -Message "[$ScriptTag] $(Format-AppList $contextApps)"
                 if ($deferredApps.Count -gt 0) {
                     Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
                 }
+                Write-UpgradeTaskFile -Records $contextApps
                 Write-Log -Message "Performing marker file cleanup before exit (direct user context apps found)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "Direct user context apps found"
                 exit 1  # Trigger remediation
@@ -1963,6 +2088,7 @@ if ($LIST -and $LIST.Count -gt 0) {
                     Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
                 }
                 Write-Log -Message "[$ScriptTag] No user context upgrades available"
+                Remove-UpgradeTaskFile -Reason "No user context upgrades available"
                 Write-Log -Message "Performing marker file cleanup before exit (no user context upgrades)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "No user context upgrades available"
                 exit 0
@@ -1970,6 +2096,7 @@ if ($LIST -and $LIST.Count -gt 0) {
         }
 } else {
     Write-Log -Message "[$ScriptTag] No upgrades found in winget output"
+    Remove-UpgradeTaskFile -Reason "No upgrades in winget output"
     Write-Log -Message "Performing final marker file cleanup before script exit" -IsDebug
     Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (no upgrades found)"
     exit 0
