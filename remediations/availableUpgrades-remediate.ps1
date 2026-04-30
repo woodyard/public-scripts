@@ -82,6 +82,8 @@
     9.15 - FIX: Direct install fallback now calls WaitForExit() before reading exit code and treats null exit code as success; Chromium-based installers fork a child process and the parent exits immediately with no exit code, which was incorrectly treated as failure
     9.16 - FIX: Added --scope user dual-listing to SYSTEM context so apps like Perplexity.Comet (user-scoped in winget but installed to Program Files) are discovered and upgraded with SYSTEM privileges; prevents failed upgrades from user context lacking write access to Program Files
     9.17 - REVERT: Removed --scope user from SYSTEM context — SYSTEM cannot see user-registered winget packages; dual-scope listing remains in user context only where it is effective
+    9.18 - FIX: Prevent unintended UAC prompts during user-context upgrades. Scope detection correctly identified machine-scoped apps (e.g. Mozilla.Firefox) but the resulting `$doUpgrade = $false` had no effect because it was set inside the `if ($doUpgrade)` block, so winget still ran and the installer triggered UAC. Now the user-context flow signals dialogs cleanly and `continue`s to the next app, leaving machine-scoped upgrades to the SYSTEM context.
+    9.19 - FIX: Post-upgrade verification was producing false-positive failures. Whitespace-split column extraction misclassified columns when winget list returns no Available column after a successful upgrade — empty parse fell into the failure branch. Replaced ad-hoc parsing with the existing header-position parser (ConvertFrom-WingetOutput) and now treats only an EXACT match between parsed Available and our target version as a true failure; empty/different Available is treated as success. Also: SYSTEM context now augments its `winget upgrade` listing by querying `winget list --id <id>` for each whitelisted machine-scoped app missing from the upgrade list — picks up apps like Mozilla.Firefox that winget tracks under user accounts but which actually live in C:\Program Files, so SYSTEM can upgrade them without UAC.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6033,7 +6035,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "17" # Update this tag for each script version
+$ScriptTag = "19" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6444,6 +6446,87 @@ function ConvertFrom-WingetOutput {
 
     Write-Log -Message "Parsed $($apps.Count) apps from winget output"
     return $apps
+}
+
+function Get-MissingMachineUpgrades {
+    <#
+    .SYNOPSIS
+        Discovers pending upgrades for whitelisted machine-scoped apps that SYSTEM-context's
+        plain `winget upgrade` listing missed.
+    .DESCRIPTION
+        winget tracks installed packages per-account: an app the user installed (e.g. Mozilla.Firefox)
+        ends up registered in the user's tracking database, so `winget upgrade` run as SYSTEM does
+        not list it — even though the binary lives in C:\Program Files and the SYSTEM account has
+        full write access to it. `winget list --id <id>` does correlate against ARP (machine-wide),
+        so this helper queries each whitelisted machine-scoped app individually and reports any
+        pending upgrade so the main loop can apply it from SYSTEM context (no UAC).
+    .PARAMETER Whitelist
+        Parsed whitelist entries with AppID, FriendlyName, and optional Enabled.
+    .PARAMETER ExistingIds
+        Hashtable of AppIDs already discovered by the main `winget upgrade` listing — these are
+        skipped to avoid duplicate processing.
+    .PARAMETER WingetExePath
+        Full path to winget.exe (resolved for SYSTEM context).
+    .PARAMETER WingetWorkingDir
+        Working directory for winget (the WindowsApps DesktopAppInstaller folder under SYSTEM).
+    .OUTPUTS
+        ArrayList of @{ AppID; CurrentVersion; AvailableVersion } entries ready to merge into $LIST.
+    #>
+    param(
+        [array]$Whitelist,
+        [hashtable]$ExistingIds,
+        [string]$WingetExePath,
+        [string]$WingetWorkingDir
+    )
+
+    $discovered = [System.Collections.ArrayList]::new()
+    if (-not $Whitelist -or -not $WingetExePath) { return $discovered }
+
+    $augmentStart = Get-Date
+    $candidates = 0
+    foreach ($entry in $Whitelist) {
+        if (-not $entry.AppID) { continue }
+        if ($entry.PSObject.Properties['Disabled'] -and $entry.Disabled -eq $true) { continue }
+        # Skip wildcard patterns — `winget list --id` needs a concrete ID.
+        # Wildcarded entries are typically handled fine by the main `winget upgrade` listing because
+        # they cover variants (Beta/ESR/etc.) that are independently tracked.
+        if ($entry.AppID -match '[\*\?]') { continue }
+        if ($ExistingIds -and $ExistingIds.ContainsKey($entry.AppID)) { continue }
+
+        # Quick registry-based gate: only consider apps actually installed machine-wide.
+        $scope = Get-AppInstalledScope -AppID $entry.AppID -FriendlyName $entry.FriendlyName
+        if ($scope -ne "machine") { continue }
+
+        $candidates++
+        try {
+            $listArgs = @("list", "--id", $entry.AppID, "--exact", "--source", "winget", "--accept-source-agreements")
+            $listOut = if ($WingetWorkingDir) {
+                Push-Location $WingetWorkingDir
+                try { & $WingetExePath @listArgs 2>&1 } finally { Pop-Location }
+            } else {
+                & $WingetExePath @listArgs 2>&1
+            }
+            $listLines = @($listOut | ForEach-Object { "$_" })
+            $parsed = ConvertFrom-WingetOutput -Output $listLines
+            foreach ($p in $parsed) {
+                if ($p.AppID -eq $entry.AppID -and -not [string]::IsNullOrWhiteSpace($p.AvailableVersion)) {
+                    $null = $discovered.Add(@{
+                        AppID = $p.AppID
+                        CurrentVersion = $p.CurrentVersion
+                        AvailableVersion = $p.AvailableVersion
+                    })
+                    Write-Log -Message "SYSTEM augmentation: discovered pending upgrade for $($entry.AppID) ($($p.CurrentVersion) -> $($p.AvailableVersion))"
+                    break
+                }
+            }
+        } catch {
+            Write-Log -Message "SYSTEM augmentation: error querying $($entry.AppID): $($_.Exception.Message)"
+        }
+    }
+
+    $augmentTime = (Get-Date) - $augmentStart
+    Write-Log -Message "SYSTEM augmentation: scanned $candidates machine-scoped candidates in $([int]$augmentTime.TotalSeconds)s, discovered $($discovered.Count) missed upgrades"
+    return $discovered
 }
 
 # Main remediation logic - dual-context architecture
@@ -7023,6 +7106,25 @@ if ($OUTPUT_USER_SCOPE -and $OUTPUT_USER_SCOPE.Count -gt 0) {
     }
 }
 
+# SYSTEM-context augmentation: pick up whitelisted machine-scoped apps that `winget upgrade`
+# missed because winget's per-account package tracking does not include them under SYSTEM
+# (e.g. user-installed Mozilla.Firefox in C:\Program Files). Apps discovered here will be
+# upgraded later in the main loop with full SYSTEM privileges, avoiding the UAC prompt that
+# would otherwise hit the user when machine-scoped upgrades fall through to user context.
+if ((Test-RunningAsSystem) -and -not $UserRemediationOnly -and $whitelistConfig -and $WingetPath) {
+    $existingIdMap = @{}
+    foreach ($a in $LIST) { if ($a.AppID) { $existingIdMap[$a.AppID] = $true } }
+
+    $augmentExe = Join-Path $WingetPath "winget.exe"
+    $augmented = Get-MissingMachineUpgrades -Whitelist $whitelistConfig -ExistingIds $existingIdMap -WingetExePath $augmentExe -WingetWorkingDir $WingetPath
+    if ($augmented -and $augmented.Count -gt 0) {
+        $augmentList = [System.Collections.ArrayList]::new()
+        foreach ($a in $LIST) { $null = $augmentList.Add($a) }
+        foreach ($a in $augmented) { $null = $augmentList.Add($a) }
+        $LIST = $augmentList
+    }
+}
+
 if ($LIST -and $LIST.Count -gt 0) {
         $count = 0
         $message = ""
@@ -7290,13 +7392,28 @@ if ($LIST -and $LIST.Count -gt 0) {
                         } elseif (-not $userIsAdmin) {
                             $detectedScope = Get-AppInstalledScope -AppID $appInfo.AppID -FriendlyName $okapp.FriendlyName
                             if ($detectedScope -eq "machine") {
-                                Write-Log -Message "Skipping $($appInfo.AppID) - machine-scoped install cannot be upgraded without elevation (non-admin user context)"
+                                Write-Log -Message "Skipping $($appInfo.AppID) - machine-scoped install cannot be upgraded without elevation (non-admin user context); already handled by SYSTEM context"
                                 $doUpgrade = $false
                             } else {
                                 Write-Log -Message "Using --scope user for non-admin user context upgrade (detected scope: $detectedScope)"
                                 $wingetArgs += @("--scope", "user")
                             }
                         }
+
+                        # Honor scope-detection skip decision: must NOT invoke winget for machine-scoped
+                        # apps in non-admin user context, as Windows would trigger a UAC prompt for the
+                        # installer (e.g. Firefox writing to Program Files). The SYSTEM context handles
+                        # these apps separately.
+                        if (-not $doUpgrade) {
+                            if ($dialogResult -and $dialogResult.ProgressSignalFile) {
+                                @{ Success = $true; Message = "Update handled by system" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                            } elseif ($infoSignalFile) {
+                                @{ Success = $true; Message = "Update handled by system" } | ConvertTo-Json | Out-File -FilePath $infoSignalFile -Encoding UTF8
+                            }
+                            $message += "$($appInfo.AppID) (SKIPPED-scope)|"
+                            continue
+                        }
+
                         if (Get-Command Update-Heartbeat -ErrorAction SilentlyContinue) {
                             Update-Heartbeat -Stage "UpgradeStarting" -AdditionalData @{ AppID = $appInfo.AppID }
                         }
@@ -7516,34 +7633,31 @@ if ($LIST -and $LIST.Count -gt 0) {
                                 } else {
                                     $verifyResult = & $verifyExe @verifyArgs 2>&1
                                 }
-                                $verifyText = ($verifyResult | ForEach-Object { "$_" }) -join "`n"
-                                # If winget list still shows an "Available" upgrade column for this exact app, check whether
-                                # it is the SAME version we tried to install (true failure) or a NEWER version (source updated after our upgrade)
-                                if ($verifyText -match "\sAvailable\s" -and $verifyText -like "*$($appInfo.AppID)*") {
-                                    # Parse the available version from winget list output to compare
-                                    $verifyAvailableVersion = $null
-                                    foreach ($vLine in ($verifyText -split "`n")) {
-                                        if ($vLine -like "*$($appInfo.AppID)*" -and $vLine -notmatch '^\s*Name\s') {
-                                            # Extract version fields: the line format is "Name  Id  Version  Available  Source"
-                                            # Split on 2+ spaces to get columns
-                                            $vCols = $vLine -split '\s{2,}' | Where-Object { $_ -ne "" }
-                                            if ($vCols.Count -ge 4) {
-                                                $verifyAvailableVersion = $vCols[$vCols.Count - 2]  # Available is second-to-last (before Source)
-                                            }
-                                            break
-                                        }
+                                # Use the column-position parser (header-based) to extract Available reliably,
+                                # since whitespace splitting misclassifies columns when Available is empty after a successful upgrade.
+                                $verifyLines = @($verifyResult | ForEach-Object { "$_" })
+                                $verifyApps = ConvertFrom-WingetOutput -Output $verifyLines
+                                $verifyAvailableVersion = $null
+                                $verifyCurrentVersion = $null
+                                foreach ($vApp in $verifyApps) {
+                                    if ($vApp.AppID -eq $appInfo.AppID) {
+                                        $verifyAvailableVersion = $vApp.AvailableVersion
+                                        $verifyCurrentVersion = $vApp.CurrentVersion
+                                        break
                                     }
-                                    Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) shows Available=$verifyAvailableVersion (we upgraded to $($appInfo.AvailableVersion))"
-                                    if ($verifyAvailableVersion -and $verifyAvailableVersion -ne $appInfo.AvailableVersion) {
-                                        # A different (newer) version appeared in the source after our upgrade — our upgrade likely succeeded
-                                        Write-Log -Message "Post-upgrade verification: Available version ($verifyAvailableVersion) differs from target ($($appInfo.AvailableVersion)) - newer release appeared, trusting original success"
-                                    } else {
-                                        # Same version still pending — the upgrade genuinely did not take effect
-                                        Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) still shows same pending update - treating as failure"
-                                        $isSuccess = $false
-                                    }
+                                }
+
+                                if ([string]::IsNullOrWhiteSpace($verifyAvailableVersion)) {
+                                    # No Available version parsed (column empty or absent) — upgrade took effect
+                                    # or no pending upgrade remains. Trust the original success signal.
+                                    Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) confirmed up to date (Current=$verifyCurrentVersion, no Available)"
+                                } elseif ($verifyAvailableVersion -eq $appInfo.AvailableVersion) {
+                                    # winget list still shows the EXACT version we tried to install as pending — true failure
+                                    Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) still shows pending update for our target version $($appInfo.AvailableVersion) - treating as failure"
+                                    $isSuccess = $false
                                 } else {
-                                    Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) confirmed up to date"
+                                    # A different (typically newer) version appeared in the source after our upgrade — trust original success
+                                    Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) Available=$verifyAvailableVersion differs from target $($appInfo.AvailableVersion) - newer release appeared, trusting original success"
                                 }
                             } catch {
                                 Write-Log -Message "Post-upgrade verification error: $($_.Exception.Message) - trusting original result"
