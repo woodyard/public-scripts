@@ -81,6 +81,7 @@
     5.32 - REVERT: Removed --scope user from SYSTEM context detection — SYSTEM cannot see user-registered winget packages; user context detection already handles this via scheduled task
     5.33 - FIX: User-context detection now runs BOTH the default `winget upgrade` listing AND `--scope user`, then merges by AppID. Previously it only ran `--scope user`, which misses apps like Mozilla.Firefox that winget tracks under the user account but installs machine-wide (C:\Program Files). Such apps were invisible to BOTH SYSTEM (per-user tracking gap) and user `--scope user` (filter excludes machine-installed binaries), so detection never reported them and remediation was never triggered. Mirrors the dual-listing logic remediate.ps1 has used since v9.11.
     5.34 - REFACTOR: Detection now writes a static task file (C:\ProgramData\Temp\availableUpgrades-tasks.json) listing the upgrades it found, so remediate.ps1 can use it as an authoritative work list and skip its own discovery pass. ConvertFrom-WingetOutput now returns full records (AppID + CurrentVersion + AvailableVersion) so the task file carries version info for dialogs without a second winget query. Added Get-RecordAppId and Format-AppList helpers to keep logging readable across the heterogeneous record types (string, hashtable, PSCustomObject from ConvertFrom-Json).
+    5.35 - FEATURE: Each task entry now records InstalledScope (machine/user/unknown) determined via the registry uninstall keys (HKLM + HKU\SID under SYSTEM, HKLM + HKCU under user). Lets remediate.ps1 route entries to the right context without re-walking the registry per app. Get-AppInstalledScope ported from remediate.ps1 with HKCU support added for the user-context path.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -795,6 +796,76 @@ function Get-InteractiveUser {
     }
 }
 
+function Get-AppInstalledScope {
+    <#
+    .SYNOPSIS
+        Detects whether an app is installed per-user or machine-wide via the Windows
+        uninstall registry. Returns "user", "machine", or "unknown".
+    .DESCRIPTION
+        Scans HKLM (machine-wide) and the current user's HKU/HKCU (user-scope) uninstall
+        keys for an entry whose DisplayName matches the provided FriendlyName (or, when
+        FriendlyName is empty, the last segment of the AppID).
+        - From SYSTEM context the user hive is reached via HKU\<interactive-user-SID>.
+        - From user context HKCU is the current user's own hive.
+        Used by detect.ps1 to embed an InstalledScope in each task entry so remediate.ps1
+        can route the upgrade to the right context without rerunning the registry walk.
+    #>
+    param(
+        [string]$AppID,
+        [string]$FriendlyName
+    )
+
+    try {
+        $foundMachine = $false
+        $foundUser = $false
+
+        $searchName = if ($FriendlyName) { $FriendlyName } else { ($AppID -split '\.')[-1] }
+
+        # Machine-wide uninstall registry
+        $machineKeys = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        )
+        foreach ($keyPath in $machineKeys) {
+            if (Test-Path $keyPath) {
+                $entries = Get-ChildItem $keyPath -ErrorAction SilentlyContinue |
+                    Get-ItemProperty -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DisplayName -like "*$searchName*" }
+                if ($entries) { $foundMachine = $true; break }
+            }
+        }
+
+        # User-scope uninstall registry — different access path per context
+        if (Test-RunningAsSystem) {
+            $userInfo = Get-InteractiveUser
+            if ($userInfo -and $userInfo.SID) {
+                $userKey = "Registry::HKU\$($userInfo.SID)\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+                if (Test-Path $userKey) {
+                    $userEntries = Get-ChildItem $userKey -ErrorAction SilentlyContinue |
+                        Get-ItemProperty -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -like "*$searchName*" }
+                    if ($userEntries) { $foundUser = $true }
+                }
+            }
+        } else {
+            $userKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+            if (Test-Path $userKey) {
+                $userEntries = Get-ChildItem $userKey -ErrorAction SilentlyContinue |
+                    Get-ItemProperty -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DisplayName -like "*$searchName*" }
+                if ($userEntries) { $foundUser = $true }
+            }
+        }
+
+        if ($foundUser -and -not $foundMachine) { return "user" }
+        if ($foundMachine) { return "machine" }
+        return "unknown"
+    } catch {
+        Write-Log "Scope detection error for $AppID : $($_.Exception.Message)" | Out-Null
+        return "unknown"
+    }
+}
+
 function Get-RecordAppId {
     <#
     .SYNOPSIS
@@ -859,11 +930,15 @@ function Write-UpgradeTaskFile {
                 if ($r.PSObject.Properties['AvailableVersion']) { $available = [string]$r.AvailableVersion }
                 if ($r.PSObject.Properties['FriendlyName']) { $friendly = [string]$r.FriendlyName }
             }
+            # Determine the install scope so remediation can route the upgrade to the right context
+            # without re-walking the registry per app.
+            $scope = Get-AppInstalledScope -AppID $appId -FriendlyName $friendly
             $entries += [pscustomobject]@{
                 AppID = $appId
                 FriendlyName = $friendly
                 CurrentVersion = $current
                 AvailableVersion = $available
+                InstalledScope = $scope
                 DiscoveredAt = (Get-Date).ToString("o")
             }
         }
@@ -1342,7 +1417,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "64" # Update this tag for each script version
+$ScriptTag = "65" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"

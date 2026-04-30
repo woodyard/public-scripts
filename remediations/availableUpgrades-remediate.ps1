@@ -85,6 +85,7 @@
     9.18 - FIX: Prevent unintended UAC prompts during user-context upgrades. Scope detection correctly identified machine-scoped apps (e.g. Mozilla.Firefox) but the resulting `$doUpgrade = $false` had no effect because it was set inside the `if ($doUpgrade)` block, so winget still ran and the installer triggered UAC. Now the user-context flow signals dialogs cleanly and `continue`s to the next app, leaving machine-scoped upgrades to the SYSTEM context.
     9.19 - FIX: Post-upgrade verification was producing false-positive failures. Whitespace-split column extraction misclassified columns when winget list returns no Available column after a successful upgrade — empty parse fell into the failure branch. Replaced ad-hoc parsing with the existing header-position parser (ConvertFrom-WingetOutput) and now treats only an EXACT match between parsed Available and our target version as a true failure; empty/different Available is treated as success. Also: SYSTEM context now augments its `winget upgrade` listing by querying `winget list --id ID` for each whitelisted machine-scoped app missing from the upgrade list — picks up apps like Mozilla.Firefox that winget tracks under user accounts but which actually live in C:\Program Files, so SYSTEM can upgrade them without UAC.
     9.20 - REFACTOR: Detection now writes a static task file (C:\ProgramData\Temp\availableUpgrades-tasks.json) with the apps it found pending upgrade. Remediation reads that file as the authoritative work list and removes entries as each app is processed (success or final-failure). Eliminates the need for SYSTEM-context augmentation to walk every whitelisted machine-scoped app querying `winget list` per app — detection has already done the discovery via its dual `winget upgrade` listing. The augmentation pass remains as a fallback for when the task file is missing or older than 6 hours. User-context "skip machine-scoped to avoid UAC" leaves the entry in the task file so SYSTEM picks it up next cycle.
+    9.21 - REFACTOR: Removed all `winget upgrade` discovery calls from remediation - detection's task file is now the sole source of truth. Each task entry carries an InstalledScope (machine/user/unknown) recorded by detect.ps1, which lets remediation filter the work list by current context at load time: SYSTEM processes machine + unknown, user context processes user + unknown. Scope decisions in the upgrade loop now read InstalledScope from the task entry instead of re-running Get-AppInstalledScope per app. When the task file is missing or stale, remediation exits 0 cleanly (no fallback discovery — run detect.ps1 first).
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6036,7 +6037,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "20" # Update this tag for each script version
+$ScriptTag = "21" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6496,11 +6497,14 @@ function Read-UpgradeTaskFile {
         $list = [System.Collections.ArrayList]::new()
         foreach ($t in $payload.Tasks) {
             if (-not $t.AppID) { continue }
+            $rawScope = if ($t.PSObject.Properties['InstalledScope']) { [string]$t.InstalledScope } else { "unknown" }
+            if ([string]::IsNullOrWhiteSpace($rawScope)) { $rawScope = "unknown" }
             $null = $list.Add(@{
                 AppID = [string]$t.AppID
                 FriendlyName = [string]$t.FriendlyName
                 CurrentVersion = [string]$t.CurrentVersion
                 AvailableVersion = [string]$t.AvailableVersion
+                InstalledScope = $rawScope.ToLower()
             })
         }
         return $list
@@ -6827,301 +6831,70 @@ if ($UserRemediationOnly) {
             TestRunningAsSystem = (Test-RunningAsSystem)
         }
         
-        # Add timeout protection for winget execution to prevent hangs
-        Write-Log -Message "Starting winget execution with timeout protection..."
-        $wingetStart = Get-Date
-        $wingetTimeout = 180  # 3 minutes timeout for winget
-        
-        try {
-            # Use background job with timeout to prevent winget hanging
-            # Default listing (no --scope) sees machine-scoped apps; a second --scope user run
-            # is added after this block to also capture user-scoped apps (see below)
-            $wingetJob = Start-Job -ScriptBlock {
-                winget upgrade --accept-source-agreements --source winget
-            }
-            
-            Write-Log -Message "Winget job started (Job ID: $($wingetJob.Id)), waiting up to $wingetTimeout seconds..."
-            Update-Status -Status "Running winget" -Progress "Executing winget upgrade command with timeout protection"
-            
-            # Update heartbeat every 30 seconds while waiting for winget
-            $wingetWaitStart = Get-Date
-            while ((Get-Date) -lt $wingetWaitStart.AddSeconds($wingetTimeout) -and $wingetJob.State -eq "Running") {
-                if (Wait-Job $wingetJob -Timeout 30) {
-                    break  # Job completed
-                }
-                $elapsedWinget = [int]((Get-Date) - $wingetWaitStart).TotalSeconds
-                Update-Heartbeat -Stage "WingetExecution" -AdditionalData @{
-                    ElapsedSeconds = $elapsedWinget
-                    JobState = $wingetJob.State
-                }
-                Write-Log -Message "Winget still running... ${elapsedWinget}s elapsed" | Out-Null
-            }
-            
-            if ($wingetJob.State -eq "Completed") {
-                $OUTPUT = Receive-Job $wingetJob
-                $wingetTime = (Get-Date) - $wingetStart
-                Write-Log -Message "Winget completed successfully in $($wingetTime.TotalSeconds) seconds"
-                Write-Log -Message "Winget output lines: $($OUTPUT.Count)"
-                Update-Status -Status "Winget complete" -Progress "Output: $($OUTPUT.Count) lines, Time: $([int]$wingetTime.TotalSeconds)s"
-                
-                # Sample first few lines of output for debugging
-                if ($OUTPUT -and $OUTPUT.Count -gt 0) {
-                    $sampleLines = ($OUTPUT | Select-Object -First 3) -join " | "
-                    Write-Log -Message "Winget sample output: $sampleLines"
-                }
-            } else {
-                $wingetTime = (Get-Date) - $wingetStart
-                Write-Log -Message "ERROR: Winget timed out after $($wingetTime.TotalSeconds) seconds"
-                Remove-Job $wingetJob -Force
-                throw "Winget execution timed out after $wingetTimeout seconds"
-            }
-            Remove-Job $wingetJob -Force
-            
-        } catch {
-            $wingetTime = (Get-Date) - $wingetStart
-            Write-Log -Message "Error executing winget in user context after $($wingetTime.TotalSeconds) seconds: $($_.Exception.Message)"
-            Write-Log -Message "Winget may not be available, properly configured, or timed out"
-            
-            # Write error result file immediately
+        # Privilege check + minimal context setup. Discovery is done by detect.ps1 — we read
+        # its task file below instead of calling `winget upgrade` here.
+        Update-Status -Status "Loading work list" -Progress "Reading task file written by detect.ps1"
+
+        # Validate winget is available; we still need winget.exe later to actually run upgrades.
+        if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+            Write-Log -Message "winget.exe not on PATH in user context - cannot perform upgrades"
             if ($RemediationResultFile) {
-                try {
-                    Write-Log -Message "Writing error result to: $RemediationResultFile"
-                    $errorResult = @{
-                        ProcessedApps = 0
-                        UpgradeResults = @("ERROR: Winget execution failed or timed out")
-                        Success = $false
-                        Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-                        Username = $env:USERNAME
-                        Computer = $env:COMPUTERNAME
-                        Context = "USER"
-                        Error = $_.Exception.Message
-                        ExecutionTime = $wingetTime.TotalSeconds
-                    }
-                    $errorResult | ConvertTo-Json -Depth 3 -Compress | Out-File -FilePath $RemediationResultFile -Encoding UTF8 -Force
-                    Write-Log -Message "Error result file written successfully"
-                    
-                    # Verify file was written
-                    if (Test-Path $RemediationResultFile) {
-                        $fileSize = (Get-Item $RemediationResultFile).Length
-                        Write-Log -Message "Error result file verified: $fileSize bytes"
-                    } else {
-                        Write-Log -Message "ERROR: Error result file was not created"
-                    }
-                } catch {
-                    Write-Log -Message "Failed to write error result file: $($_.Exception.Message)"
-                }
+                $errorResult = @{
+                    ProcessedApps = 0
+                    UpgradeResults = @("ERROR: winget.exe not available in user context")
+                    Success = $false
+                    Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                    Username = $env:USERNAME
+                    Computer = $env:COMPUTERNAME
+                    Context = "USER"
+                    Error = "winget.exe not on PATH"
+                } | ConvertTo-Json -Depth 3 -Compress
+                $errorResult | Out-File -FilePath $RemediationResultFile -Encoding UTF8 -Force
             }
-            Write-Log -Message "Performing marker file cleanup before exit (user context error)"
-            Invoke-MarkerFileCleanup -Reason "User context execution error"
+            Write-Log -Message "Performing marker file cleanup before exit (winget unavailable)"
+            Invoke-MarkerFileCleanup -Reason "winget.exe not on PATH"
             exit 1
         }
-        
-        # Check if first output is valid (contains actual app data)
-        Write-Log -Message "Validating winget output..."
-        $outputValidationStart = Get-Date
-        $hasValidOutput = $false
-        foreach ($line in $OUTPUT) {
-            if ($line -is [string] -and $line.Trim() -match '^-{10,}$') { $hasValidOutput = $true; break }
-        }
-        $outputValidationTime = (Get-Date) - $outputValidationStart
-        Write-Log -Message "Output validation completed in $($outputValidationTime.TotalMilliseconds) ms - Valid: $hasValidOutput"
 
-        # If first output was just source-update progress, run again with timeout protection
-        if (-not $hasValidOutput) {
-            Write-Log -Message "Winget source update in progress, running again..."
-            $retryStart = Get-Date
-            
-            try {
-                $retryJob = Start-Job -ScriptBlock {
-                    winget upgrade --accept-source-agreements --source winget
-                }
-                
-                if (Wait-Job $retryJob -Timeout $wingetTimeout) {
-                    $OUTPUT = Receive-Job $retryJob
-                    $retryTime = (Get-Date) - $retryStart
-                    Write-Log -Message "Winget retry completed in $($retryTime.TotalSeconds) seconds"
-                } else {
-                    $retryTime = (Get-Date) - $retryStart
-                    Write-Log -Message "ERROR: Winget retry timed out after $($retryTime.TotalSeconds) seconds"
-                    Remove-Job $retryJob -Force
-                    throw "Winget retry timed out"
-                }
-                Remove-Job $retryJob -Force
-                
-            } catch {
-                $retryTime = (Get-Date) - $retryStart
-                Write-Log -Message "Error in winget retry after $($retryTime.TotalSeconds) seconds: $($_.Exception.Message)"
-                
-                # Write error result and exit
-                if ($RemediationResultFile) {
-                    Write-Log -Message "Writing retry error result to: $RemediationResultFile"
-                    $errorResult = @{
-                        ProcessedApps = 0
-                        UpgradeResults = @("ERROR: Winget retry failed or timed out")
-                        Success = $false
-                        Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-                        Username = $env:USERNAME
-                        Computer = $env:COMPUTERNAME
-                        Context = "USER"
-                        Error = $_.Exception.Message
-                        ExecutionTime = ((Get-Date) - $userContextStart).TotalSeconds
-                    }
-                    $errorResult | ConvertTo-Json -Depth 3 -Compress | Out-File -FilePath $RemediationResultFile -Encoding UTF8 -Force
-                }
-                Write-Log -Message "Performing marker file cleanup before exit (user context timeout/error)"
-                Invoke-MarkerFileCleanup -Reason "User context timeout or error"
-                exit 1
-            }
-        }
-        
-        # Second winget run: --scope user reveals user-scoped apps that are invisible
-        # to the default listing (e.g. Perplexity.Comet). Non-fatal if this fails.
+        # Discovery output is intentionally empty — the task file is the work source.
+        $OUTPUT = @()
         $OUTPUT_USER_SCOPE = @()
-        Write-Log -Message "Running winget with --scope user to detect user-scoped apps..."
-        try {
-            $userScopeStart = Get-Date
-            $userScopeJob = Start-Job -ScriptBlock {
-                winget upgrade --accept-source-agreements --source winget --scope user
-            }
-
-            $userScopeWaitStart = Get-Date
-            while ((Get-Date) -lt $userScopeWaitStart.AddSeconds($wingetTimeout) -and $userScopeJob.State -eq "Running") {
-                if (Wait-Job $userScopeJob -Timeout 30) { break }
-                $elapsedUserScope = [int]((Get-Date) - $userScopeWaitStart).TotalSeconds
-                Update-Heartbeat -Stage "WingetUserScopeExecution" -AdditionalData @{
-                    ElapsedSeconds = $elapsedUserScope
-                    JobState = $userScopeJob.State
-                }
-                Write-Log -Message "Winget (user scope) still running... ${elapsedUserScope}s elapsed" | Out-Null
-            }
-
-            if ($userScopeJob.State -eq "Completed") {
-                $OUTPUT_USER_SCOPE = Receive-Job $userScopeJob
-                $userScopeTime = (Get-Date) - $userScopeStart
-                Write-Log -Message "Winget (user scope) completed in $($userScopeTime.TotalSeconds) seconds, output lines: $($OUTPUT_USER_SCOPE.Count)"
-
-                # Validate output — retry once if it was just a source update
-                $hasValidUserOutput = $false
-                foreach ($line in $OUTPUT_USER_SCOPE) {
-                    if ($line -is [string] -and $line.Trim() -match '^-{10,}$') { $hasValidUserOutput = $true; break }
-                }
-                if (-not $hasValidUserOutput) {
-                    Write-Log -Message "Winget user-scope output invalid (source update?), retrying..."
-                    $retryUserJob = Start-Job -ScriptBlock {
-                        winget upgrade --accept-source-agreements --source winget --scope user
-                    }
-                    if (Wait-Job $retryUserJob -Timeout $wingetTimeout) {
-                        $OUTPUT_USER_SCOPE = Receive-Job $retryUserJob
-                    } else {
-                        Write-Log -Message "Winget user-scope retry timed out"
-                        $OUTPUT_USER_SCOPE = @()
-                        Remove-Job $retryUserJob -Force
-                    }
-                    Remove-Job $retryUserJob -Force -ErrorAction SilentlyContinue
-                }
-            } else {
-                Write-Log -Message "Winget (user scope) timed out, proceeding without user-scoped apps"
-                Remove-Job $userScopeJob -Force
-            }
-            Remove-Job $userScopeJob -Force -ErrorAction SilentlyContinue
-        } catch {
-            Write-Log -Message "Error running winget with --scope user (non-fatal): $($_.Exception.Message)"
-        }
-
-        Write-Log -Message "User context remediation - processing user-scoped apps only"
 
 } elseif (Test-RunningAsSystem) {
         # SYSTEM context main execution - process system apps and schedule user remediation
-        Write-Log -Message "SYSTEM context - processing system apps and scheduling user remediation"
-        
-        if ($WingetPath) {
-            Write-Log -Message "Using winget path: $WingetPath"
-            $wingetExe = Join-Path $WingetPath "winget.exe"
+        Write-Log -Message "SYSTEM context - reading task file work list and processing"
 
-            try {
-                # System context winget - only sees system-wide apps
-                $OUTPUT = $(& $wingetExe upgrade --accept-source-agreements --source winget)
-                Write-Log -Message "Successfully executed winget upgrade in system context"
-            } catch {
-                Write-Log -Message "Error executing winget in system context: $($_.Exception.Message)"
-                Write-Log -Message "Winget execution failed, exiting"
-                Write-Log -Message "Performing marker file cleanup before exit (winget execution failed)"
-                Invoke-MarkerFileCleanup -Reason "Winget execution failed in system context"
-                exit 1
-            }
-
-            # Validate output contains separator line
-            $hasValidOutput = $false
-            foreach ($line in $OUTPUT) {
-                if ($line -is [string] -and $line.Trim() -match '^-{10,}$') { $hasValidOutput = $true; break }
-            }
-
-            # If first output was just source-update progress, run again
-            if (-not $hasValidOutput) {
-                Write-Log -Message "Winget source update in progress, running again..."
-                $OUTPUT = $(& $wingetExe upgrade --accept-source-agreements --source winget)
-            }
-        } else {
+        if (-not $WingetPath) {
             Write-Log -Message "Winget not detected in SYSTEM context"
             Write-Log -Message "Performing marker file cleanup before exit (no winget in system context)"
             Invoke-MarkerFileCleanup -Reason "Winget not detected in SYSTEM context"
             exit 0
         }
+
+        Write-Log -Message "Using winget path: $WingetPath"
+        $wingetExe = Join-Path $WingetPath "winget.exe"
+        # Discovery output is intentionally empty — the task file is the work source.
+        $OUTPUT = @()
+        $OUTPUT_USER_SCOPE = @()
 } else {
-    # User context execution - process user apps only
-    Write-Log -Message "USER context - processing user-scoped apps"
-
-    try {
-        $OUTPUT = $(winget upgrade --accept-source-agreements --source winget)
-        Write-Log -Message "Successfully executed winget upgrade in user context"
-    } catch {
-        Write-Log -Message "Error executing winget in user context: $($_.Exception.Message)"
-        Write-Log -Message "Winget may not be available or properly configured"
-        Write-Log -Message "Performing marker file cleanup before exit (winget not available)"
-        Invoke-MarkerFileCleanup -Reason "Winget not available or properly configured"
-        exit 1
-    }
-
-    # Validate output contains separator line
-    $hasValidOutput = $false
-    foreach ($line in $OUTPUT) {
-        if ($line -is [string] -and $line.Trim() -match '^-{10,}$') { $hasValidOutput = $true; break }
-    }
-
-    # If first output was just source-update progress, run again
-    if (-not $hasValidOutput) {
-        Write-Log -Message "Winget source update in progress, running again..."
-        $OUTPUT = $(winget upgrade --accept-source-agreements --source winget)
-    }
-
-    # Second run with --scope user to capture user-scoped apps invisible to default listing
+    # User context execution - reads the task file written by detect.ps1
+    Write-Log -Message "USER context - reading task file work list and processing"
+    $OUTPUT = @()
     $OUTPUT_USER_SCOPE = @()
-    try {
-        Write-Log -Message "Running winget with --scope user to detect user-scoped apps..."
-        $OUTPUT_USER_SCOPE = $(winget upgrade --accept-source-agreements --source winget --scope user)
-        Write-Log -Message "Winget (user scope) completed, output lines: $($OUTPUT_USER_SCOPE.Count)"
-
-        $hasValidUserOutput = $false
-        foreach ($line in $OUTPUT_USER_SCOPE) {
-            if ($line -is [string] -and $line.Trim() -match '^-{10,}$') { $hasValidUserOutput = $true; break }
-        }
-        if (-not $hasValidUserOutput) {
-            Write-Log -Message "Winget user-scope output invalid (source update?), retrying..."
-            $OUTPUT_USER_SCOPE = $(winget upgrade --accept-source-agreements --source winget --scope user)
-        }
-    } catch {
-        Write-Log -Message "Error running winget with --scope user (non-fatal): $($_.Exception.Message)"
-    }
 }
 
-# TEST MODE: Replace winget output with simulated upgrade data
+# TEST MODE: Inject a simulated task entry so the upgrade loop has something to chew on
+# without requiring a real task file. Marker in the upgrade loop short-circuits the actual
+# winget call for the Test.DemoApp ID.
 if ($Script:TestMode) {
-    Write-Log -Message "TEST MODE: Injecting simulated winget output for Test.DemoApp (1.0.0 -> 2.0.0)"
-    $OUTPUT = @(
-        "Name              Id                Version   Available  Source",
-        "----------------------------------------------------------------",
-        "Demo Application  Test.DemoApp      1.0.0     2.0.0      winget"
-    )
+    Write-Log -Message "TEST MODE: Injecting simulated task entry for Test.DemoApp (1.0.0 -> 2.0.0)"
+    $Script:TestModeInjected = @(@{
+        AppID = "Test.DemoApp"
+        FriendlyName = "Demo Application"
+        CurrentVersion = "1.0.0"
+        AvailableVersion = "2.0.0"
+        InstalledScope = "machine"
+    })
 }
 
 function Resolve-FriendlyName {
@@ -7168,64 +6941,43 @@ function Resolve-FriendlyName {
     return $null
 }
 
-# Parse winget output and process apps
-Write-Log -Message "Starting winget output parsing..."
-$parsingStart = Get-Date
-
-$LIST = ConvertFrom-WingetOutput -Output $OUTPUT
-
-# Merge user-scoped apps discovered via --scope user into the main list (dedup by AppID)
-if ($OUTPUT_USER_SCOPE -and $OUTPUT_USER_SCOPE.Count -gt 0) {
-    $userScopeList = ConvertFrom-WingetOutput -Output $OUTPUT_USER_SCOPE
-    if ($userScopeList -and $userScopeList.Count -gt 0) {
-        $seenAppIDs = @{}
-        $mergedList = [System.Collections.ArrayList]::new()
-        foreach ($app in $LIST) {
-            if ($app.AppID) { $seenAppIDs[$app.AppID] = $true }
-            $null = $mergedList.Add($app)
+# Build the work list from the static task file written by detect.ps1.
+# detect.ps1 has already run the `winget upgrade` discovery and recorded each pending
+# upgrade with its InstalledScope, so remediation does no discovery itself.
+$LIST = @()
+$rawTaskList = @(Read-UpgradeTaskFile)
+if ($rawTaskList -and $rawTaskList.Count -gt 0) {
+    # Filter the task list down to entries that belong in the current context:
+    #   - SYSTEM: machine-scoped + unknown (SYSTEM has the privileges to install both)
+    #   - User context: user-scoped + unknown (machine entries are SYSTEM's job; running them
+    #     here as non-admin would either fail or trigger UAC)
+    $isSystem = (Test-RunningAsSystem)
+    $allowedScopes = if ($isSystem) { @("machine", "unknown") } else { @("user", "unknown") }
+    $filtered = [System.Collections.ArrayList]::new()
+    $skipped = 0
+    foreach ($t in $rawTaskList) {
+        $taskScope = if ($t.InstalledScope) { $t.InstalledScope } else { "unknown" }
+        if ($allowedScopes -contains $taskScope) {
+            $null = $filtered.Add($t)
+        } else {
+            $skipped++
         }
-        $addedCount = 0
-        foreach ($app in $userScopeList) {
-            if ($app.AppID -and -not $seenAppIDs.ContainsKey($app.AppID)) {
-                $null = $mergedList.Add($app)
-                $seenAppIDs[$app.AppID] = $true
-                $addedCount++
-            }
-        }
-        if ($addedCount -gt 0) {
-            Write-Log -Message "Merged $addedCount user-scoped apps into upgrade list (total: $($mergedList.Count))"
-        }
-        $LIST = $mergedList
     }
+    $LIST = $filtered
+    $contextLabel = if ($isSystem) { "SYSTEM" } else { "user" }
+    $listCount = $LIST.Count
+    Write-Log -Message "Task file: $($rawTaskList.Count) entries, $listCount routed to $contextLabel context, $skipped left for the other context"
+} else {
+    Write-Log -Message "No fresh upgrade task file - nothing to remediate (run detect.ps1 first)"
 }
 
-# Authoritative work list: prefer the static task file written by detect.ps1.
-# When present and fresh, it tells us exactly which apps need upgrading — discovered via the
-# user-context dual `winget upgrade` listing during detection — and we can skip the
-# SYSTEM-context augmentation pass below entirely.
-$Script:UsingTaskFile = $false
-$taskFileList = @(Read-UpgradeTaskFile)
-if ($taskFileList -and $taskFileList.Count -gt 0) {
-    $taskListCount = $taskFileList.Count
-    Write-Log -Message "Loaded upgrade task file as authoritative work list - $taskListCount entries; skipping winget-discovery augmentation"
-    $LIST = $taskFileList
-    $Script:UsingTaskFile = $true
-}
-
-# SYSTEM-context augmentation (fallback only): pick up whitelisted machine-scoped apps that
-# `winget upgrade` missed. Skipped when the task file is the source of truth.
-if (-not $Script:UsingTaskFile -and (Test-RunningAsSystem) -and -not $UserRemediationOnly -and $whitelistConfig -and $WingetPath) {
-    $existingIdMap = @{}
-    foreach ($a in $LIST) { if ($a.AppID) { $existingIdMap[$a.AppID] = $true } }
-
-    $augmentExe = Join-Path $WingetPath "winget.exe"
-    $augmented = Get-MissingMachineUpgrades -Whitelist $whitelistConfig -ExistingIds $existingIdMap -WingetExePath $augmentExe -WingetWorkingDir $WingetPath
-    if ($augmented -and $augmented.Count -gt 0) {
-        $augmentList = [System.Collections.ArrayList]::new()
-        foreach ($a in $LIST) { $null = $augmentList.Add($a) }
-        foreach ($a in $augmented) { $null = $augmentList.Add($a) }
-        $LIST = $augmentList
-    }
+# TEST MODE: append the simulated task so the loop runs even without a real task file.
+if ($Script:TestMode -and $Script:TestModeInjected) {
+    $injected = [System.Collections.ArrayList]::new()
+    foreach ($a in $LIST) { $null = $injected.Add($a) }
+    foreach ($a in $Script:TestModeInjected) { $null = $injected.Add($a) }
+    $LIST = $injected
+    Write-Log -Message "TEST MODE: appended simulated task; total work list = $($LIST.Count)"
 }
 
 if ($LIST -and $LIST.Count -gt 0) {
@@ -7484,21 +7236,21 @@ if ($LIST -and $LIST.Count -gt 0) {
                         $wingetDir = if ((Test-RunningAsSystem) -and $WingetPath) { $WingetPath } else { $null }
                         $wingetArgs = @("upgrade", "--silent", "--disable-interactivity", "--accept-source-agreements", "--accept-package-agreements", "--source", "winget", "--id", $appInfo.AppID)
 
-                        # Detect installed scope and add --scope flag accordingly
-                        $detectedScope = "unknown"
+                        # Use the InstalledScope already recorded in the task entry by detect.ps1
+                        # rather than re-walking the registry per app. Falls back to "unknown"
+                        # for entries that pre-date scope-aware detection.
+                        $detectedScope = if ($appInfo.InstalledScope) { [string]$appInfo.InstalledScope } else { "unknown" }
                         if ((Test-RunningAsSystem)) {
-                            $detectedScope = Get-AppInstalledScope -AppID $appInfo.AppID -FriendlyName $okapp.FriendlyName
                             if ($detectedScope -eq "user") {
-                                Write-Log -Message "Using --scope user for $($appInfo.AppID) (detected as user-scoped install)"
+                                Write-Log -Message "Using --scope user for $($appInfo.AppID) (task file scope: user)"
                                 $wingetArgs += @("--scope", "user")
                             }
                         } elseif (-not $userIsAdmin) {
-                            $detectedScope = Get-AppInstalledScope -AppID $appInfo.AppID -FriendlyName $okapp.FriendlyName
                             if ($detectedScope -eq "machine") {
-                                Write-Log -Message "Skipping $($appInfo.AppID) - machine-scoped install cannot be upgraded without elevation (non-admin user context); already handled by SYSTEM context"
+                                Write-Log -Message "Skipping $($appInfo.AppID) - machine-scoped install cannot be upgraded without elevation (non-admin user context); SYSTEM will handle it"
                                 $doUpgrade = $false
                             } else {
-                                Write-Log -Message "Using --scope user for non-admin user context upgrade (detected scope: $detectedScope)"
+                                Write-Log -Message "Using --scope user for $($appInfo.AppID) in non-admin user context (task file scope: $detectedScope)"
                                 $wingetArgs += @("--scope", "user")
                             }
                         }
