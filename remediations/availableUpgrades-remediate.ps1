@@ -86,6 +86,7 @@
     9.19 - FIX: Post-upgrade verification was producing false-positive failures. Whitespace-split column extraction misclassified columns when winget list returns no Available column after a successful upgrade — empty parse fell into the failure branch. Replaced ad-hoc parsing with the existing header-position parser (ConvertFrom-WingetOutput) and now treats only an EXACT match between parsed Available and our target version as a true failure; empty/different Available is treated as success. Also: SYSTEM context now augments its `winget upgrade` listing by querying `winget list --id ID` for each whitelisted machine-scoped app missing from the upgrade list — picks up apps like Mozilla.Firefox that winget tracks under user accounts but which actually live in C:\Program Files, so SYSTEM can upgrade them without UAC.
     9.20 - REFACTOR: Detection now writes a static task file (C:\ProgramData\Temp\availableUpgrades-tasks.json) with the apps it found pending upgrade. Remediation reads that file as the authoritative work list and removes entries as each app is processed (success or final-failure). Eliminates the need for SYSTEM-context augmentation to walk every whitelisted machine-scoped app querying `winget list` per app — detection has already done the discovery via its dual `winget upgrade` listing. The augmentation pass remains as a fallback for when the task file is missing or older than 6 hours. User-context "skip machine-scoped to avoid UAC" leaves the entry in the task file so SYSTEM picks it up next cycle.
     9.21 - REFACTOR: Removed all `winget upgrade` discovery calls from remediation - detection's task file is now the sole source of truth. Each task entry carries an InstalledScope (machine/user/unknown) recorded by detect.ps1, which lets remediation filter the work list by current context at load time: SYSTEM processes machine + unknown, user context processes user + unknown. Scope decisions in the upgrade loop now read InstalledScope from the task entry instead of re-running Get-AppInstalledScope per app. When the task file is missing or stale, remediation exits 0 cleanly (no fallback discovery — run detect.ps1 first).
+    9.22 - FIX: When user-context remediation had nothing to do (typically because SYSTEM had already drained the task file) it exited without writing the result file. SYSTEM-side Schedule-UserContextRemediation then waited the full 600-second idle timeout for a heartbeat that never came (observed: 750-second hang, ~12 min wasted per cycle). Now the empty-work-list exit path writes a minimal result JSON (ProcessedApps=0, Success=true, Reason) so SYSTEM can stop waiting immediately.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6037,7 +6038,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "21" # Update this tag for each script version
+$ScriptTag = "22" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -7678,6 +7679,33 @@ if ($LIST -and $LIST.Count -gt 0) {
         exit 0
 } else {
     Write-Log -Message "[$ScriptTag] No upgrades found in winget output"
+
+    # When a UserRemediationOnly run has nothing to do (typically because SYSTEM already drained
+    # the task file), still write the result file so SYSTEM stops waiting on heartbeats — the
+    # outer Schedule-UserContextRemediation polls for this file and otherwise sits in its
+    # 600-second idle timeout before declaring failure.
+    if ($UserRemediationOnly -and $RemediationResultFile) {
+        try {
+            $resultDir = Split-Path $RemediationResultFile -Parent
+            if ($resultDir -and -not (Test-Path $resultDir)) {
+                New-Item -Path $resultDir -ItemType Directory -Force | Out-Null
+            }
+            @{
+                ProcessedApps = 0
+                UpgradeResults = @()
+                Success = $true
+                Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                Username = $env:USERNAME
+                Computer = $env:COMPUTERNAME
+                Context = "USER"
+                Reason = "No fresh upgrade task file - nothing to remediate"
+            } | ConvertTo-Json -Depth 3 -Compress | Out-File -FilePath $RemediationResultFile -Encoding UTF8 -Force
+            Write-Log -Message "Wrote empty result file to signal completion: $RemediationResultFile"
+        } catch {
+            Write-Log -Message "ERROR writing empty result file: $($_.Exception.Message)"
+        }
+    }
+
     Write-Log -Message "Performing final marker file cleanup before script exit (no upgrades)"
     Invoke-MarkerFileCleanup -Reason "Script completion (no upgrades)"
     exit 0
