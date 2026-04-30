@@ -82,6 +82,7 @@
     5.33 - FIX: User-context detection now runs BOTH the default `winget upgrade` listing AND `--scope user`, then merges by AppID. Previously it only ran `--scope user`, which misses apps like Mozilla.Firefox that winget tracks under the user account but installs machine-wide (C:\Program Files). Such apps were invisible to BOTH SYSTEM (per-user tracking gap) and user `--scope user` (filter excludes machine-installed binaries), so detection never reported them and remediation was never triggered. Mirrors the dual-listing logic remediate.ps1 has used since v9.11.
     5.34 - REFACTOR: Detection now writes a static task file (C:\ProgramData\Temp\availableUpgrades-tasks.json) listing the upgrades it found, so remediate.ps1 can use it as an authoritative work list and skip its own discovery pass. ConvertFrom-WingetOutput now returns full records (AppID + CurrentVersion + AvailableVersion) so the task file carries version info for dialogs without a second winget query. Added Get-RecordAppId and Format-AppList helpers to keep logging readable across the heterogeneous record types (string, hashtable, PSCustomObject from ConvertFrom-Json).
     5.35 - FEATURE: Each task entry now records InstalledScope (machine/user/unknown) determined via the registry uninstall keys (HKLM + HKU\SID under SYSTEM, HKLM + HKCU under user). Lets remediate.ps1 route entries to the right context without re-walking the registry per app. Get-AppInstalledScope ported from remediate.ps1 with HKCU support added for the user-context path.
+    5.36 - FIX: SYSTEM-context flow was deleting the task file and reporting "No upgrades available" even when user-context detection found apps. Two issues: (a) PS5.1's ConvertFrom-Json unwraps single-element arrays, so $results.Apps for one task became a bare PSCustomObject with no .Count property, making `.Count -gt 0` false; (b) Invoke-UserContextDetection's return value was polluted by unsuppressed Write-Log output and cmdlet objects, so $userApps was a heterogeneous mix rather than just the apps. Both fixed: @() wrap inside the function for array context, and a Where-Object filter at the call site to keep only records that have an AppID.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -1278,9 +1279,10 @@ function Invoke-UserContextDetection {
                         
                         $results = $fileContent | ConvertFrom-Json
                         Write-Log "DEBUG: JSON parsed successfully" -IsDebug | Out-Null
-                        Write-Log "DEBUG: Results object - Apps count: $($results.Apps.Count), Context: $($results.Context), Username: $($results.Username)" -IsDebug | Out-Null
-                        
-                        $apps = $results.Apps
+                        # @() forces array context: PS5.1's ConvertFrom-Json unwraps single-element
+                        # JSON arrays to a bare object, which then has no .Count property.
+                        $apps = @($results.Apps)
+                        Write-Log "DEBUG: Results object - Apps count: $($apps.Count), Context: $($results.Context), Username: $($results.Username)" -IsDebug | Out-Null
                         Write-Log "User detection completed: $($apps.Count) apps found" | Out-Null
                         if ($apps.Count -gt 0) {
                             Write-Log "DEBUG: User context apps found: $(Format-AppList $apps)" -IsDebug | Out-Null
@@ -1417,7 +1419,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "65" # Update this tag for each script version
+$ScriptTag = "66" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -2122,8 +2124,14 @@ if ($LIST -and $LIST.Count -gt 0) {
 
             Write-Log -Message "Interactive session confirmed - proceeding with user context detection"
             Write-Log -Message "DEBUG: About to call Invoke-UserContextDetection function" -IsDebug
-            $userApps = Invoke-UserContextDetection
-            Write-Log -Message "DEBUG: Invoke-UserContextDetection returned $($userApps.Count) apps" -IsDebug
+            # Filter the function's return stream down to actual app records: Write-Log emits the
+            # formatted line to the success stream and several cmdlets inside Invoke-UserContextDetection
+            # also output objects, so unfiltered $userApps is a mix of strings + task-info objects + apps.
+            $userApps = @((Invoke-UserContextDetection) | Where-Object {
+                ($_ -is [hashtable] -or $_ -is [System.Collections.IDictionary]) -or
+                ($_.PSObject -and $_.PSObject.Properties['AppID'])
+            })
+            Write-Log -Message "DEBUG: Invoke-UserContextDetection returned $($userApps.Count) apps after filtering" -IsDebug
 
             if ($userApps.Count -gt 0) {
                 Write-Log -Message "[$ScriptTag] $(Format-AppList $userApps)"
