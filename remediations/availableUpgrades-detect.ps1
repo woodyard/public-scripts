@@ -83,6 +83,7 @@
     5.34 - REFACTOR: Detection now writes a static task file (C:\ProgramData\Temp\availableUpgrades-tasks.json) listing the upgrades it found, so remediate.ps1 can use it as an authoritative work list and skip its own discovery pass. ConvertFrom-WingetOutput now returns full records (AppID + CurrentVersion + AvailableVersion) so the task file carries version info for dialogs without a second winget query. Added Get-RecordAppId and Format-AppList helpers to keep logging readable across the heterogeneous record types (string, hashtable, PSCustomObject from ConvertFrom-Json).
     5.35 - FEATURE: Each task entry now records InstalledScope (machine/user/unknown) determined via the registry uninstall keys (HKLM + HKU\SID under SYSTEM, HKLM + HKCU under user). Lets remediate.ps1 route entries to the right context without re-walking the registry per app. Get-AppInstalledScope ported from remediate.ps1 with HKCU support added for the user-context path.
     5.36 - FIX: SYSTEM-context flow was deleting the task file and reporting "No upgrades available" even when user-context detection found apps. Two issues: (a) PS5.1's ConvertFrom-Json unwraps single-element arrays, so $results.Apps for one task became a bare PSCustomObject with no .Count property, making `.Count -gt 0` false; (b) Invoke-UserContextDetection's return value was polluted by unsuppressed Write-Log output and cmdlet objects, so $userApps was a heterogeneous mix rather than just the apps. Both fixed: @() wrap inside the function for array context, and a Where-Object filter at the call site to keep only records that have an AppID.
+    5.37 - FIX: Get-AppInstalledScope was silently returning "unknown" for Firefox when called from SYSTEM-context Write-UpgradeTaskFile (task file showed InstalledScope="unknown" despite Firefox being in HKLM uninstall). Replaced the `Get-ChildItem | Get-ItemProperty | Where-Object` pipeline with the more robust `Get-ItemProperty <path>\*` wildcard form — empirically the pipeline can short-circuit silently in some SYSTEM-context environments, the wildcard form does not. Also added match-count diagnostic logging (machine matches=N, user matches=N -> scope) so future drift is visible in the log without needing to instrument.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -822,45 +823,53 @@ function Get-AppInstalledScope {
 
         $searchName = if ($FriendlyName) { $FriendlyName } else { ($AppID -split '\.')[-1] }
 
-        # Machine-wide uninstall registry
-        $machineKeys = @(
-            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+        # Machine-wide uninstall registry. Using `Get-ItemProperty <path>\*` instead of
+        # `Get-ChildItem | Get-ItemProperty` because the latter has been observed to silently
+        # produce empty results in SYSTEM context for some hosts (suspected: a subkey with a
+        # malformed default value short-circuits the pipeline). The wildcard form is more
+        # robust because errors on individual subkeys do not break the rest of the read.
+        $machinePaths = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
         )
-        foreach ($keyPath in $machineKeys) {
-            if (Test-Path $keyPath) {
-                $entries = Get-ChildItem $keyPath -ErrorAction SilentlyContinue |
-                    Get-ItemProperty -ErrorAction SilentlyContinue |
-                    Where-Object { $_.DisplayName -like "*$searchName*" }
-                if ($entries) { $foundMachine = $true; break }
+        $machineMatches = 0
+        foreach ($p in $machinePaths) {
+            $entries = Get-ItemProperty -Path $p -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -and $_.DisplayName -like "*$searchName*" }
+            if ($entries) {
+                $machineMatches += @($entries).Count
+                $foundMachine = $true
             }
         }
 
         # User-scope uninstall registry — different access path per context
+        $userMatches = 0
         if (Test-RunningAsSystem) {
             $userInfo = Get-InteractiveUser
             if ($userInfo -and $userInfo.SID) {
-                $userKey = "Registry::HKU\$($userInfo.SID)\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-                if (Test-Path $userKey) {
-                    $userEntries = Get-ChildItem $userKey -ErrorAction SilentlyContinue |
-                        Get-ItemProperty -ErrorAction SilentlyContinue |
-                        Where-Object { $_.DisplayName -like "*$searchName*" }
-                    if ($userEntries) { $foundUser = $true }
+                $userPath = "Registry::HKU\$($userInfo.SID)\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+                $userEntries = Get-ItemProperty -Path $userPath -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DisplayName -and $_.DisplayName -like "*$searchName*" }
+                if ($userEntries) {
+                    $userMatches = @($userEntries).Count
+                    $foundUser = $true
                 }
             }
         } else {
-            $userKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-            if (Test-Path $userKey) {
-                $userEntries = Get-ChildItem $userKey -ErrorAction SilentlyContinue |
-                    Get-ItemProperty -ErrorAction SilentlyContinue |
-                    Where-Object { $_.DisplayName -like "*$searchName*" }
-                if ($userEntries) { $foundUser = $true }
+            $userPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+            $userEntries = Get-ItemProperty -Path $userPath -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -and $_.DisplayName -like "*$searchName*" }
+            if ($userEntries) {
+                $userMatches = @($userEntries).Count
+                $foundUser = $true
             }
         }
 
-        if ($foundUser -and -not $foundMachine) { return "user" }
-        if ($foundMachine) { return "machine" }
-        return "unknown"
+        $resolvedScope = if ($foundUser -and -not $foundMachine) { "user" }
+                         elseif ($foundMachine) { "machine" }
+                         else { "unknown" }
+        Write-Log "Scope detection $AppID (search='$searchName'): machine matches=$machineMatches, user matches=$userMatches -> $resolvedScope" | Out-Null
+        return $resolvedScope
     } catch {
         Write-Log "Scope detection error for $AppID : $($_.Exception.Message)" | Out-Null
         return "unknown"
@@ -1419,7 +1428,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "66" # Update this tag for each script version
+$ScriptTag = "67" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
