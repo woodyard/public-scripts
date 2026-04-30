@@ -79,6 +79,7 @@
     5.30 - FIX: Detection script now cleans up stale temp files and orphaned scheduled tasks from both detection and remediation scripts; expanded Remove-OldTempFiles to scan user temp directories with 10-minute cutoff; added Remove-StaleScheduledTasks to remove orphaned tasks from all known prefixes; ensures cleanup runs every Intune check cycle even when remediation is not triggered
     5.31 - FIX: Added --scope user dual-listing to SYSTEM context detection so apps like Perplexity.Comet (user-scoped in winget but installed to Program Files) are detected and trigger remediation in SYSTEM context
     5.32 - REVERT: Removed --scope user from SYSTEM context detection — SYSTEM cannot see user-registered winget packages; user context detection already handles this via scheduled task
+    5.33 - FIX: User-context detection now runs BOTH the default `winget upgrade` listing AND `--scope user`, then merges by AppID. Previously it only ran `--scope user`, which misses apps like Mozilla.Firefox that winget tracks under the user account but installs machine-wide (C:\Program Files). Such apps were invisible to BOTH SYSTEM (per-user tracking gap) and user `--scope user` (filter excludes machine-installed binaries), so detection never reported them and remediation was never triggered. Mirrors the dual-listing logic remediate.ps1 has used since v9.11.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -1243,7 +1244,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "62" # Update this tag for each script version
+$ScriptTag = "63" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -1599,9 +1600,18 @@ if ($UserDetectionOnly -eq "true" -or $isUserDetectionTask) {
     $userIsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     Write-Log -Message "User is admin: $userIsAdmin"
 
-    $scope = if ($userIsAdmin) { "" } else { "user" }
-    $OUTPUT = Invoke-WingetUpgradeList -Scope $scope
-    Write-Log -Message "User context detection - processing user-scoped apps only"
+    # Run BOTH the default `winget upgrade` listing AND `--scope user`. Default catches apps
+    # that winget tracks under the user account but installs machine-wide (e.g. Mozilla.Firefox
+    # in C:\Program Files), which SYSTEM context cannot see. `--scope user` catches genuinely
+    # user-scoped apps the default listing sometimes hides. Mirrors remediate.ps1 v9.11+.
+    $OUTPUT = Invoke-WingetUpgradeList
+    $OUTPUT_USER_SCOPE = @()
+    try {
+        $OUTPUT_USER_SCOPE = Invoke-WingetUpgradeList -Scope "user"
+    } catch {
+        Write-Log -Message "Error running winget --scope user (non-fatal): $($_.Exception.Message)"
+    }
+    Write-Log -Message "User context detection - default + --scope user dual listing"
 
 } elseif (Test-RunningAsSystem) {
     Write-Log -Message "SYSTEM context - detecting system apps and scheduling user detection"
@@ -1620,13 +1630,46 @@ if ($UserDetectionOnly -eq "true" -or $isUserDetectionTask) {
 
     $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     $userIsAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    Write-Log -Message "User is admin: $userIsAdmin"
 
-    $scope = if ($userIsAdmin) { "" } else { "user" }
-    $OUTPUT = Invoke-WingetUpgradeList -Scope $scope
+    # Same dual-listing rationale as the scheduled-task branch above.
+    $OUTPUT = Invoke-WingetUpgradeList
+    $OUTPUT_USER_SCOPE = @()
+    try {
+        $OUTPUT_USER_SCOPE = Invoke-WingetUpgradeList -Scope "user"
+    } catch {
+        Write-Log -Message "Error running winget --scope user (non-fatal): $($_.Exception.Message)"
+    }
 }
 
 # Parse winget output and process apps
 $LIST = ConvertFrom-WingetOutput -Output $OUTPUT
+
+# Merge user-scoped listing into the main list (dedup by AppID).
+# Only present in user-context paths; SYSTEM leaves $OUTPUT_USER_SCOPE undefined.
+if ($OUTPUT_USER_SCOPE -and $OUTPUT_USER_SCOPE.Count -gt 0) {
+    $userScopeList = ConvertFrom-WingetOutput -Output $OUTPUT_USER_SCOPE
+    if ($userScopeList -and $userScopeList.Count -gt 0) {
+        $seenAppIDs = @{}
+        $mergedList = [System.Collections.ArrayList]::new()
+        foreach ($app in $LIST) {
+            if ($app.AppID) { $seenAppIDs[$app.AppID] = $true }
+            $null = $mergedList.Add($app)
+        }
+        $addedCount = 0
+        foreach ($app in $userScopeList) {
+            if ($app.AppID -and -not $seenAppIDs.ContainsKey($app.AppID)) {
+                $null = $mergedList.Add($app)
+                $seenAppIDs[$app.AppID] = $true
+                $addedCount++
+            }
+        }
+        if ($addedCount -gt 0) {
+            Write-Log -Message "Merged $addedCount user-scoped apps into detection list (total: $($mergedList.Count))"
+        }
+        $LIST = $mergedList
+    }
+}
 
 if ($LIST -and $LIST.Count -gt 0) {
 
