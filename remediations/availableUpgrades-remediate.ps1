@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.23
- Tag: 23
+ Version: 9.24
+ Tag: 24
     
     Version History:
     1.0 - Initial version
@@ -88,6 +88,7 @@
     9.21 - REFACTOR: Removed all `winget upgrade` discovery calls from remediation - detection's task file is now the sole source of truth. Each task entry carries an InstalledScope (machine/user/unknown) recorded by detect.ps1, which lets remediation filter the work list by current context at load time: SYSTEM processes machine + unknown, user context processes user + unknown. Scope decisions in the upgrade loop now read InstalledScope from the task entry instead of re-running Get-AppInstalledScope per app. When the task file is missing or stale, remediation exits 0 cleanly (no fallback discovery — run detect.ps1 first).
     9.22 - FIX: When user-context remediation had nothing to do (typically because SYSTEM had already drained the task file) it exited without writing the result file. SYSTEM-side Schedule-UserContextRemediation then waited the full 600-second idle timeout for a heartbeat that never came (observed: 750-second hang, ~12 min wasted per cycle). Now the empty-work-list exit path writes a minimal result JSON (ProcessedApps=0, Success=true, Reason) so SYSTEM can stop waiting immediately.
     9.23 - FIX: SYSTEM-context remediation no longer skips user-context handoff when its own work list is empty. The handoff (Schedule-UserContextRemediation) was nested inside the `if ($LIST.Count -gt 0)` branch, so a task file containing only user-scoped entries (e.g. "0 routed to SYSTEM, 1 left for the other context") fell into the else branch and exited without ever launching the user-context task. Added a parallel handoff in the else branch gated on $Script:TasksForOtherContext > 0 (set during routing). Pairs with detect.ps1 v5.38 which now produces task files containing both scopes.
+    9.24 - LOGGING: Made remediation log self-explanatory at the SYSTEM level. (a) Successful upgrades now report as `AppID (OK)` instead of bare AppID — previously success/failure was distinguishable only by the absence of a "(FAILED)/(ERROR)" suffix, which was easy to misread when the user-context task reported back. (b) Routing log now lists the actual AppIDs (with InstalledScope) for both the current context's work list AND the entries handed off to the other context, so SYSTEM log readers can see which apps the user-context task is about to attempt without needing the user-context log file.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6039,7 +6040,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "23" # Update this tag for each script version
+$ScriptTag = "24" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6948,6 +6949,7 @@ function Resolve-FriendlyName {
 # upgrade with its InstalledScope, so remediation does no discovery itself.
 $LIST = @()
 $Script:TasksForOtherContext = 0   # set by the routing block below; checked in the else branch so SYSTEM can still hand off user-scoped work even when its own list is empty
+$Script:OtherContextAppIds = @()   # AppIDs routed to the other context, logged when handing off
 $rawTaskList = @(Read-UpgradeTaskFile)
 if ($rawTaskList -and $rawTaskList.Count -gt 0) {
     # Filter the task list down to entries that belong in the current context:
@@ -6957,20 +6959,28 @@ if ($rawTaskList -and $rawTaskList.Count -gt 0) {
     $isSystem = (Test-RunningAsSystem)
     $allowedScopes = if ($isSystem) { @("machine", "unknown") } else { @("user", "unknown") }
     $filtered = [System.Collections.ArrayList]::new()
-    $skipped = 0
+    $skippedIds = [System.Collections.ArrayList]::new()
     foreach ($t in $rawTaskList) {
         $taskScope = if ($t.InstalledScope) { $t.InstalledScope } else { "unknown" }
         if ($allowedScopes -contains $taskScope) {
             $null = $filtered.Add($t)
         } else {
-            $skipped++
+            $null = $skippedIds.Add("$($t.AppID)[$taskScope]")
         }
     }
     $LIST = $filtered
-    $Script:TasksForOtherContext = $skipped
+    $Script:TasksForOtherContext = $skippedIds.Count
+    $Script:OtherContextAppIds = @($skippedIds)
     $contextLabel = if ($isSystem) { "SYSTEM" } else { "user" }
     $listCount = $LIST.Count
-    Write-Log -Message "Task file: $($rawTaskList.Count) entries, $listCount routed to $contextLabel context, $skipped left for the other context"
+    Write-Log -Message "Task file: $($rawTaskList.Count) entries, $listCount routed to $contextLabel context, $($skippedIds.Count) left for the other context"
+    if ($listCount -gt 0) {
+        $hereIds = ($LIST | ForEach-Object { "$($_.AppID)[$(if ($_.InstalledScope) { $_.InstalledScope } else { 'unknown' })]" }) -join ', '
+        Write-Log -Message "$contextLabel work list: $hereIds"
+    }
+    if ($skippedIds.Count -gt 0) {
+        Write-Log -Message "Other-context work list: $($skippedIds -join ', ')"
+    }
 } else {
     Write-Log -Message "No fresh upgrade task file - nothing to remediate (run detect.ps1 first)"
 }
@@ -7525,7 +7535,7 @@ if ($LIST -and $LIST.Count -gt 0) {
                         if ($isSuccess) {
                             Write-Log -Message "Upgrade completed successfully for: $($appInfo.AppID)"
                             Clear-VersionFailureData -AppID $appInfo.AppID
-                            $message += "$($appInfo.AppID)|"
+                            $message += "$($appInfo.AppID) (OK)|"
                             # Done with this entry \u2014 drop it from the static task file.
                             Remove-UpgradeTaskEntry -AppID $appInfo.AppID
 
