@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.17
- Tag: 10
+ Version: 9.23
+ Tag: 23
     
     Version History:
     1.0 - Initial version
@@ -87,6 +87,7 @@
     9.20 - REFACTOR: Detection now writes a static task file (C:\ProgramData\Temp\availableUpgrades-tasks.json) with the apps it found pending upgrade. Remediation reads that file as the authoritative work list and removes entries as each app is processed (success or final-failure). Eliminates the need for SYSTEM-context augmentation to walk every whitelisted machine-scoped app querying `winget list` per app — detection has already done the discovery via its dual `winget upgrade` listing. The augmentation pass remains as a fallback for when the task file is missing or older than 6 hours. User-context "skip machine-scoped to avoid UAC" leaves the entry in the task file so SYSTEM picks it up next cycle.
     9.21 - REFACTOR: Removed all `winget upgrade` discovery calls from remediation - detection's task file is now the sole source of truth. Each task entry carries an InstalledScope (machine/user/unknown) recorded by detect.ps1, which lets remediation filter the work list by current context at load time: SYSTEM processes machine + unknown, user context processes user + unknown. Scope decisions in the upgrade loop now read InstalledScope from the task entry instead of re-running Get-AppInstalledScope per app. When the task file is missing or stale, remediation exits 0 cleanly (no fallback discovery — run detect.ps1 first).
     9.22 - FIX: When user-context remediation had nothing to do (typically because SYSTEM had already drained the task file) it exited without writing the result file. SYSTEM-side Schedule-UserContextRemediation then waited the full 600-second idle timeout for a heartbeat that never came (observed: 750-second hang, ~12 min wasted per cycle). Now the empty-work-list exit path writes a minimal result JSON (ProcessedApps=0, Success=true, Reason) so SYSTEM can stop waiting immediately.
+    9.23 - FIX: SYSTEM-context remediation no longer skips user-context handoff when its own work list is empty. The handoff (Schedule-UserContextRemediation) was nested inside the `if ($LIST.Count -gt 0)` branch, so a task file containing only user-scoped entries (e.g. "0 routed to SYSTEM, 1 left for the other context") fell into the else branch and exited without ever launching the user-context task. Added a parallel handoff in the else branch gated on $Script:TasksForOtherContext > 0 (set during routing). Pairs with detect.ps1 v5.38 which now produces task files containing both scopes.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6038,7 +6039,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "22" # Update this tag for each script version
+$ScriptTag = "23" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6946,6 +6947,7 @@ function Resolve-FriendlyName {
 # detect.ps1 has already run the `winget upgrade` discovery and recorded each pending
 # upgrade with its InstalledScope, so remediation does no discovery itself.
 $LIST = @()
+$Script:TasksForOtherContext = 0   # set by the routing block below; checked in the else branch so SYSTEM can still hand off user-scoped work even when its own list is empty
 $rawTaskList = @(Read-UpgradeTaskFile)
 if ($rawTaskList -and $rawTaskList.Count -gt 0) {
     # Filter the task list down to entries that belong in the current context:
@@ -6965,6 +6967,7 @@ if ($rawTaskList -and $rawTaskList.Count -gt 0) {
         }
     }
     $LIST = $filtered
+    $Script:TasksForOtherContext = $skipped
     $contextLabel = if ($isSystem) { "SYSTEM" } else { "user" }
     $listCount = $LIST.Count
     Write-Log -Message "Task file: $($rawTaskList.Count) entries, $listCount routed to $contextLabel context, $skipped left for the other context"
@@ -7679,6 +7682,24 @@ if ($LIST -and $LIST.Count -gt 0) {
         exit 0
 } else {
     Write-Log -Message "[$ScriptTag] No upgrades found in winget output"
+
+    # SYSTEM had no machine-scoped work itself, but the task file may still contain user-scoped
+    # entries that need handing off. Without this branch, an all-user-scope task file would
+    # silently exit here and the user-context task would never be scheduled.
+    if ((Test-RunningAsSystem) -and (-not $UserRemediationOnly) -and ($Script:TasksForOtherContext -gt 0)) {
+        Write-Log -Message "$($Script:TasksForOtherContext) task(s) routed to user context - checking for interactive session"
+        if (-not (Test-InteractiveSession)) {
+            Write-Log -Message "No interactive session detected - skipping user context remediation (will retry next cycle)"
+        } else {
+            Write-Log -Message "Interactive session confirmed - scheduling user context remediation"
+            $userScheduled = Schedule-UserContextRemediation
+            if ($userScheduled) {
+                Write-Log -Message "User context remediation scheduled successfully"
+            } else {
+                Write-Log -Message "User context remediation scheduling failed"
+            }
+        }
+    }
 
     # When a UserRemediationOnly run has nothing to do (typically because SYSTEM already drained
     # the task file), still write the result file so SYSTEM stops waiting on heartbeats — the
