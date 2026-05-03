@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.32
-    Tag: 60
+    Version: 5.38
+    Tag: 68
     
     Version History:
     1.0 - Initial version
@@ -84,6 +84,7 @@
     5.35 - FEATURE: Each task entry now records InstalledScope (machine/user/unknown) determined via the registry uninstall keys (HKLM + HKU\SID under SYSTEM, HKLM + HKCU under user). Lets remediate.ps1 route entries to the right context without re-walking the registry per app. Get-AppInstalledScope ported from remediate.ps1 with HKCU support added for the user-context path.
     5.36 - FIX: SYSTEM-context flow was deleting the task file and reporting "No upgrades available" even when user-context detection found apps. Two issues: (a) PS5.1's ConvertFrom-Json unwraps single-element arrays, so $results.Apps for one task became a bare PSCustomObject with no .Count property, making `.Count -gt 0` false; (b) Invoke-UserContextDetection's return value was polluted by unsuppressed Write-Log output and cmdlet objects, so $userApps was a heterogeneous mix rather than just the apps. Both fixed: @() wrap inside the function for array context, and a Where-Object filter at the call site to keep only records that have an AppID.
     5.37 - FIX: Get-AppInstalledScope was silently returning "unknown" for Firefox when called from SYSTEM-context Write-UpgradeTaskFile (task file showed InstalledScope="unknown" despite Firefox being in HKLM uninstall). Replaced the `Get-ChildItem | Get-ItemProperty | Where-Object` pipeline with the more robust `Get-ItemProperty <path>\*` wildcard form — empirically the pipeline can short-circuit silently in some SYSTEM-context environments, the wildcard form does not. Also added match-count diagnostic logging (machine matches=N, user matches=N -> scope) so future drift is visible in the log without needing to instrument.
+    5.38 - FIX: SYSTEM-context detection no longer skips user-context detection when system apps are found. The v5.19 "performance optimization" caused the task file to omit user-scoped upgrades on any machine that also had a system-scoped upgrade pending, leaving them indefinitely undone (remediate.ps1 now relies solely on the task file). New flow: always run user-context detection when an interactive session exists, then merge system + user records by AppID into a single task file. SYSTEM record wins on AppID conflict so the more accurate InstalledScope (HKLM + HKU\SID) is preserved.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -1428,7 +1429,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "67" # Update this tag for each script version
+$ScriptTag = "68" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -2093,7 +2094,10 @@ if ($LIST -and $LIST.Count -gt 0) {
             
         } elseif (Test-RunningAsSystem) {
             Write-Log -Message "DEBUG: *** TAKING SYSTEM CONTEXT MAIN EXECUTION PATH ***" -IsDebug
-            # SYSTEM context main execution - check system apps first, only run user detection if none found
+            # SYSTEM context main execution - run BOTH system and user detection, merge results,
+            # then write the combined task file. The two contexts are not mutually exclusive: a
+            # machine has both system-scoped and user-scoped upgrades, and the task file is the
+            # sole input remediate.ps1 uses, so missing either side leaves work undone.
             $systemApps = $contextApps
             # Write-Log -Message "System detection found $($systemApps.Count) apps: $($systemApps -join ', ')"
 
@@ -2105,51 +2109,53 @@ if ($LIST -and $LIST.Count -gt 0) {
                 exit 1
             }
 
-            # PERFORMANCE OPTIMIZATION: Exit immediately if system apps are found
-            if ($systemApps.Count -gt 0) {
-                Write-Log -Message "[$ScriptTag] $(Format-AppList $systemApps)"
-                if ($deferredApps.Count -gt 0) {
-                    Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
-                }
-                Write-UpgradeTaskFile -Records $systemApps
-                Write-Log -Message "Performing marker file cleanup before exit (system apps found)" -IsDebug
-                Invoke-MarkerFileEmergencyCleanup -Reason "System apps found, triggering remediation"
-                exit 1  # Trigger remediation immediately
+            $userApps = @()
+            if (Test-InteractiveSession) {
+                Write-Log -Message "Interactive session confirmed - proceeding with user context detection"
+                Write-Log -Message "DEBUG: About to call Invoke-UserContextDetection function" -IsDebug
+                # Filter the function's return stream down to actual app records: Write-Log emits the
+                # formatted line to the success stream and several cmdlets inside Invoke-UserContextDetection
+                # also output objects, so unfiltered $userApps is a mix of strings + task-info objects + apps.
+                $userApps = @((Invoke-UserContextDetection) | Where-Object {
+                    ($_ -is [hashtable] -or $_ -is [System.Collections.IDictionary]) -or
+                    ($_.PSObject -and $_.PSObject.Properties['AppID'])
+                })
+                Write-Log -Message "DEBUG: Invoke-UserContextDetection returned $($userApps.Count) apps after filtering" -IsDebug
+            } else {
+                Write-Log -Message "No interactive session detected - skipping user context detection (system-only run)"
             }
 
-            # Only run user detection if no system apps were found AND interactive session exists
-            Write-Log -Message "No system apps found - checking for interactive session before user context detection"
-            if (-not (Test-InteractiveSession)) {
-                if ($deferredApps.Count -gt 0) {
-                    Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
+            # Merge by AppID. SYSTEM record wins on conflict because its InstalledScope was
+            # determined from HKLM + HKU\SID (the SYSTEM-context path of Get-AppInstalledScope
+            # has visibility into all loaded user hives; the user-context path only sees HKCU).
+            $mergedApps = @()
+            $seenIds = @{}
+            foreach ($r in $systemApps) {
+                $id = Get-RecordAppId -Record $r
+                if ([string]::IsNullOrEmpty($id)) { continue }
+                if (-not $seenIds.ContainsKey($id)) {
+                    $mergedApps += $r
+                    $seenIds[$id] = $true
                 }
-                Write-Log -Message "[$ScriptTag] No interactive session detected - skipping user context detection"
-                Write-Log -Message "[$ScriptTag] No upgrades available in any context (no system apps, no interactive session)"
-                Remove-UpgradeTaskFile -Reason "No interactive session, no upgrades"
-                Write-Log -Message "Performing marker file cleanup before exit (no interactive session)" -IsDebug
-                Invoke-MarkerFileEmergencyCleanup -Reason "No interactive session"
-                exit 0
             }
+            foreach ($r in $userApps) {
+                $id = Get-RecordAppId -Record $r
+                if ([string]::IsNullOrEmpty($id)) { continue }
+                if (-not $seenIds.ContainsKey($id)) {
+                    $mergedApps += $r
+                    $seenIds[$id] = $true
+                }
+            }
+            Write-Log -Message "Merged detection: $($systemApps.Count) system + $($userApps.Count) user = $($mergedApps.Count) unique apps"
 
-            Write-Log -Message "Interactive session confirmed - proceeding with user context detection"
-            Write-Log -Message "DEBUG: About to call Invoke-UserContextDetection function" -IsDebug
-            # Filter the function's return stream down to actual app records: Write-Log emits the
-            # formatted line to the success stream and several cmdlets inside Invoke-UserContextDetection
-            # also output objects, so unfiltered $userApps is a mix of strings + task-info objects + apps.
-            $userApps = @((Invoke-UserContextDetection) | Where-Object {
-                ($_ -is [hashtable] -or $_ -is [System.Collections.IDictionary]) -or
-                ($_.PSObject -and $_.PSObject.Properties['AppID'])
-            })
-            Write-Log -Message "DEBUG: Invoke-UserContextDetection returned $($userApps.Count) apps after filtering" -IsDebug
-
-            if ($userApps.Count -gt 0) {
-                Write-Log -Message "[$ScriptTag] $(Format-AppList $userApps)"
+            if ($mergedApps.Count -gt 0) {
+                Write-Log -Message "[$ScriptTag] $(Format-AppList $mergedApps)"
                 if ($deferredApps.Count -gt 0) {
                     Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
                 }
-                Write-UpgradeTaskFile -Records $userApps
-                Write-Log -Message "Performing marker file cleanup before exit (user apps found)" -IsDebug
-                Invoke-MarkerFileEmergencyCleanup -Reason "User apps found, triggering remediation"
+                Write-UpgradeTaskFile -Records $mergedApps
+                Write-Log -Message "Performing marker file cleanup before exit (merged apps found)" -IsDebug
+                Invoke-MarkerFileEmergencyCleanup -Reason "Merged apps found, triggering remediation"
                 exit 1  # Trigger remediation
             } else {
                 if ($deferredApps.Count -gt 0) {
