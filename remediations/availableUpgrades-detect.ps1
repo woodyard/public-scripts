@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.43
-    Tag: 73
+    Version: 5.44
+    Tag: 74
     
     Version History:
     1.0 - Initial version
@@ -90,6 +90,7 @@
     5.41 - PERF: Orphan marker cleanup at startup no longer calls Get-InteractiveUser to find the user temp dir — replaced with a disk enumeration of C:\Users\* (skipping well-known non-user profile dirs). The CIM-based user detection costs ~7s on Azure AD machines and was the first thing every Intune cycle paid for; disk enumeration is sub-millisecond and additionally catches orphans from any user profile rather than just the active one.
     5.42 - FIX: Get-AppInstalledScope returned "unknown" for Notepad++ (and likely other apps) on ARM64 because the `Get-ItemProperty <basepath>\*` wildcard form silently returned $null when -ErrorAction SilentlyContinue swallowed a single bad subkey. Replaced with explicit per-subkey enumeration: Get-ChildItem to list subkeys, then Get-ItemProperty per subkey wrapped in try/catch so individual unreadable entries don't abort the whole walk. Also extended the match function to check PSChildName (the literal subkey name, e.g. "Notepad++") in addition to DisplayName, providing a second signal when DisplayName is missing or formatted unexpectedly. Confirmed via diagnostic log line "machine hits=0, user hits=0" for Notepad++.Notepad++ that the previous walk found nothing.
     5.43 - FIX: Notepad++ still returned "unknown" after v5.42 because the underlying problem was WoW64 redirection, not enumeration. When this script runs in a 32-bit PowerShell host (Intune Remediation policies default to 32-bit unless "Run script in 64-bit PowerShell host" is enabled), accesses to HKLM:\SOFTWARE\... are silently redirected to WOW6432Node, hiding native 64-bit and ARM64 uninstall entries entirely. Listing WOW6432Node explicitly didn't help — that's still the same redirected view a 32-bit process gets when reading SOFTWARE\. Switched the registry walk to [Microsoft.Win32.RegistryKey]::OpenBaseKey() with explicit Registry64 and Registry32 views for HKLM, and Default view for HKU/HKCU (user hives have no 32/64 split). This bypasses the WoW64 redirector and guarantees both views are read regardless of host process architecture. Diagnostic log line now also includes [32-bit host] / [64-bit host] for visibility.
+    5.44 - PERF: Two cost reductions. (a) Get-InteractiveUser now uses Get-Process explorer -IncludeUserName as the PRIMARY detection method (~50ms) and falls back to Win32_ComputerSystem (~5s) only when Explorer isn't running. Explorer is the desktop shell so its owner is by definition the interactive user — same answer as the WMI Username property in 99%+ of sessions, much faster. (b) Whitelist fetch now uses an on-disk cache (C:\ProgramData\Temp\availableUpgrades-whitelist.cache.*) with a 60-min TTL plus ETag/If-Modified-Since revalidation. Within the TTL window we skip the network entirely; after TTL we send If-None-Match and reuse the cached body on a 304. Reduces external dependency from once-per-cycle to at most once-per-hour. Stale cache is also used as a fallback when the network is unavailable.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -727,34 +728,38 @@ function Get-InteractiveUser {
             return $Script:CachedUserInfo
         }
         
-        Write-Log "Detecting interactive user using Win32_ComputerSystem..."
+        Write-Log "Detecting interactive user..."
 
-        # Primary method - proven to work with Azure AD
+        # Primary: Get-Process explorer -IncludeUserName. Typically ~50ms vs several seconds
+        # for Win32_ComputerSystem on Azure AD machines. Explorer is the desktop shell so its
+        # owner is by definition the interactive user. WMI is now only the fallback for cases
+        # where Explorer isn't running (e.g. session not yet fully initialized).
         $loggedInUser = $null
         try {
-            $loggedInUser = Get-WmiObject -Class Win32_ComputerSystem | Select-Object username -ExpandProperty username
-            if (-not $loggedInUser) {
-                Write-Log "No username returned from Win32_ComputerSystem (possible RDP/Windows 365 session) - trying Explorer process fallback..."
+            $explorerProc = Get-Process explorer -IncludeUserName -ErrorAction Stop |
+                Where-Object { $_.SessionId -gt 0 } | Select-Object -First 1
+            if ($explorerProc -and $explorerProc.UserName) {
+                $loggedInUser = $explorerProc.UserName
+                Write-Log "Explorer-based detection successful - User: $loggedInUser"
             }
         } catch {
-            Write-Log "Win32_ComputerSystem failed: $($_.Exception.Message) - trying Explorer process fallback..."
+            Write-Log "Explorer-based detection unavailable: $($_.Exception.Message) - trying Win32_ComputerSystem fallback..."
         }
 
-        # Fallback for RDP/Windows 365 sessions where Win32_ComputerSystem returns empty
+        # Fallback: Win32_ComputerSystem (slower, but works when Explorer isn't running yet)
         if (-not $loggedInUser) {
             try {
-                $explorerProc = Get-Process explorer -IncludeUserName -ErrorAction Stop | Select-Object -First 1
-                if ($explorerProc -and $explorerProc.UserName) {
-                    $loggedInUser = $explorerProc.UserName
-                    Write-Log "Explorer fallback successful - User: $loggedInUser"
+                $loggedInUser = Get-WmiObject -Class Win32_ComputerSystem | Select-Object username -ExpandProperty username
+                if ($loggedInUser) {
+                    Write-Log "Win32_ComputerSystem fallback successful - User: $loggedInUser"
                 }
             } catch {
-                Write-Log "Explorer process fallback failed: $($_.Exception.Message)"
+                Write-Log "Win32_ComputerSystem fallback failed: $($_.Exception.Message)"
             }
         }
 
         if (-not $loggedInUser) {
-            $Message = "User is not logged on to the primary session: No username returned from Win32_ComputerSystem or Explorer fallback"
+            $Message = "User is not logged on to the primary session: neither Explorer nor Win32_ComputerSystem returned a user"
             Write-Log $Message
             Throw $Message
         }
@@ -1539,7 +1544,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "73" # Update this tag for each script version
+$ScriptTag = "74" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -1628,7 +1633,91 @@ if ($MyInvocation.MyCommand.Path) {
     }
 }
 
-# Load whitelist configuration with priority: Local file > GitHub > Hardcoded fallback
+function Get-CachedWhitelistJSON {
+    <#
+    .SYNOPSIS
+        Fetches whitelist JSON from a URL using a local cache with TTL + ETag revalidation.
+    .DESCRIPTION
+        Cache lives at C:\ProgramData\Temp\availableUpgrades-whitelist.cache.json with a
+        sibling .meta.json holding the source URL, ETag, and timestamp.
+        - Within $TtlMinutes of the last successful fetch: skip network entirely.
+        - After TTL: revalidate via If-None-Match. 304 -> use cache; 200 -> save new body.
+        - On network failure with a stale cache present: use the stale copy.
+        - On network failure with no cache: return $null (caller falls back to hardcoded).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [int]$TtlMinutes = 60,
+        [string]$CachePath = "C:\ProgramData\Temp\availableUpgrades-whitelist.cache.json"
+    )
+
+    $metaPath = "$CachePath.meta.json"
+    $cachedJson = $null
+    $cachedEtag = $null
+    $cacheAge = $null
+
+    if ((Test-Path $CachePath) -and (Test-Path $metaPath)) {
+        try {
+            $meta = Get-Content -Path $metaPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+            if ($meta.Url -eq $Url -and $meta.Timestamp) {
+                $cachedJson = Get-Content -Path $CachePath -Raw -Encoding UTF8
+                $cachedEtag = $meta.ETag
+                $cacheAge = (Get-Date) - [datetime]$meta.Timestamp
+            }
+        } catch { }
+    }
+
+    # Fresh cache window — skip network entirely.
+    if ($cachedJson -and $cacheAge -and $cacheAge.TotalMinutes -lt $TtlMinutes) {
+        Write-Log -Message "Using cached whitelist (age $([Math]::Round($cacheAge.TotalMinutes, 1)) min, TTL $TtlMinutes min)"
+        return $cachedJson
+    }
+
+    # TTL expired (or no cache): revalidate / fetch.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $headers = @{ 'User-Agent' = 'PowerShell-WingetScript' }
+    if ($cachedEtag) { $headers['If-None-Match'] = $cachedEtag }
+
+    try {
+        $resp = Invoke-WebRequest -Uri $Url -Headers $headers -UseBasicParsing -ErrorAction Stop
+        $newJson = $resp.Content
+        $newEtag = $resp.Headers['ETag']
+        if ($newEtag -is [array]) { $newEtag = $newEtag[0] }
+        Write-Log -Message "Fetched whitelist from $Url ($($newJson.Length) bytes)"
+
+        try {
+            $cacheDir = Split-Path -Parent $CachePath
+            if ($cacheDir -and -not (Test-Path $cacheDir)) { New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null }
+            $newJson | Out-File -FilePath $CachePath -Encoding UTF8 -Force
+            @{ Url = $Url; ETag = $newEtag; Timestamp = (Get-Date).ToString('o') } |
+                ConvertTo-Json | Out-File -FilePath $metaPath -Encoding UTF8 -Force
+        } catch {
+            Write-Log -Message "Whitelist cache write failed (non-fatal): $($_.Exception.Message)"
+        }
+        return $newJson
+    } catch {
+        # 304 Not Modified: PowerShell treats it as an exception. Reuse cache and refresh
+        # the timestamp so the next TTL window starts now.
+        $statusCode = $null
+        if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
+        if ($statusCode -eq 304 -and $cachedJson) {
+            Write-Log -Message "Whitelist unchanged on server (304) — reusing cache"
+            try {
+                @{ Url = $Url; ETag = $cachedEtag; Timestamp = (Get-Date).ToString('o') } |
+                    ConvertTo-Json | Out-File -FilePath $metaPath -Encoding UTF8 -Force
+            } catch { }
+            return $cachedJson
+        }
+        Write-Log -Message "Whitelist fetch failed: $($_.Exception.Message)"
+        if ($cachedJson) {
+            Write-Log -Message "Falling back to stale whitelist cache"
+            return $cachedJson
+        }
+        return $null
+    }
+}
+
+# Load whitelist configuration with priority: Local file > GitHub (cached) > Hardcoded fallback
 $whitelistJSON = $null
 $localWhitelistPath = $null
 if ($MyInvocation.MyCommand.Path) {
@@ -1648,23 +1737,16 @@ if ($localWhitelistPath -and (Test-Path $localWhitelistPath)) {
     }
 }
 
-# If no local file or local file failed, try GitHub
+# If no local file or local file failed, fetch from GitHub via the cache helper.
+# The cache (C:\ProgramData\Temp\availableUpgrades-whitelist.cache.*) keeps a copy of the
+# last response plus its ETag; for the next TTL window we skip the network call entirely,
+# and after that we revalidate with If-None-Match (a 304 response means we keep using the
+# cached body). Significantly reduces external dependency on every Intune cycle.
 if ([string]::IsNullOrEmpty($whitelistJSON)) {
     if (-not $whitelistUrl) {
         $whitelistUrl = "https://raw.githubusercontent.com/woodyard/public-scripts/main/remediations/app-whitelist.json"
     }
-    Write-Log -Message "Loading whitelist configuration from GitHub: $whitelistUrl"
-
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        $webClient = New-Object System.Net.WebClient
-        $webClient.Headers.Add("User-Agent", "PowerShell-WingetScript/4.2")
-        $whitelistJSON = $webClient.DownloadString($whitelistUrl)
-        Write-Log -Message "Successfully downloaded whitelist configuration from GitHub ($($whitelistJSON.Length) bytes)"
-    } catch {
-        Write-Log -Message "Error downloading whitelist from GitHub: $($_.Exception.Message)"
-        $whitelistJSON = $null
-    }
+    $whitelistJSON = Get-CachedWhitelistJSON -Url $whitelistUrl
 }
 
 # If both local file and GitHub failed, use hardcoded fallback

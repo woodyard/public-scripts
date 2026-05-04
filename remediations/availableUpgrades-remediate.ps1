@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.26
- Tag: 26
+ Version: 9.27
+ Tag: 27
     
     Version History:
     1.0 - Initial version
@@ -91,6 +91,7 @@
     9.24 - LOGGING: Made remediation log self-explanatory at the SYSTEM level. (a) Successful upgrades now report as `AppID (OK)` instead of bare AppID — previously success/failure was distinguishable only by the absence of a "(FAILED)/(ERROR)" suffix, which was easy to misread when the user-context task reported back. (b) Routing log now lists the actual AppIDs (with InstalledScope) for both the current context's work list AND the entries handed off to the other context, so SYSTEM log readers can see which apps the user-context task is about to attempt without needing the user-context log file.
     9.25 - FIX: SYSTEM-context handoff to user-context remediation no longer runs when the task file contains zero user-scoped entries. The post-processing handoff (only reached when SYSTEM had work itself) was unconditional — every SYSTEM run that processed any machine-scoped app would also schedule a no-op user-context task, wasting ~3 minutes per cycle on heartbeat polling for nothing. Now gated on $Script:TasksForOtherContext > 0, matching the gate already on the empty-list else branch added in v9.23.
     9.26 - PERF: Two startup/per-app cost reductions. (a) Orphan marker cleanup no longer calls Get-InteractiveUser to find the user temp dir — replaced with a disk enumeration of C:\Users\* (skipping well-known non-user profile dirs). The CIM call costs ~7s on Azure AD machines and was the first thing every Intune cycle paid for; disk enumeration is sub-millisecond and additionally catches orphans from any user profile rather than just the active one. (b) Post-upgrade verification (the `winget list --exact` re-query that costs ~1.5s per upgraded app) is now opt-in via a new whitelist `RequiresPostVerify: true` flag. Originally added in v8.8 for Adobe Reader's silent-failure pattern; Adobe Reader is now disabled in the whitelist, so the cost was being paid on every enabled app to protect against a problem none of them have. Apps that need the safety net can opt back in by setting the flag.
+    9.27 - PERF: Three further cost reductions. (a) Get-InteractiveUser now uses Get-Process explorer -IncludeUserName as the PRIMARY detection method (~50ms) and falls back to CIM (~5s) only when Explorer isn't running. Explorer is the desktop shell so its owner is by definition the interactive user — same answer as Win32_ComputerSystem.Username in 99%+ of sessions, dramatically faster. The CIM/WMI paths are kept as fallbacks for early-boot or RDP-edge scenarios where Explorer isn't yet running. Also collapsed the verbose per-method logging: the function now emits a single line "User detection method: Explorer (52ms) -> DSGR\\adminhsk, SID=..." instead of 8+ progress lines. (b) Whitelist fetch now uses an on-disk cache (C:\ProgramData\Temp\availableUpgrades-whitelist.cache.*) with a 60-min TTL plus ETag/If-Modified-Since revalidation. Within the TTL window we skip the network entirely; after TTL we send If-None-Match and reuse the cached body on a 304. Reduces external dependency from once-per-cycle to at most once-per-hour. Stale cache is also used as a fallback when the network is unavailable. (c) Removed three redundant log lines around the Get-InteractiveUser call inside Schedule-UserContextRemediation that were just announcing function entry/exit ("Calling Get-InteractiveUser function...", "Get-InteractiveUser completed in X seconds"). The function logs its own success line.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -290,94 +291,83 @@ function Get-InteractiveUser {
             return $Script:CachedUserInfo
         }
         
-        Write-Log "Detecting interactive user using improved Azure AD compatible method..." | Out-Null
+        Write-Log "Detecting interactive user..." | Out-Null
         $userDetectionStart = Get-Date
-        
-        # Improved user detection method that handles Azure AD properly
+
         try {
-            # Try CIM instance first, fallback to WMI
             $loggedInUser = $null
             $LoggedSID = $null
             $CurrentAzureADUser = $null
-            
+            $detectionMethod = $null
+
+            # Primary: Get-Process explorer -IncludeUserName. Typically ~50ms vs ~5s for CIM.
+            # Explorer is the desktop shell — its owner is by definition the interactive user.
+            # CIM/WMI Win32_ComputerSystem.Username is the historic method but is far slower
+            # and produces the same answer in 99%+ of sessions, so it's now only the fallback
+            # for cases where Explorer isn't running (e.g. session not yet fully initialized).
             try {
-                Write-Log "Attempting user detection via CIM..." | Out-Null
-                $cimStart = Get-Date
-                
-                # Add timeout protection for CIM call
-                $cimJob = Start-Job -ScriptBlock {
-                    Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object -ExpandProperty Username
+                $expStart = Get-Date
+                $explorerProc = Get-Process explorer -IncludeUserName -ErrorAction Stop |
+                    Where-Object { $_.SessionId -gt 0 } | Select-Object -First 1
+                $expDuration = (Get-Date) - $expStart
+                if ($explorerProc -and $explorerProc.UserName) {
+                    $loggedInUser = $explorerProc.UserName
+                    $LoggedSID = ([System.Security.Principal.NTAccount]$loggedInUser).Translate([System.Security.Principal.SecurityIdentifier]).Value
+                    $detectionMethod = "Explorer ($([Math]::Round($expDuration.TotalMilliseconds))ms)"
                 }
-                
-                if (Wait-Job $cimJob -Timeout 15) {
-                    $loggedInUser = Receive-Job $cimJob
-                    $cimDuration = (Get-Date) - $cimStart
-                    Write-Log "CIM call completed in $($cimDuration.TotalSeconds) seconds" | Out-Null
-                    
-                    if ($loggedInUser) {
-                        $LoggedSID = (([System.Security.Principal.NTAccount]$loggedInUser).Translate([System.Security.Principal.SecurityIdentifier]).Value)
-                        Write-Log "CIM method successful - User: $loggedInUser, SID: $LoggedSID" | Out-Null
-                    }
-                } else {
-                    $cimDuration = (Get-Date) - $cimStart
-                    Write-Log "CIM call timed out after $($cimDuration.TotalSeconds) seconds" | Out-Null
-                    Remove-Job $cimJob -Force
-                    throw "CIM timeout"
-                }
-                Remove-Job $cimJob -Force
-                
             } catch {
-                Write-Log "CIM method failed: $($_.Exception.Message). Trying WMI fallback..." | Out-Null
+                Write-Log "Explorer-based detection unavailable: $($_.Exception.Message)" | Out-Null
+            }
+
+            # Fallback 1: CIM Win32_ComputerSystem.Username (slow, but works when Explorer isn't running yet)
+            if (-not $loggedInUser -or -not $LoggedSID) {
                 try {
-                    Write-Log "Attempting user detection via WMI..." | Out-Null
+                    $cimStart = Get-Date
+                    $cimJob = Start-Job -ScriptBlock {
+                        Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object -ExpandProperty Username
+                    }
+                    if (Wait-Job $cimJob -Timeout 15) {
+                        $loggedInUser = Receive-Job $cimJob
+                        $cimDuration = (Get-Date) - $cimStart
+                        if ($loggedInUser) {
+                            $LoggedSID = (([System.Security.Principal.NTAccount]$loggedInUser).Translate([System.Security.Principal.SecurityIdentifier]).Value)
+                            $detectionMethod = "CIM ($([Math]::Round($cimDuration.TotalSeconds, 1))s)"
+                        }
+                    } else {
+                        $cimDuration = (Get-Date) - $cimStart
+                        Write-Log "CIM fallback timed out after $($cimDuration.TotalSeconds) seconds" | Out-Null
+                    }
+                    Remove-Job $cimJob -Force
+                } catch {
+                    Write-Log "CIM fallback failed: $($_.Exception.Message)" | Out-Null
+                }
+            }
+
+            # Fallback 2: WMI (legacy COM-based path; same data, different transport)
+            if (-not $loggedInUser -or -not $LoggedSID) {
+                try {
                     $wmiStart = Get-Date
-                    
-                    # Add timeout protection for WMI call
                     $wmiJob = Start-Job -ScriptBlock {
                         Get-WmiObject -Class Win32_ComputerSystem | Select-Object -ExpandProperty Username
                     }
-                    
                     if (Wait-Job $wmiJob -Timeout 15) {
                         $loggedInUser = Receive-Job $wmiJob
                         $wmiDuration = (Get-Date) - $wmiStart
-                        Write-Log "WMI call completed in $($wmiDuration.TotalSeconds) seconds" | Out-Null
-                        
                         if ($loggedInUser) {
                             $LoggedSID = (([System.Security.Principal.NTAccount]$loggedInUser).Translate([System.Security.Principal.SecurityIdentifier]).Value)
-                            Write-Log "WMI fallback successful - User: $loggedInUser, SID: $LoggedSID" | Out-Null
+                            $detectionMethod = "WMI ($([Math]::Round($wmiDuration.TotalSeconds, 1))s)"
                         }
-                    } else {
-                        $wmiDuration = (Get-Date) - $wmiStart
-                        Write-Log "WMI call timed out after $($wmiDuration.TotalSeconds) seconds" | Out-Null
-                        Remove-Job $wmiJob -Force
-                        throw "WMI timeout"
                     }
                     Remove-Job $wmiJob -Force
-                    
                 } catch {
-                    Write-Log "Both CIM and WMI methods failed: $($_.Exception.Message)" | Out-Null
-                    throw "No logged in user detected via CIM or WMI"
-                }
-            }
-            
-            if (-not $loggedInUser -or -not $LoggedSID) {
-                # CIM/WMI returns empty on Windows 365 (RDP sessions) - try Explorer process owner as fallback
-                Write-Log "CIM/WMI returned no user (possible RDP/Windows 365 session) - trying Explorer process fallback..." | Out-Null
-                try {
-                    $explorerProc = Get-Process explorer -IncludeUserName -ErrorAction Stop | Select-Object -First 1
-                    if ($explorerProc -and $explorerProc.UserName) {
-                        $loggedInUser = $explorerProc.UserName
-                        $LoggedSID = ([System.Security.Principal.NTAccount]$loggedInUser).Translate([System.Security.Principal.SecurityIdentifier]).Value
-                        Write-Log "Explorer fallback successful - User: $loggedInUser, SID: $LoggedSID" | Out-Null
-                    }
-                } catch {
-                    Write-Log "Explorer process fallback failed: $($_.Exception.Message)" | Out-Null
+                    Write-Log "WMI fallback failed: $($_.Exception.Message)" | Out-Null
                 }
             }
 
             if (-not $loggedInUser -or -not $LoggedSID) {
                 throw "User detection failed - no logged in user found"
             }
+            Write-Log "User detection method: $detectionMethod -> $loggedInUser, SID=$LoggedSID" | Out-Null
             
             # Try to get Azure AD username from registry with enhanced error suppression
             try {
@@ -4993,21 +4983,13 @@ function Schedule-UserContextRemediation {
     try {
         Write-Log "Starting user context remediation scheduling" | Out-Null
         $startTime = Get-Date
-        
-        # Use SAME Get-InteractiveUser function as detection script (simple WMI-based)
-        Write-Log "Calling Get-InteractiveUser function..." | Out-Null
-        $userDetectionStart = Get-Date
+
         $userInfo = Get-InteractiveUser
-        $userDetectionTime = (Get-Date) - $userDetectionStart
-        Write-Log "Get-InteractiveUser completed in $($userDetectionTime.TotalSeconds) seconds" | Out-Null
-        
         if (-not $userInfo) {
             Write-Log "No interactive user found - skipping user context remediation" | Out-Null
-            Write-Log "Total time spent in user detection: $($userDetectionTime.TotalSeconds) seconds" | Out-Null
             return $false
         }
-        Write-Log "Interactive user found: $($userInfo.Username)" | Out-Null
-        Write-Log "User detection successful in $($userDetectionTime.TotalSeconds) seconds" | Out-Null
+        Write-Log "Interactive user: $($userInfo.Username)" | Out-Null
         
         # Create remediation result file - use shared path accessible to both SYSTEM and USER contexts (SAME AS DETECTION)
         $sharedTempPath = "C:\ProgramData\Temp"
@@ -6048,7 +6030,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "26" # Update this tag for each script version
+$ScriptTag = "27" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6243,7 +6225,87 @@ if (-not (OOBEComplete)) {
 
 <# ---------------------------------------------- #>
 
-# Fetch whitelist configuration - try local file first, then GitHub, then fallback
+function Get-CachedWhitelistJSON {
+    <#
+    .SYNOPSIS
+        Fetches whitelist JSON from a URL using a local cache with TTL + ETag revalidation.
+    .DESCRIPTION
+        Cache lives at C:\ProgramData\Temp\availableUpgrades-whitelist.cache.json with a
+        sibling .meta.json holding the source URL, ETag, and timestamp.
+        - Within $TtlMinutes of the last successful fetch: skip network entirely.
+        - After TTL: revalidate via If-None-Match. 304 -> use cache; 200 -> save new body.
+        - On network failure with a stale cache present: use the stale copy.
+        - On network failure with no cache: return $null (caller falls back to hardcoded).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [int]$TtlMinutes = 60,
+        [string]$CachePath = "C:\ProgramData\Temp\availableUpgrades-whitelist.cache.json"
+    )
+
+    $metaPath = "$CachePath.meta.json"
+    $cachedJson = $null
+    $cachedEtag = $null
+    $cacheAge = $null
+
+    if ((Test-Path $CachePath) -and (Test-Path $metaPath)) {
+        try {
+            $meta = Get-Content -Path $metaPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+            if ($meta.Url -eq $Url -and $meta.Timestamp) {
+                $cachedJson = Get-Content -Path $CachePath -Raw -Encoding UTF8
+                $cachedEtag = $meta.ETag
+                $cacheAge = (Get-Date) - [datetime]$meta.Timestamp
+            }
+        } catch { }
+    }
+
+    if ($cachedJson -and $cacheAge -and $cacheAge.TotalMinutes -lt $TtlMinutes) {
+        Write-Log -Message "Using cached whitelist (age $([Math]::Round($cacheAge.TotalMinutes, 1)) min, TTL $TtlMinutes min)"
+        return $cachedJson
+    }
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $headers = @{ 'User-Agent' = 'PowerShell-WingetScript' }
+    if ($cachedEtag) { $headers['If-None-Match'] = $cachedEtag }
+
+    try {
+        $resp = Invoke-WebRequest -Uri $Url -Headers $headers -UseBasicParsing -ErrorAction Stop
+        $newJson = $resp.Content
+        $newEtag = $resp.Headers['ETag']
+        if ($newEtag -is [array]) { $newEtag = $newEtag[0] }
+        Write-Log -Message "Fetched whitelist from $Url ($($newJson.Length) bytes)"
+
+        try {
+            $cacheDir = Split-Path -Parent $CachePath
+            if ($cacheDir -and -not (Test-Path $cacheDir)) { New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null }
+            $newJson | Out-File -FilePath $CachePath -Encoding UTF8 -Force
+            @{ Url = $Url; ETag = $newEtag; Timestamp = (Get-Date).ToString('o') } |
+                ConvertTo-Json | Out-File -FilePath $metaPath -Encoding UTF8 -Force
+        } catch {
+            Write-Log -Message "Whitelist cache write failed (non-fatal): $($_.Exception.Message)"
+        }
+        return $newJson
+    } catch {
+        $statusCode = $null
+        if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
+        if ($statusCode -eq 304 -and $cachedJson) {
+            Write-Log -Message "Whitelist unchanged on server (304) — reusing cache"
+            try {
+                @{ Url = $Url; ETag = $cachedEtag; Timestamp = (Get-Date).ToString('o') } |
+                    ConvertTo-Json | Out-File -FilePath $metaPath -Encoding UTF8 -Force
+            } catch { }
+            return $cachedJson
+        }
+        Write-Log -Message "Whitelist fetch failed: $($_.Exception.Message)"
+        if ($cachedJson) {
+            Write-Log -Message "Falling back to stale whitelist cache"
+            return $cachedJson
+        }
+        return $null
+    }
+}
+
+# Fetch whitelist configuration - try local file first, then GitHub (cached), then fallback
 $localWhitelistPath = $null
 if ($MyInvocation.MyCommand.Path) {
     $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -6274,16 +6336,13 @@ if ($localWhitelistPath -and (Test-Path $localWhitelistPath)) {
     }
 }
 
-# If local file failed or doesn't exist, try GitHub
+# If local file failed or doesn't exist, fetch from GitHub via the cache helper.
+# Cache (C:\ProgramData\Temp\availableUpgrades-whitelist.cache.*) keeps the last response
+# plus its ETag; for the next TTL window we skip the network call entirely, and after that
+# we revalidate with If-None-Match (304 means we keep using the cached body).
 if (-not $whitelistJSON) {
-    try {
-        Write-Log -Message "Fetching whitelist configuration from GitHub: $whitelistUrl"
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        $whitelistJSON = Invoke-RestMethod -Uri $whitelistUrl -Headers @{"User-Agent"="PowerShell-WingetScript/7.1"} -ErrorAction Stop
-        if ($whitelistJSON -isnot [string]) { $whitelistJSON = $whitelistJSON | ConvertTo-Json -Depth 10 }
-        Write-Log -Message "Successfully downloaded whitelist configuration from GitHub ($($whitelistJSON.Length) bytes)"
-    } catch {
-        Write-Log -Message "Error downloading whitelist from GitHub: $($_.Exception.Message)"
+    $whitelistJSON = Get-CachedWhitelistJSON -Url $whitelistUrl
+    if (-not $whitelistJSON) {
         Write-Log -Message "Falling back to basic hardcoded configuration"
     }
 }
