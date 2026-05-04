@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.24
- Tag: 24
+ Version: 9.25
+ Tag: 25
     
     Version History:
     1.0 - Initial version
@@ -89,6 +89,7 @@
     9.22 - FIX: When user-context remediation had nothing to do (typically because SYSTEM had already drained the task file) it exited without writing the result file. SYSTEM-side Schedule-UserContextRemediation then waited the full 600-second idle timeout for a heartbeat that never came (observed: 750-second hang, ~12 min wasted per cycle). Now the empty-work-list exit path writes a minimal result JSON (ProcessedApps=0, Success=true, Reason) so SYSTEM can stop waiting immediately.
     9.23 - FIX: SYSTEM-context remediation no longer skips user-context handoff when its own work list is empty. The handoff (Schedule-UserContextRemediation) was nested inside the `if ($LIST.Count -gt 0)` branch, so a task file containing only user-scoped entries (e.g. "0 routed to SYSTEM, 1 left for the other context") fell into the else branch and exited without ever launching the user-context task. Added a parallel handoff in the else branch gated on $Script:TasksForOtherContext > 0 (set during routing). Pairs with detect.ps1 v5.38 which now produces task files containing both scopes.
     9.24 - LOGGING: Made remediation log self-explanatory at the SYSTEM level. (a) Successful upgrades now report as `AppID (OK)` instead of bare AppID — previously success/failure was distinguishable only by the absence of a "(FAILED)/(ERROR)" suffix, which was easy to misread when the user-context task reported back. (b) Routing log now lists the actual AppIDs (with InstalledScope) for both the current context's work list AND the entries handed off to the other context, so SYSTEM log readers can see which apps the user-context task is about to attempt without needing the user-context log file.
+    9.25 - FIX: SYSTEM-context handoff to user-context remediation no longer runs when the task file contains zero user-scoped entries. The post-processing handoff (only reached when SYSTEM had work itself) was unconditional — every SYSTEM run that processed any machine-scoped app would also schedule a no-op user-context task, wasting ~3 minutes per cycle on heartbeat polling for nothing. Now gated on $Script:TasksForOtherContext > 0, matching the gate already on the empty-list else branch added in v9.23.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6040,7 +6041,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "24" # Update this tag for each script version
+$ScriptTag = "25" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -7588,22 +7589,28 @@ if ($LIST -and $LIST.Count -gt 0) {
             }
         }
 
-        # If we're in SYSTEM context and processed system apps, check for interactive session before scheduling user context
+        # If we're in SYSTEM context, hand off to user context only when the task file
+        # actually contains user-scoped entries. The unconditional handoff predated the
+        # task-file routing and would launch a no-op user-context task on every cycle
+        # that had only machine-scoped work.
         if ($Script:TestMode) {
             Write-Log -Message "TEST MODE: Skipping user context remediation scheduling (test app is system-only)"
         } elseif ((Test-RunningAsSystem) -and (-not $UserRemediationOnly)) {
-            Write-Log -Message "SYSTEM context processing complete - checking for interactive session"
-
-            if (-not (Test-InteractiveSession)) {
-                Write-Log -Message "No interactive session detected - skipping user context remediation"
-                Write-Log -Message "[$ScriptTag] Remediation completed: $count apps processed (system only, no interactive session)"
+            if ($Script:TasksForOtherContext -le 0) {
+                Write-Log -Message "SYSTEM context processing complete - no user-scoped tasks in task file, skipping user context handoff"
             } else {
-                Write-Log -Message "Interactive session confirmed - scheduling user context remediation"
-                $userScheduled = Schedule-UserContextRemediation
-                if ($userScheduled) {
-                    Write-Log -Message "User context remediation scheduled successfully"
+                Write-Log -Message "SYSTEM context processing complete - $($Script:TasksForOtherContext) task(s) routed to user context, checking for interactive session"
+                if (-not (Test-InteractiveSession)) {
+                    Write-Log -Message "No interactive session detected - skipping user context remediation"
+                    Write-Log -Message "[$ScriptTag] Remediation completed: $count apps processed (system only, no interactive session)"
                 } else {
-                    Write-Log -Message "User context remediation scheduling failed"
+                    Write-Log -Message "Interactive session confirmed - scheduling user context remediation"
+                    $userScheduled = Schedule-UserContextRemediation
+                    if ($userScheduled) {
+                        Write-Log -Message "User context remediation scheduled successfully"
+                    } else {
+                        Write-Log -Message "User context remediation scheduling failed"
+                    }
                 }
             }
         }
