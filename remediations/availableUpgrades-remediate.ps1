@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.25
- Tag: 25
+ Version: 9.26
+ Tag: 26
     
     Version History:
     1.0 - Initial version
@@ -90,6 +90,7 @@
     9.23 - FIX: SYSTEM-context remediation no longer skips user-context handoff when its own work list is empty. The handoff (Schedule-UserContextRemediation) was nested inside the `if ($LIST.Count -gt 0)` branch, so a task file containing only user-scoped entries (e.g. "0 routed to SYSTEM, 1 left for the other context") fell into the else branch and exited without ever launching the user-context task. Added a parallel handoff in the else branch gated on $Script:TasksForOtherContext > 0 (set during routing). Pairs with detect.ps1 v5.38 which now produces task files containing both scopes.
     9.24 - LOGGING: Made remediation log self-explanatory at the SYSTEM level. (a) Successful upgrades now report as `AppID (OK)` instead of bare AppID — previously success/failure was distinguishable only by the absence of a "(FAILED)/(ERROR)" suffix, which was easy to misread when the user-context task reported back. (b) Routing log now lists the actual AppIDs (with InstalledScope) for both the current context's work list AND the entries handed off to the other context, so SYSTEM log readers can see which apps the user-context task is about to attempt without needing the user-context log file.
     9.25 - FIX: SYSTEM-context handoff to user-context remediation no longer runs when the task file contains zero user-scoped entries. The post-processing handoff (only reached when SYSTEM had work itself) was unconditional — every SYSTEM run that processed any machine-scoped app would also schedule a no-op user-context task, wasting ~3 minutes per cycle on heartbeat polling for nothing. Now gated on $Script:TasksForOtherContext > 0, matching the gate already on the empty-list else branch added in v9.23.
+    9.26 - PERF: Two startup/per-app cost reductions. (a) Orphan marker cleanup no longer calls Get-InteractiveUser to find the user temp dir — replaced with a disk enumeration of C:\Users\* (skipping well-known non-user profile dirs). The CIM call costs ~7s on Azure AD machines and was the first thing every Intune cycle paid for; disk enumeration is sub-millisecond and additionally catches orphans from any user profile rather than just the active one. (b) Post-upgrade verification (the `winget list --exact` re-query that costs ~1.5s per upgraded app) is now opt-in via a new whitelist `RequiresPostVerify: true` flag. Originally added in v8.8 for Adobe Reader's silent-failure pattern; Adobe Reader is now disabled in the whitelist, so the cost was being paid on every enabled app to protect against a problem none of them have. Apps that need the safety net can opt back in by setting the flag.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -5883,17 +5884,23 @@ function Clear-OrphanedMarkerFiles {
                 "$env:SystemRoot\Temp"
             )
             
-            # Add user-specific temp if we can detect the user
+            # Enumerate user profile temp dirs from disk instead of calling Get-InteractiveUser.
+            # The CIM-based user detection costs ~7s on Azure AD machines and we'd be paying it
+            # at the very start of every Intune cycle just to find one path; disk enumeration
+            # is sub-millisecond and also catches orphans from any user profile, not just the
+            # currently active one. Skip well-known non-user profile dirs.
             try {
-                $userInfo = Get-InteractiveUser -ErrorAction SilentlyContinue
-                if ($userInfo -and $userInfo.Username) {
-                    $userTemp = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
-                    if ((Test-Path $userTemp) -and ($ScanLocations -notcontains $userTemp)) {
-                        $ScanLocations += $userTemp
+                $skipProfiles = @('Default', 'Default User', 'DefaultUser', 'All Users', 'Public', 'defaultuser0', 'WDAGUtilityAccount')
+                Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $skipProfiles -notcontains $_.Name } |
+                    ForEach-Object {
+                        $userTemp = Join-Path $_.FullName 'AppData\Local\Temp'
+                        if ((Test-Path $userTemp) -and ($ScanLocations -notcontains $userTemp)) {
+                            $ScanLocations += $userTemp
+                        }
                     }
-                }
             } catch {
-                # Ignore errors in user detection during cleanup
+                # Ignore — orphan cleanup is best-effort
             }
         }
         
@@ -6041,7 +6048,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "25" # Update this tag for each script version
+$ScriptTag = "26" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -7492,8 +7499,15 @@ if ($LIST -and $LIST.Count -gt 0) {
                         }
                         Write-Log -Message "Initial success evaluation for $($appInfo.AppID): isSuccess=$isSuccess, reason=$successReason, LASTEXITCODE=$LASTEXITCODE, outputLength=$($upgradeOutput.Length)"
 
-                        # Post-upgrade verification: confirm via winget list --exact that the update actually took effect
-                        if ($isSuccess -and -not $Script:TestMode) {
+                        # Post-upgrade verification: confirm via winget list --exact that the update actually took effect.
+                        # Originally added (v8.8) for Adobe Reader's exit-code-0-but-no-version-change behavior. The
+                        # extra winget list pass costs ~1.5s per app, so it is now opt-in via the whitelist
+                        # `RequiresPostVerify` flag — set true only on apps known to lie about success.
+                        $needsPostVerify = $false
+                        if ($okapp -and $okapp.PSObject.Properties['RequiresPostVerify'] -and $okapp.RequiresPostVerify -eq $true) {
+                            $needsPostVerify = $true
+                        }
+                        if ($isSuccess -and -not $Script:TestMode -and $needsPostVerify) {
                             try {
                                 $verifyExe = if ((Test-RunningAsSystem) -and $WingetPath) { Join-Path $WingetPath "winget.exe" } else { "winget.exe" }
                                 $verifyArgs = @("list", "--id", $appInfo.AppID, "--exact", "--source", "winget", "--accept-source-agreements")

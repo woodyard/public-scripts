@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.40
-    Tag: 70
+    Version: 5.41
+    Tag: 71
     
     Version History:
     1.0 - Initial version
@@ -87,6 +87,7 @@
     5.38 - FIX: SYSTEM-context detection no longer skips user-context detection when system apps are found. The v5.19 "performance optimization" caused the task file to omit user-scoped upgrades on any machine that also had a system-scoped upgrade pending, leaving them indefinitely undone (remediate.ps1 now relies solely on the task file). New flow: always run user-context detection when an interactive session exists, then merge system + user records by AppID into a single task file. SYSTEM record wins on AppID conflict so the more accurate InstalledScope (HKLM + HKU\SID) is preserved.
     5.39 - FIX: Detection script's last stdout line is now always the [ScriptTag] summary so Intune reads the right detection result. Previously Write-UpgradeTaskFile and Remove-UpgradeTaskFile (both non-debug) ran AFTER the summary, so on some runs the final visible line was "Wrote upgrade task file with N tasks" or "Removed upgrade task file" instead of the upgrade-list/no-upgrade summary, which Intune surfaces as the detection state. Reordered all four main exit paths (SYSTEM merged-apps, SYSTEM no-apps, direct-user apps-found, direct-user no-apps, plus the no-winget-output path) to do task-file IO first and emit the [ScriptTag] line last.
     5.40 - FIX: Get-AppInstalledScope was returning "unknown" for apps like Google.Chrome whose registry layout doesn't fit the simple "DisplayName contains FriendlyName, hive determines scope" model. Two improvements: (a) search by multiple terms — FriendlyName plus AppID parts (e.g. "Google Chrome", "Chrome", "Google") — so apps where the whitelist FriendlyName doesn't substring-match the registry DisplayName are still found; (b) use InstallLocation as the authoritative scope signal. A binary in C:\Users\...\AppData\... is per-user even when the uninstall key sits in HKLM, and a Program Files install is machine-wide even when the uninstall key sits in HKCU. Hive membership is now only the fallback when InstallLocation is empty. When both scopes show installs, prefer "machine" so SYSTEM remediation runs (covers the Program Files binary; the per-user copy comes along via the same upgrade).
+    5.41 - PERF: Orphan marker cleanup at startup no longer calls Get-InteractiveUser to find the user temp dir — replaced with a disk enumeration of C:\Users\* (skipping well-known non-user profile dirs). The CIM-based user detection costs ~7s on Azure AD machines and was the first thing every Intune cycle paid for; disk enumeration is sub-millisecond and additionally catches orphans from any user profile rather than just the active one.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -442,17 +443,23 @@ function Clear-OrphanedMarkerFiles {
                 "$env:SystemRoot\Temp"
             )
             
-            # Add user-specific temp if we can detect the user
+            # Enumerate user profile temp dirs from disk instead of calling Get-InteractiveUser.
+            # The CIM-based user detection costs ~7s on Azure AD machines and we'd be paying it
+            # at the very start of every Intune cycle just to find one path; disk enumeration
+            # is sub-millisecond and also catches orphans from any user profile, not just the
+            # currently active one. Skip well-known non-user profile dirs.
             try {
-                $userInfo = Get-InteractiveUser -ErrorAction SilentlyContinue
-                if ($userInfo -and $userInfo.Username) {
-                    $userTemp = "C:\Users\$($userInfo.Username)\AppData\Local\Temp"
-                    if ((Test-Path $userTemp) -and ($ScanLocations -notcontains $userTemp)) {
-                        $ScanLocations += $userTemp
+                $skipProfiles = @('Default', 'Default User', 'DefaultUser', 'All Users', 'Public', 'defaultuser0', 'WDAGUtilityAccount')
+                Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $skipProfiles -notcontains $_.Name } |
+                    ForEach-Object {
+                        $userTemp = Join-Path $_.FullName 'AppData\Local\Temp'
+                        if ((Test-Path $userTemp) -and ($ScanLocations -notcontains $userTemp)) {
+                            $ScanLocations += $userTemp
+                        }
                     }
-                }
             } catch {
-                # Ignore errors in user detection during cleanup
+                # Ignore — orphan cleanup is best-effort
             }
         }
         
@@ -1480,7 +1487,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "70" # Update this tag for each script version
+$ScriptTag = "71" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
