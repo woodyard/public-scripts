@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.38
-    Tag: 68
+    Version: 5.39
+    Tag: 69
     
     Version History:
     1.0 - Initial version
@@ -85,6 +85,7 @@
     5.36 - FIX: SYSTEM-context flow was deleting the task file and reporting "No upgrades available" even when user-context detection found apps. Two issues: (a) PS5.1's ConvertFrom-Json unwraps single-element arrays, so $results.Apps for one task became a bare PSCustomObject with no .Count property, making `.Count -gt 0` false; (b) Invoke-UserContextDetection's return value was polluted by unsuppressed Write-Log output and cmdlet objects, so $userApps was a heterogeneous mix rather than just the apps. Both fixed: @() wrap inside the function for array context, and a Where-Object filter at the call site to keep only records that have an AppID.
     5.37 - FIX: Get-AppInstalledScope was silently returning "unknown" for Firefox when called from SYSTEM-context Write-UpgradeTaskFile (task file showed InstalledScope="unknown" despite Firefox being in HKLM uninstall). Replaced the `Get-ChildItem | Get-ItemProperty | Where-Object` pipeline with the more robust `Get-ItemProperty <path>\*` wildcard form — empirically the pipeline can short-circuit silently in some SYSTEM-context environments, the wildcard form does not. Also added match-count diagnostic logging (machine matches=N, user matches=N -> scope) so future drift is visible in the log without needing to instrument.
     5.38 - FIX: SYSTEM-context detection no longer skips user-context detection when system apps are found. The v5.19 "performance optimization" caused the task file to omit user-scoped upgrades on any machine that also had a system-scoped upgrade pending, leaving them indefinitely undone (remediate.ps1 now relies solely on the task file). New flow: always run user-context detection when an interactive session exists, then merge system + user records by AppID into a single task file. SYSTEM record wins on AppID conflict so the more accurate InstalledScope (HKLM + HKU\SID) is preserved.
+    5.39 - FIX: Detection script's last stdout line is now always the [ScriptTag] summary so Intune reads the right detection result. Previously Write-UpgradeTaskFile and Remove-UpgradeTaskFile (both non-debug) ran AFTER the summary, so on some runs the final visible line was "Wrote upgrade task file with N tasks" or "Removed upgrade task file" instead of the upgrade-list/no-upgrade summary, which Intune surfaces as the detection state. Reordered all four main exit paths (SYSTEM merged-apps, SYSTEM no-apps, direct-user apps-found, direct-user no-apps, plus the no-winget-output path) to do task-file IO first and emit the [ScriptTag] line last.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -1429,7 +1430,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "68" # Update this tag for each script version
+$ScriptTag = "69" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -2149,52 +2150,57 @@ if ($LIST -and $LIST.Count -gt 0) {
             Write-Log -Message "Merged detection: $($systemApps.Count) system + $($userApps.Count) user = $($mergedApps.Count) unique apps"
 
             if ($mergedApps.Count -gt 0) {
-                Write-Log -Message "[$ScriptTag] $(Format-AppList $mergedApps)"
-                if ($deferredApps.Count -gt 0) {
-                    Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
-                }
+                # Write the task file BEFORE the [ScriptTag] summary so the summary line is the
+                # last non-debug line on stdout — Intune reads the final stdout line as the
+                # detection result.
                 Write-UpgradeTaskFile -Records $mergedApps
                 Write-Log -Message "Performing marker file cleanup before exit (merged apps found)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "Merged apps found, triggering remediation"
+                if ($deferredApps.Count -gt 0) {
+                    Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
+                }
+                Write-Log -Message "[$ScriptTag] $(Format-AppList $mergedApps)"
                 exit 1  # Trigger remediation
             } else {
+                Remove-UpgradeTaskFile -Reason "No upgrades available"
+                Write-Log -Message "Performing marker file cleanup before exit (no upgrades found)" -IsDebug
+                Invoke-MarkerFileEmergencyCleanup -Reason "No upgrades available in any context"
                 if ($deferredApps.Count -gt 0) {
                     Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
                 }
                 Write-Log -Message "[$ScriptTag] No upgrades available in any context"
-                Remove-UpgradeTaskFile -Reason "No upgrades available"
-                Write-Log -Message "Performing marker file cleanup before exit (no upgrades found)" -IsDebug
-                Invoke-MarkerFileEmergencyCleanup -Reason "No upgrades available in any context"
                 exit 0
             }
-            
+
         } else {
             Write-Log -Message "DEBUG: *** TAKING DIRECT USER CONTEXT EXECUTION PATH ***" -IsDebug
             Write-Log -Message "DEBUG: This path is for direct user context execution (not scheduled task)" -IsDebug
             # Direct user context execution
             if ($contextApps.Count -gt 0) {
-                Write-Log -Message "[$ScriptTag] $(Format-AppList $contextApps)"
-                if ($deferredApps.Count -gt 0) {
-                    Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
-                }
+                # Write the task file BEFORE the [ScriptTag] summary — Intune reads the final
+                # stdout line as the detection result, so the summary must come last.
                 Write-UpgradeTaskFile -Records $contextApps
                 Write-Log -Message "Performing marker file cleanup before exit (direct user context apps found)" -IsDebug
                 Invoke-MarkerFileEmergencyCleanup -Reason "Direct user context apps found"
+                if ($deferredApps.Count -gt 0) {
+                    Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
+                }
+                Write-Log -Message "[$ScriptTag] $(Format-AppList $contextApps)"
                 exit 1  # Trigger remediation
             } else {
+                Remove-UpgradeTaskFile -Reason "No user context upgrades available"
+                Write-Log -Message "Performing marker file cleanup before exit (no user context upgrades)" -IsDebug
+                Invoke-MarkerFileEmergencyCleanup -Reason "No user context upgrades available"
                 if ($deferredApps.Count -gt 0) {
                     Write-Log -Message "[$ScriptTag] Deferred: $($deferredApps -join ', ')"
                 }
                 Write-Log -Message "[$ScriptTag] No user context upgrades available"
-                Remove-UpgradeTaskFile -Reason "No user context upgrades available"
-                Write-Log -Message "Performing marker file cleanup before exit (no user context upgrades)" -IsDebug
-                Invoke-MarkerFileEmergencyCleanup -Reason "No user context upgrades available"
                 exit 0
             }
         }
 } else {
-    Write-Log -Message "[$ScriptTag] No upgrades found in winget output"
     Remove-UpgradeTaskFile -Reason "No upgrades in winget output"
+    Write-Log -Message "[$ScriptTag] No upgrades found in winget output"
     Write-Log -Message "Performing final marker file cleanup before script exit" -IsDebug
     Invoke-MarkerFileEmergencyCleanup -Reason "Script completion (no upgrades found)"
     exit 0
