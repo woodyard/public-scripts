@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Winget Application Update Detection Script
 
@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.45
-    Tag: 75
+    Version: 5.46
+    Tag: 76
     
     Version History:
     1.0 - Initial version
@@ -78,20 +78,21 @@
     5.29 - FEATURE: Added category-based whitelist defaults; supports new { CategoryDefaults, Apps } JSON structure with backward compatibility for legacy flat array format
     5.30 - FIX: Detection script now cleans up stale temp files and orphaned scheduled tasks from both detection and remediation scripts; expanded Remove-OldTempFiles to scan user temp directories with 10-minute cutoff; added Remove-StaleScheduledTasks to remove orphaned tasks from all known prefixes; ensures cleanup runs every Intune check cycle even when remediation is not triggered
     5.31 - FIX: Added --scope user dual-listing to SYSTEM context detection so apps like Perplexity.Comet (user-scoped in winget but installed to Program Files) are detected and trigger remediation in SYSTEM context
-    5.32 - REVERT: Removed --scope user from SYSTEM context detection — SYSTEM cannot see user-registered winget packages; user context detection already handles this via scheduled task
+    5.32 - REVERT: Removed --scope user from SYSTEM context detection - SYSTEM cannot see user-registered winget packages; user context detection already handles this via scheduled task
     5.33 - FIX: User-context detection now runs BOTH the default `winget upgrade` listing AND `--scope user`, then merges by AppID. Previously it only ran `--scope user`, which misses apps like Mozilla.Firefox that winget tracks under the user account but installs machine-wide (C:\Program Files). Such apps were invisible to BOTH SYSTEM (per-user tracking gap) and user `--scope user` (filter excludes machine-installed binaries), so detection never reported them and remediation was never triggered. Mirrors the dual-listing logic remediate.ps1 has used since v9.11.
     5.34 - REFACTOR: Detection now writes a static task file (C:\ProgramData\Temp\availableUpgrades-tasks.json) listing the upgrades it found, so remediate.ps1 can use it as an authoritative work list and skip its own discovery pass. ConvertFrom-WingetOutput now returns full records (AppID + CurrentVersion + AvailableVersion) so the task file carries version info for dialogs without a second winget query. Added Get-RecordAppId and Format-AppList helpers to keep logging readable across the heterogeneous record types (string, hashtable, PSCustomObject from ConvertFrom-Json).
     5.35 - FEATURE: Each task entry now records InstalledScope (machine/user/unknown) determined via the registry uninstall keys (HKLM + HKU\SID under SYSTEM, HKLM + HKCU under user). Lets remediate.ps1 route entries to the right context without re-walking the registry per app. Get-AppInstalledScope ported from remediate.ps1 with HKCU support added for the user-context path.
     5.36 - FIX: SYSTEM-context flow was deleting the task file and reporting "No upgrades available" even when user-context detection found apps. Two issues: (a) PS5.1's ConvertFrom-Json unwraps single-element arrays, so $results.Apps for one task became a bare PSCustomObject with no .Count property, making `.Count -gt 0` false; (b) Invoke-UserContextDetection's return value was polluted by unsuppressed Write-Log output and cmdlet objects, so $userApps was a heterogeneous mix rather than just the apps. Both fixed: @() wrap inside the function for array context, and a Where-Object filter at the call site to keep only records that have an AppID.
-    5.37 - FIX: Get-AppInstalledScope was silently returning "unknown" for Firefox when called from SYSTEM-context Write-UpgradeTaskFile (task file showed InstalledScope="unknown" despite Firefox being in HKLM uninstall). Replaced the `Get-ChildItem | Get-ItemProperty | Where-Object` pipeline with the more robust `Get-ItemProperty <path>\*` wildcard form — empirically the pipeline can short-circuit silently in some SYSTEM-context environments, the wildcard form does not. Also added match-count diagnostic logging (machine matches=N, user matches=N -> scope) so future drift is visible in the log without needing to instrument.
+    5.37 - FIX: Get-AppInstalledScope was silently returning "unknown" for Firefox when called from SYSTEM-context Write-UpgradeTaskFile (task file showed InstalledScope="unknown" despite Firefox being in HKLM uninstall). Replaced the `Get-ChildItem | Get-ItemProperty | Where-Object` pipeline with the more robust `Get-ItemProperty <path>\*` wildcard form - empirically the pipeline can short-circuit silently in some SYSTEM-context environments, the wildcard form does not. Also added match-count diagnostic logging (machine matches=N, user matches=N -> scope) so future drift is visible in the log without needing to instrument.
     5.38 - FIX: SYSTEM-context detection no longer skips user-context detection when system apps are found. The v5.19 "performance optimization" caused the task file to omit user-scoped upgrades on any machine that also had a system-scoped upgrade pending, leaving them indefinitely undone (remediate.ps1 now relies solely on the task file). New flow: always run user-context detection when an interactive session exists, then merge system + user records by AppID into a single task file. SYSTEM record wins on AppID conflict so the more accurate InstalledScope (HKLM + HKU\SID) is preserved.
     5.39 - FIX: Detection script's last stdout line is now always the [ScriptTag] summary so Intune reads the right detection result. Previously Write-UpgradeTaskFile and Remove-UpgradeTaskFile (both non-debug) ran AFTER the summary, so on some runs the final visible line was "Wrote upgrade task file with N tasks" or "Removed upgrade task file" instead of the upgrade-list/no-upgrade summary, which Intune surfaces as the detection state. Reordered all four main exit paths (SYSTEM merged-apps, SYSTEM no-apps, direct-user apps-found, direct-user no-apps, plus the no-winget-output path) to do task-file IO first and emit the [ScriptTag] line last.
-    5.40 - FIX: Get-AppInstalledScope was returning "unknown" for apps like Google.Chrome whose registry layout doesn't fit the simple "DisplayName contains FriendlyName, hive determines scope" model. Two improvements: (a) search by multiple terms — FriendlyName plus AppID parts (e.g. "Google Chrome", "Chrome", "Google") — so apps where the whitelist FriendlyName doesn't substring-match the registry DisplayName are still found; (b) use InstallLocation as the authoritative scope signal. A binary in C:\Users\...\AppData\... is per-user even when the uninstall key sits in HKLM, and a Program Files install is machine-wide even when the uninstall key sits in HKCU. Hive membership is now only the fallback when InstallLocation is empty. When both scopes show installs, prefer "machine" so SYSTEM remediation runs (covers the Program Files binary; the per-user copy comes along via the same upgrade).
-    5.41 - PERF: Orphan marker cleanup at startup no longer calls Get-InteractiveUser to find the user temp dir — replaced with a disk enumeration of C:\Users\* (skipping well-known non-user profile dirs). The CIM-based user detection costs ~7s on Azure AD machines and was the first thing every Intune cycle paid for; disk enumeration is sub-millisecond and additionally catches orphans from any user profile rather than just the active one.
+    5.40 - FIX: Get-AppInstalledScope was returning "unknown" for apps like Google.Chrome whose registry layout doesn't fit the simple "DisplayName contains FriendlyName, hive determines scope" model. Two improvements: (a) search by multiple terms - FriendlyName plus AppID parts (e.g. "Google Chrome", "Chrome", "Google") - so apps where the whitelist FriendlyName doesn't substring-match the registry DisplayName are still found; (b) use InstallLocation as the authoritative scope signal. A binary in C:\Users\...\AppData\... is per-user even when the uninstall key sits in HKLM, and a Program Files install is machine-wide even when the uninstall key sits in HKCU. Hive membership is now only the fallback when InstallLocation is empty. When both scopes show installs, prefer "machine" so SYSTEM remediation runs (covers the Program Files binary; the per-user copy comes along via the same upgrade).
+    5.41 - PERF: Orphan marker cleanup at startup no longer calls Get-InteractiveUser to find the user temp dir - replaced with a disk enumeration of C:\Users\* (skipping well-known non-user profile dirs). The CIM-based user detection costs ~7s on Azure AD machines and was the first thing every Intune cycle paid for; disk enumeration is sub-millisecond and additionally catches orphans from any user profile rather than just the active one.
     5.42 - FIX: Get-AppInstalledScope returned "unknown" for Notepad++ (and likely other apps) on ARM64 because the `Get-ItemProperty <basepath>\*` wildcard form silently returned $null when -ErrorAction SilentlyContinue swallowed a single bad subkey. Replaced with explicit per-subkey enumeration: Get-ChildItem to list subkeys, then Get-ItemProperty per subkey wrapped in try/catch so individual unreadable entries don't abort the whole walk. Also extended the match function to check PSChildName (the literal subkey name, e.g. "Notepad++") in addition to DisplayName, providing a second signal when DisplayName is missing or formatted unexpectedly. Confirmed via diagnostic log line "machine hits=0, user hits=0" for Notepad++.Notepad++ that the previous walk found nothing.
-    5.43 - FIX: Notepad++ still returned "unknown" after v5.42 because the underlying problem was WoW64 redirection, not enumeration. When this script runs in a 32-bit PowerShell host (Intune Remediation policies default to 32-bit unless "Run script in 64-bit PowerShell host" is enabled), accesses to HKLM:\SOFTWARE\... are silently redirected to WOW6432Node, hiding native 64-bit and ARM64 uninstall entries entirely. Listing WOW6432Node explicitly didn't help — that's still the same redirected view a 32-bit process gets when reading SOFTWARE\. Switched the registry walk to [Microsoft.Win32.RegistryKey]::OpenBaseKey() with explicit Registry64 and Registry32 views for HKLM, and Default view for HKU/HKCU (user hives have no 32/64 split). This bypasses the WoW64 redirector and guarantees both views are read regardless of host process architecture. Diagnostic log line now also includes [32-bit host] / [64-bit host] for visibility.
-    5.44 - PERF: Two cost reductions. (a) Get-InteractiveUser now uses Get-Process explorer -IncludeUserName as the PRIMARY detection method (~50ms) and falls back to Win32_ComputerSystem (~5s) only when Explorer isn't running. Explorer is the desktop shell so its owner is by definition the interactive user — same answer as the WMI Username property in 99%+ of sessions, much faster. (b) Whitelist fetch now uses an on-disk cache (C:\ProgramData\Temp\availableUpgrades-whitelist.cache.*) with a 60-min TTL plus ETag/If-Modified-Since revalidation. Within the TTL window we skip the network entirely; after TTL we send If-None-Match and reuse the cached body on a 304. Reduces external dependency from once-per-cycle to at most once-per-hour. Stale cache is also used as a fallback when the network is unavailable.
+    5.43 - FIX: Notepad++ still returned "unknown" after v5.42 because the underlying problem was WoW64 redirection, not enumeration. When this script runs in a 32-bit PowerShell host (Intune Remediation policies default to 32-bit unless "Run script in 64-bit PowerShell host" is enabled), accesses to HKLM:\SOFTWARE\... are silently redirected to WOW6432Node, hiding native 64-bit and ARM64 uninstall entries entirely. Listing WOW6432Node explicitly didn't help - that's still the same redirected view a 32-bit process gets when reading SOFTWARE\. Switched the registry walk to [Microsoft.Win32.RegistryKey]::OpenBaseKey() with explicit Registry64 and Registry32 views for HKLM, and Default view for HKU/HKCU (user hives have no 32/64 split). This bypasses the WoW64 redirector and guarantees both views are read regardless of host process architecture. Diagnostic log line now also includes [32-bit host] / [64-bit host] for visibility.
+    5.44 - PERF: Two cost reductions. (a) Get-InteractiveUser now uses Get-Process explorer -IncludeUserName as the PRIMARY detection method (~50ms) and falls back to Win32_ComputerSystem (~5s) only when Explorer isn't running. Explorer is the desktop shell so its owner is by definition the interactive user - same answer as the WMI Username property in 99%+ of sessions, much faster. (b) Whitelist fetch now uses an on-disk cache (C:\ProgramData\Temp\availableUpgrades-whitelist.cache.*) with a 60-min TTL plus ETag/If-Modified-Since revalidation. Within the TTL window we skip the network entirely; after TTL we send If-None-Match and reuse the cached body on a 304. Reduces external dependency from once-per-cycle to at most once-per-hour. Stale cache is also used as a fallback when the network is unavailable.
     5.45 - TUNE: Whitelist cache TTL bumped from 60 min to 36 hours (2160 min). At a once-a-day client cadence the 60-min default never reached the fast-path (cache always >60 min old at next run, always revalidated). 36 h is comfortably longer than a daily cycle including check-in jitter, so the fast-path normally hits and we skip the network entirely. Whitelist edits propagate within ~1.5 days worst case.
+    5.46 - FIX: Stripped em-dashes/en-dashes (U+2014, U+2013) from the script and saved with a UTF-8 BOM. Without a BOM, PowerShell 5.1 reads the file as Windows-1252 and the multi-byte UTF-8 sequence for an em-dash decodes to bytes 0xE2 0x80 0x94 - byte 0x94 is a right-quote in Windows-1252 which terminated string literals early and broke the parser ("Unexpected token" cascade starting from the Get-CachedWhitelistJSON function added in 5.44). All Unicode dashes replaced with ASCII hyphen-minus.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -463,7 +464,7 @@ function Clear-OrphanedMarkerFiles {
                         }
                     }
             } catch {
-                # Ignore — orphan cleanup is best-effort
+                # Ignore - orphan cleanup is best-effort
             }
         }
         
@@ -826,7 +827,7 @@ function Get-AppInstalledScope {
         keys for entries whose DisplayName matches one of several search terms derived
         from the FriendlyName and the AppID (e.g. "Google.Chrome" -> "Google Chrome",
         "Chrome", "Google"). For each match found the function then inspects
-        InstallLocation as the authoritative scope signal — a binary living in the user
+        InstallLocation as the authoritative scope signal - a binary living in the user
         profile is per-user even if the uninstall key happens to be in HKLM, and a
         Program Files install is machine-wide even if the uninstall key is in HKCU
         (Chrome and similar apps that mix per-user winget metadata with machine binaries).
@@ -860,7 +861,7 @@ function Get-AppInstalledScope {
             param($e)
             foreach ($t in $searchTerms) {
                 if ($e.DisplayName -and $e.DisplayName -like "*$t*") { return $true }
-                # Also match the subkey name itself — for many apps (e.g. "Notepad++") the
+                # Also match the subkey name itself - for many apps (e.g. "Notepad++") the
                 # uninstall key is literally named after the product. This is a second signal
                 # independent of DisplayName, useful when DisplayName is missing or differs.
                 if ($e.PSChildName -and $e.PSChildName -like "*$t*") { return $true }
@@ -904,7 +905,7 @@ function Get-AppInstalledScope {
 
         $hostBits = if ([Environment]::Is64BitProcess) { "64-bit" } else { "32-bit" }
         $machineHits = New-Object System.Collections.Generic.List[object]
-        # Read both 64-bit and 32-bit views of HKLM\SOFTWARE\...\Uninstall — Registry64 is the
+        # Read both 64-bit and 32-bit views of HKLM\SOFTWARE\...\Uninstall - Registry64 is the
         # native ARM64/x64 view, Registry32 is the WOW6432Node 32-bit view.
         foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
             try {
@@ -919,7 +920,7 @@ function Get-AppInstalledScope {
             }
         }
 
-        # User-scope uninstall registry — open via the same explicit-view API so a 32-bit
+        # User-scope uninstall registry - open via the same explicit-view API so a 32-bit
         # host doesn't get redirected. From SYSTEM context we open the interactive user's
         # hive under HKEY_USERS\<SID>; from user context we open HKCU directly.
         $userHits = New-Object System.Collections.Generic.List[object]
@@ -973,7 +974,7 @@ function Get-AppInstalledScope {
         } elseif ($installLocHints.user -gt 0 -and $installLocHints.machine -eq 0) {
             $resolvedScope = "user"; $decisionBy = "InstallLocation"
         } elseif ($installLocHints.machine -gt 0 -and $installLocHints.user -gt 0) {
-            # Both scopes installed — let SYSTEM handle it (machine wins) so the user
+            # Both scopes installed - let SYSTEM handle it (machine wins) so the user
             # binary is also covered if Program Files is the active install.
             $resolvedScope = "machine"; $decisionBy = "InstallLocation(both)"
         } elseif ($machineHits.Count -gt 0 -and $userHits.Count -eq 0) {
@@ -1011,7 +1012,7 @@ function Format-AppList {
     <#
     .SYNOPSIS
         Formats a heterogeneous app list (strings, hashtables, PSCustomObjects) as a
-        comma-separated AppID string for logging — avoids "System.Collections.Hashtable" noise.
+        comma-separated AppID string for logging - avoids "System.Collections.Hashtable" noise.
     #>
     param([object[]]$Apps)
     if (-not $Apps -or $Apps.Count -eq 0) { return "" }
@@ -1545,7 +1546,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "75" # Update this tag for each script version
+$ScriptTag = "76" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -1619,7 +1620,7 @@ if (-not $whitelistUrl -and $global:whitelistUrl) {
     Write-Log -Message "Restored whitelistUrl from global scope: $whitelistUrl"
 }
 
-# Early marker file check — restore whitelistUrl BEFORE whitelist loading
+# Early marker file check - restore whitelistUrl BEFORE whitelist loading
 # (scheduled task child process needs this to use the correct whitelist source)
 if ($MyInvocation.MyCommand.Path) {
     $earlyMarkerFile = "$($MyInvocation.MyCommand.Path).userdetection"
@@ -1648,7 +1649,7 @@ function Get-CachedWhitelistJSON {
     #>
     param(
         [Parameter(Mandatory)][string]$Url,
-        [int]$TtlMinutes = 2160,   # 36 hours — longer than a daily cycle so the fast-path normally hits
+        [int]$TtlMinutes = 2160,   # 36 hours - longer than a daily cycle so the fast-path normally hits
         [string]$CachePath = "C:\ProgramData\Temp\availableUpgrades-whitelist.cache.json"
     )
 
@@ -1668,7 +1669,7 @@ function Get-CachedWhitelistJSON {
         } catch { }
     }
 
-    # Fresh cache window — skip network entirely.
+    # Fresh cache window - skip network entirely.
     if ($cachedJson -and $cacheAge -and $cacheAge.TotalMinutes -lt $TtlMinutes) {
         Write-Log -Message "Using cached whitelist (age $([Math]::Round($cacheAge.TotalMinutes, 1)) min, TTL $TtlMinutes min)"
         return $cachedJson
@@ -1702,7 +1703,7 @@ function Get-CachedWhitelistJSON {
         $statusCode = $null
         if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
         if ($statusCode -eq 304 -and $cachedJson) {
-            Write-Log -Message "Whitelist unchanged on server (304) — reusing cache"
+            Write-Log -Message "Whitelist unchanged on server (304) - reusing cache"
             try {
                 @{ Url = $Url; ETag = $cachedEtag; Timestamp = (Get-Date).ToString('o') } |
                     ConvertTo-Json | Out-File -FilePath $metaPath -Encoding UTF8 -Force
@@ -2343,7 +2344,7 @@ if ($LIST -and $LIST.Count -gt 0) {
 
             if ($mergedApps.Count -gt 0) {
                 # Write the task file BEFORE the [ScriptTag] summary so the summary line is the
-                # last non-debug line on stdout — Intune reads the final stdout line as the
+                # last non-debug line on stdout - Intune reads the final stdout line as the
                 # detection result.
                 Write-UpgradeTaskFile -Records $mergedApps
                 Write-Log -Message "Performing marker file cleanup before exit (merged apps found)" -IsDebug
@@ -2369,7 +2370,7 @@ if ($LIST -and $LIST.Count -gt 0) {
             Write-Log -Message "DEBUG: This path is for direct user context execution (not scheduled task)" -IsDebug
             # Direct user context execution
             if ($contextApps.Count -gt 0) {
-                # Write the task file BEFORE the [ScriptTag] summary — Intune reads the final
+                # Write the task file BEFORE the [ScriptTag] summary - Intune reads the final
                 # stdout line as the detection result, so the summary must come last.
                 Write-UpgradeTaskFile -Records $contextApps
                 Write-Log -Message "Performing marker file cleanup before exit (direct user context apps found)" -IsDebug

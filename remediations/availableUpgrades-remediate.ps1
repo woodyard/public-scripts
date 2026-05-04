@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Winget Application Update Remediation Script
     
@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.28
- Tag: 28
+ Version: 9.29
+ Tag: 29
     
     Version History:
     1.0 - Initial version
@@ -71,28 +71,29 @@
     9.4 - ENHANCEMENT: Added Resolve-FriendlyName function that looks up display names via winget show when FriendlyName is missing from whitelist config; runs lazily only for matched apps being updated
     9.5 - FEATURE: Added category-based whitelist defaults; JSON now supports { CategoryDefaults, Apps } structure where per-category settings (PromptWhenBlocked, TimeoutSeconds, DeferralEnabled, etc.) are inherited by apps in that category; app-level properties override category defaults; backward compatible with legacy flat array format
     9.6 - FIX: SYSTEM-side wait now uses idle-based timeout (600s without heartbeat) instead of hard deadline, so active user-context upgrades run indefinitely as long as heartbeat is alive; post-upgrade verification uses --exact flag to prevent substring ID matches and compares available version against target to avoid false failures when a newer release appears in the source after upgrade; added diagnostic logging to success evaluation; pre-update winget source once before the upgrade loop to prevent redundant per-app source refreshes; removed misleading "Updating sources..." status from progress dialog; optimized per-app winget commands by dropping unused --log flag, adding --disable-interactivity and --accept-package-agreements to eliminate preamble stalls
-    9.7 - FIX: Fixed orphaned scheduled task cleanup — added Remove-StaleScheduledTasks startup sweep for all task prefixes (UserPrompt_, UpgradeProgress_, CompletionNotification_, MandatoryPrompt_, DeferralPrompt_, SkipPrompt_, UserRemediation_); added task and temp file cleanup to catch blocks in Invoke-SystemUserPrompt, Invoke-SystemCompletionNotification, Invoke-SystemDeferralPrompt, Show-VersionSkipDialog, and Show-MandatoryUpdateDialog that previously leaked tasks on exceptions
-    9.8 - FIX: Fixed VBS launcher file accumulation in temp directories — expanded Remove-OldTempFiles to scan user temp directories (not just C:\ProgramData\Temp) for stale HiddenLaunch_*.vbs and dialog script/response files; added VBS cleanup to New-UserPromptTask failure paths (including Azure AD fallback) and Show-UpgradeProgressNotification error/no-principal paths; broadened temp file regex to cover all dialog types (UpgradeProgress_, CompletionNotification_, SkipPrompt_)
+    9.7 - FIX: Fixed orphaned scheduled task cleanup - added Remove-StaleScheduledTasks startup sweep for all task prefixes (UserPrompt_, UpgradeProgress_, CompletionNotification_, MandatoryPrompt_, DeferralPrompt_, SkipPrompt_, UserRemediation_); added task and temp file cleanup to catch blocks in Invoke-SystemUserPrompt, Invoke-SystemCompletionNotification, Invoke-SystemDeferralPrompt, Show-VersionSkipDialog, and Show-MandatoryUpdateDialog that previously leaked tasks on exceptions
+    9.8 - FIX: Fixed VBS launcher file accumulation in temp directories - expanded Remove-OldTempFiles to scan user temp directories (not just C:\ProgramData\Temp) for stale HiddenLaunch_*.vbs and dialog script/response files; added VBS cleanup to New-UserPromptTask failure paths (including Azure AD fallback) and Show-UpgradeProgressNotification error/no-principal paths; broadened temp file regex to cover all dialog types (UpgradeProgress_, CompletionNotification_, SkipPrompt_)
     9.9 - FIX: VBS launcher files now self-delete after the child process finishes; eliminates accumulation regardless of caller cleanup path
     9.10 - FIX: Reduced stale file/task cleanup cutoff from 30 minutes to 10 minutes so the startup sweep removes old leftovers (days/months old) on next run
-    9.11 - FIX: Wrapped VBS self-delete in On Error Resume Next to prevent "Permission denied" dialog when user context cannot delete SYSTEM-owned launcher file; Fixed user-context remediation missing user-scoped apps (e.g. Perplexity.Comet) by running winget twice — default listing for machine-scoped apps plus --scope user for user-scoped apps — and merging results by AppID before processing
+    9.11 - FIX: Wrapped VBS self-delete in On Error Resume Next to prevent "Permission denied" dialog when user context cannot delete SYSTEM-owned launcher file; Fixed user-context remediation missing user-scoped apps (e.g. Perplexity.Comet) by running winget twice - default listing for machine-scoped apps plus --scope user for user-scoped apps - and merging results by AppID before processing
     9.12 - FIX: Fixed Update-Heartbeat Boolean return value leaking into Invoke-WingetWithProgress output, causing "[System.Boolean] does not contain a method named 'Trim'" error during post-upgrade result parsing; added type guard in upgrade output iteration to skip non-string elements
     9.13 - FEATURE: Added direct-download installer fallback when winget fails with "Installer hash does not match" (common with rolling installer URLs like Perplexity Comet); resolves installer URL from whitelist InstallerUrl field or winget show output; downloads and runs installer silently; whitelist gains optional InstallerUrl and InstallerArgs fields for per-app configuration
     9.14 - FIX: Direct download fallback now uses WebClient.DownloadFile in a background job instead of Invoke-WebRequest (which is extremely slow for large files in PS 5.1); heartbeats continue during both download and install phases preventing SYSTEM parent timeout; added 5-minute timeout for each phase with progress reporting to dialog
     9.15 - FIX: Direct install fallback now calls WaitForExit() before reading exit code and treats null exit code as success; Chromium-based installers fork a child process and the parent exits immediately with no exit code, which was incorrectly treated as failure
     9.16 - FIX: Added --scope user dual-listing to SYSTEM context so apps like Perplexity.Comet (user-scoped in winget but installed to Program Files) are discovered and upgraded with SYSTEM privileges; prevents failed upgrades from user context lacking write access to Program Files
-    9.17 - REVERT: Removed --scope user from SYSTEM context — SYSTEM cannot see user-registered winget packages; dual-scope listing remains in user context only where it is effective
+    9.17 - REVERT: Removed --scope user from SYSTEM context - SYSTEM cannot see user-registered winget packages; dual-scope listing remains in user context only where it is effective
     9.18 - FIX: Prevent unintended UAC prompts during user-context upgrades. Scope detection correctly identified machine-scoped apps (e.g. Mozilla.Firefox) but the resulting `$doUpgrade = $false` had no effect because it was set inside the `if ($doUpgrade)` block, so winget still ran and the installer triggered UAC. Now the user-context flow signals dialogs cleanly and `continue`s to the next app, leaving machine-scoped upgrades to the SYSTEM context.
-    9.19 - FIX: Post-upgrade verification was producing false-positive failures. Whitespace-split column extraction misclassified columns when winget list returns no Available column after a successful upgrade — empty parse fell into the failure branch. Replaced ad-hoc parsing with the existing header-position parser (ConvertFrom-WingetOutput) and now treats only an EXACT match between parsed Available and our target version as a true failure; empty/different Available is treated as success. Also: SYSTEM context now augments its `winget upgrade` listing by querying `winget list --id ID` for each whitelisted machine-scoped app missing from the upgrade list — picks up apps like Mozilla.Firefox that winget tracks under user accounts but which actually live in C:\Program Files, so SYSTEM can upgrade them without UAC.
-    9.20 - REFACTOR: Detection now writes a static task file (C:\ProgramData\Temp\availableUpgrades-tasks.json) with the apps it found pending upgrade. Remediation reads that file as the authoritative work list and removes entries as each app is processed (success or final-failure). Eliminates the need for SYSTEM-context augmentation to walk every whitelisted machine-scoped app querying `winget list` per app — detection has already done the discovery via its dual `winget upgrade` listing. The augmentation pass remains as a fallback for when the task file is missing or older than 6 hours. User-context "skip machine-scoped to avoid UAC" leaves the entry in the task file so SYSTEM picks it up next cycle.
-    9.21 - REFACTOR: Removed all `winget upgrade` discovery calls from remediation - detection's task file is now the sole source of truth. Each task entry carries an InstalledScope (machine/user/unknown) recorded by detect.ps1, which lets remediation filter the work list by current context at load time: SYSTEM processes machine + unknown, user context processes user + unknown. Scope decisions in the upgrade loop now read InstalledScope from the task entry instead of re-running Get-AppInstalledScope per app. When the task file is missing or stale, remediation exits 0 cleanly (no fallback discovery — run detect.ps1 first).
+    9.19 - FIX: Post-upgrade verification was producing false-positive failures. Whitespace-split column extraction misclassified columns when winget list returns no Available column after a successful upgrade - empty parse fell into the failure branch. Replaced ad-hoc parsing with the existing header-position parser (ConvertFrom-WingetOutput) and now treats only an EXACT match between parsed Available and our target version as a true failure; empty/different Available is treated as success. Also: SYSTEM context now augments its `winget upgrade` listing by querying `winget list --id ID` for each whitelisted machine-scoped app missing from the upgrade list - picks up apps like Mozilla.Firefox that winget tracks under user accounts but which actually live in C:\Program Files, so SYSTEM can upgrade them without UAC.
+    9.20 - REFACTOR: Detection now writes a static task file (C:\ProgramData\Temp\availableUpgrades-tasks.json) with the apps it found pending upgrade. Remediation reads that file as the authoritative work list and removes entries as each app is processed (success or final-failure). Eliminates the need for SYSTEM-context augmentation to walk every whitelisted machine-scoped app querying `winget list` per app - detection has already done the discovery via its dual `winget upgrade` listing. The augmentation pass remains as a fallback for when the task file is missing or older than 6 hours. User-context "skip machine-scoped to avoid UAC" leaves the entry in the task file so SYSTEM picks it up next cycle.
+    9.21 - REFACTOR: Removed all `winget upgrade` discovery calls from remediation - detection's task file is now the sole source of truth. Each task entry carries an InstalledScope (machine/user/unknown) recorded by detect.ps1, which lets remediation filter the work list by current context at load time: SYSTEM processes machine + unknown, user context processes user + unknown. Scope decisions in the upgrade loop now read InstalledScope from the task entry instead of re-running Get-AppInstalledScope per app. When the task file is missing or stale, remediation exits 0 cleanly (no fallback discovery - run detect.ps1 first).
     9.22 - FIX: When user-context remediation had nothing to do (typically because SYSTEM had already drained the task file) it exited without writing the result file. SYSTEM-side Schedule-UserContextRemediation then waited the full 600-second idle timeout for a heartbeat that never came (observed: 750-second hang, ~12 min wasted per cycle). Now the empty-work-list exit path writes a minimal result JSON (ProcessedApps=0, Success=true, Reason) so SYSTEM can stop waiting immediately.
     9.23 - FIX: SYSTEM-context remediation no longer skips user-context handoff when its own work list is empty. The handoff (Schedule-UserContextRemediation) was nested inside the `if ($LIST.Count -gt 0)` branch, so a task file containing only user-scoped entries (e.g. "0 routed to SYSTEM, 1 left for the other context") fell into the else branch and exited without ever launching the user-context task. Added a parallel handoff in the else branch gated on $Script:TasksForOtherContext > 0 (set during routing). Pairs with detect.ps1 v5.38 which now produces task files containing both scopes.
-    9.24 - LOGGING: Made remediation log self-explanatory at the SYSTEM level. (a) Successful upgrades now report as `AppID (OK)` instead of bare AppID — previously success/failure was distinguishable only by the absence of a "(FAILED)/(ERROR)" suffix, which was easy to misread when the user-context task reported back. (b) Routing log now lists the actual AppIDs (with InstalledScope) for both the current context's work list AND the entries handed off to the other context, so SYSTEM log readers can see which apps the user-context task is about to attempt without needing the user-context log file.
-    9.25 - FIX: SYSTEM-context handoff to user-context remediation no longer runs when the task file contains zero user-scoped entries. The post-processing handoff (only reached when SYSTEM had work itself) was unconditional — every SYSTEM run that processed any machine-scoped app would also schedule a no-op user-context task, wasting ~3 minutes per cycle on heartbeat polling for nothing. Now gated on $Script:TasksForOtherContext > 0, matching the gate already on the empty-list else branch added in v9.23.
-    9.26 - PERF: Two startup/per-app cost reductions. (a) Orphan marker cleanup no longer calls Get-InteractiveUser to find the user temp dir — replaced with a disk enumeration of C:\Users\* (skipping well-known non-user profile dirs). The CIM call costs ~7s on Azure AD machines and was the first thing every Intune cycle paid for; disk enumeration is sub-millisecond and additionally catches orphans from any user profile rather than just the active one. (b) Post-upgrade verification (the `winget list --exact` re-query that costs ~1.5s per upgraded app) is now opt-in via a new whitelist `RequiresPostVerify: true` flag. Originally added in v8.8 for Adobe Reader's silent-failure pattern; Adobe Reader is now disabled in the whitelist, so the cost was being paid on every enabled app to protect against a problem none of them have. Apps that need the safety net can opt back in by setting the flag.
-    9.27 - PERF: Three further cost reductions. (a) Get-InteractiveUser now uses Get-Process explorer -IncludeUserName as the PRIMARY detection method (~50ms) and falls back to CIM (~5s) only when Explorer isn't running. Explorer is the desktop shell so its owner is by definition the interactive user — same answer as Win32_ComputerSystem.Username in 99%+ of sessions, dramatically faster. The CIM/WMI paths are kept as fallbacks for early-boot or RDP-edge scenarios where Explorer isn't yet running. Also collapsed the verbose per-method logging: the function now emits a single line "User detection method: Explorer (52ms) -> DSGR\\adminhsk, SID=..." instead of 8+ progress lines. (b) Whitelist fetch now uses an on-disk cache (C:\ProgramData\Temp\availableUpgrades-whitelist.cache.*) with a 60-min TTL plus ETag/If-Modified-Since revalidation. Within the TTL window we skip the network entirely; after TTL we send If-None-Match and reuse the cached body on a 304. Reduces external dependency from once-per-cycle to at most once-per-hour. Stale cache is also used as a fallback when the network is unavailable. (c) Removed three redundant log lines around the Get-InteractiveUser call inside Schedule-UserContextRemediation that were just announcing function entry/exit ("Calling Get-InteractiveUser function...", "Get-InteractiveUser completed in X seconds"). The function logs its own success line.
+    9.24 - LOGGING: Made remediation log self-explanatory at the SYSTEM level. (a) Successful upgrades now report as `AppID (OK)` instead of bare AppID - previously success/failure was distinguishable only by the absence of a "(FAILED)/(ERROR)" suffix, which was easy to misread when the user-context task reported back. (b) Routing log now lists the actual AppIDs (with InstalledScope) for both the current context's work list AND the entries handed off to the other context, so SYSTEM log readers can see which apps the user-context task is about to attempt without needing the user-context log file.
+    9.25 - FIX: SYSTEM-context handoff to user-context remediation no longer runs when the task file contains zero user-scoped entries. The post-processing handoff (only reached when SYSTEM had work itself) was unconditional - every SYSTEM run that processed any machine-scoped app would also schedule a no-op user-context task, wasting ~3 minutes per cycle on heartbeat polling for nothing. Now gated on $Script:TasksForOtherContext > 0, matching the gate already on the empty-list else branch added in v9.23.
+    9.26 - PERF: Two startup/per-app cost reductions. (a) Orphan marker cleanup no longer calls Get-InteractiveUser to find the user temp dir - replaced with a disk enumeration of C:\Users\* (skipping well-known non-user profile dirs). The CIM call costs ~7s on Azure AD machines and was the first thing every Intune cycle paid for; disk enumeration is sub-millisecond and additionally catches orphans from any user profile rather than just the active one. (b) Post-upgrade verification (the `winget list --exact` re-query that costs ~1.5s per upgraded app) is now opt-in via a new whitelist `RequiresPostVerify: true` flag. Originally added in v8.8 for Adobe Reader's silent-failure pattern; Adobe Reader is now disabled in the whitelist, so the cost was being paid on every enabled app to protect against a problem none of them have. Apps that need the safety net can opt back in by setting the flag.
+    9.27 - PERF: Three further cost reductions. (a) Get-InteractiveUser now uses Get-Process explorer -IncludeUserName as the PRIMARY detection method (~50ms) and falls back to CIM (~5s) only when Explorer isn't running. Explorer is the desktop shell so its owner is by definition the interactive user - same answer as Win32_ComputerSystem.Username in 99%+ of sessions, dramatically faster. The CIM/WMI paths are kept as fallbacks for early-boot or RDP-edge scenarios where Explorer isn't yet running. Also collapsed the verbose per-method logging: the function now emits a single line "User detection method: Explorer (52ms) -> DSGR\\adminhsk, SID=..." instead of 8+ progress lines. (b) Whitelist fetch now uses an on-disk cache (C:\ProgramData\Temp\availableUpgrades-whitelist.cache.*) with a 60-min TTL plus ETag/If-Modified-Since revalidation. Within the TTL window we skip the network entirely; after TTL we send If-None-Match and reuse the cached body on a 304. Reduces external dependency from once-per-cycle to at most once-per-hour. Stale cache is also used as a fallback when the network is unavailable. (c) Removed three redundant log lines around the Get-InteractiveUser call inside Schedule-UserContextRemediation that were just announcing function entry/exit ("Calling Get-InteractiveUser function...", "Get-InteractiveUser completed in X seconds"). The function logs its own success line.
     9.28 - TUNE: Whitelist cache TTL bumped from 60 min to 36 hours (2160 min). At a once-a-day client cadence the 60-min default never reached the fast-path (cache always >60 min old at next run, always revalidated). 36 h is comfortably longer than a daily cycle including check-in jitter, so the fast-path normally hits and we skip the network entirely. Whitelist edits propagate within ~1.5 days worst case.
+    9.29 - FIX: Stripped em-dashes/en-dashes (U+2014, U+2013) from the script and saved with a UTF-8 BOM. Without a BOM, PowerShell 5.1 reads the file as Windows-1252 and the multi-byte UTF-8 sequence for an em-dash decodes to bytes 0xE2 0x80 0x94 - byte 0x94 is a right-quote in Windows-1252 which terminated string literals early and broke the parser when run via the iex bootstrapper (which writes the script to a .ps1 in temp without preserving UTF-8 metadata). All Unicode dashes replaced with ASCII hyphen-minus.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -302,7 +303,7 @@ function Get-InteractiveUser {
             $detectionMethod = $null
 
             # Primary: Get-Process explorer -IncludeUserName. Typically ~50ms vs ~5s for CIM.
-            # Explorer is the desktop shell — its owner is by definition the interactive user.
+            # Explorer is the desktop shell - its owner is by definition the interactive user.
             # CIM/WMI Win32_ComputerSystem.Username is the historic method but is far slower
             # and produces the same answer in 99%+ of sessions, so it's now only the fallback
             # for cases where Explorer isn't running (e.g. session not yet fully initialized).
@@ -1673,7 +1674,7 @@ $okButton = $window.FindName("OKButton")
 $cancelButton = $window.FindName("CancelButton")
 $closeButton = $window.FindName("CloseButton")
 
-# Shared state hashtable — reference type accessible from all event handlers
+# Shared state hashtable - reference type accessible from all event handlers
 $s = @{
     result = $DefaultAction
     timeRemaining = [int]$TimeoutSeconds
@@ -2188,7 +2189,7 @@ function Invoke-WingetWithProgress {
                             $foundIndex = $outText.IndexOf($Matches[0])
                             $outText = $outText.Substring($foundIndex)
                         } elseif (-not $pastSourceUpdate) {
-                            # Winget preamble (source check / startup) — don't show misleading "Updating sources"
+                            # Winget preamble (source check / startup) - don't show misleading "Updating sources"
                             continue
                         } else {
                             # pastSourceUpdate is true but "Found" not in current read (partial read) - skip to avoid showing source index sizes
@@ -3891,7 +3892,7 @@ function Show-DirectDeferralDialog {
         $signalFile = Join-Path $env:TEMP "WingetDialog_${dialogId}_Complete.json"
         $statusFile = Join-Path $env:TEMP "WingetDialog_${dialogId}_Complete_Status.txt"
 
-        # Child process script — writes result file immediately on user choice,
+        # Child process script - writes result file immediately on user choice,
         # then stays open in progress mode polling for completion signal
         $dialogScript = @'
 param($Title, $Question, $TimeoutSeconds, $ResultFile)
@@ -3983,7 +3984,7 @@ $s = @{
     progressStartTime = $null
 }
 
-# Function to switch dialog to progress mode — keeps window open, polls for completion
+# Function to switch dialog to progress mode - keeps window open, polls for completion
 $switchToProgress = {
     if ($s.inProgressMode) { return }
     $s.inProgressMode = $true
@@ -3999,7 +4000,7 @@ $switchToProgress = {
 
     $s.progressStartTime = Get-Date
 
-    # Poll timer — checks for status updates and completion signal
+    # Poll timer - checks for status updates and completion signal
     $pollTimer = New-Object System.Windows.Threading.DispatcherTimer
     $pollTimer.Interval = [System.TimeSpan]::FromSeconds(2)
     $pollTimer.Add_Tick({
@@ -4098,7 +4099,7 @@ $window.ShowDialog()
 
         $proc = Start-Process $pwsh -ArgumentList "-NoProfile", "-STA", "-File", "`"$scriptFile`"", "-Title", "`"$Title`"", "-Question", "`"$Question`"", "-TimeoutSeconds", $TimeoutSeconds, "-ResultFile", "`"$resultFile`"" -PassThru -WindowStyle Hidden
 
-        # Poll for result file instead of blocking on WaitForExit — dialog stays open for progress
+        # Poll for result file instead of blocking on WaitForExit - dialog stays open for progress
         $pollTimeout = $TimeoutSeconds + 30
         $pollStart = Get-Date
         while (-not (Test-Path $resultFile)) {
@@ -4131,7 +4132,7 @@ $window.ShowDialog()
                 Write-Log "Direct dialog progress signal file: $signalFile" | Out-Null
             }
 
-            # Clean up result file (but NOT signal/status files — dialog still needs them)
+            # Clean up result file (but NOT signal/status files - dialog still needs them)
             Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
 
             Write-Log "Deferral dialog result parsed: Action=$($deferralResult.Action), Days=$($deferralResult.DeferralDays), CloseProcess=$($deferralResult.CloseProcess)" | Out-Null
@@ -5883,7 +5884,7 @@ function Clear-OrphanedMarkerFiles {
                         }
                     }
             } catch {
-                # Ignore — orphan cleanup is best-effort
+                # Ignore - orphan cleanup is best-effort
             }
         }
         
@@ -6031,7 +6032,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "28" # Update this tag for each script version
+$ScriptTag = "29" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6240,7 +6241,7 @@ function Get-CachedWhitelistJSON {
     #>
     param(
         [Parameter(Mandatory)][string]$Url,
-        [int]$TtlMinutes = 2160,   # 36 hours — longer than a daily cycle so the fast-path normally hits
+        [int]$TtlMinutes = 2160,   # 36 hours - longer than a daily cycle so the fast-path normally hits
         [string]$CachePath = "C:\ProgramData\Temp\availableUpgrades-whitelist.cache.json"
     )
 
@@ -6290,7 +6291,7 @@ function Get-CachedWhitelistJSON {
         $statusCode = $null
         if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
         if ($statusCode -eq 304 -and $cachedJson) {
-            Write-Log -Message "Whitelist unchanged on server (304) — reusing cache"
+            Write-Log -Message "Whitelist unchanged on server (304) - reusing cache"
             try {
                 @{ Url = $Url; ETag = $cachedEtag; Timestamp = (Get-Date).ToString('o') } |
                     ConvertTo-Json | Out-File -FilePath $metaPath -Encoding UTF8 -Force
@@ -6525,7 +6526,7 @@ function ConvertFrom-WingetOutput {
 # Detection writes this file when upgrades are found; remediation reads it as the authoritative
 # work list and removes entries as each app is processed (success or final-failure).
 $Script:UpgradeTaskFile = "C:\ProgramData\Temp\availableUpgrades-tasks.json"
-# Refuse to use the task file beyond this age — guards against acting on stale detections after
+# Refuse to use the task file beyond this age - guards against acting on stale detections after
 # a missed Intune cycle. Tunable; 6 h is comfortably longer than a normal detect→remediate gap.
 $Script:UpgradeTaskFileMaxAgeHours = 6
 
@@ -6538,7 +6539,7 @@ function Read-UpgradeTaskFile {
         if the file is missing, malformed, or older than UpgradeTaskFileMaxAgeHours.
     .NOTES
         All Write-Log calls in this function are piped to Out-Null because Write-Log emits the
-        formatted console line to the success stream — without suppression that string leaks
+        formatted console line to the success stream - without suppression that string leaks
         into the function's return value alongside the ArrayList.
     #>
     if (-not (Test-Path $Script:UpgradeTaskFile)) { return $null }
@@ -6622,14 +6623,14 @@ function Get-MissingMachineUpgrades {
     .DESCRIPTION
         winget tracks installed packages per-account: an app the user installed (e.g. Mozilla.Firefox)
         ends up registered in the user's tracking database, so `winget upgrade` run as SYSTEM does
-        not list it — even though the binary lives in C:\Program Files and the SYSTEM account has
+        not list it - even though the binary lives in C:\Program Files and the SYSTEM account has
         full write access to it. `winget list --id ID` does correlate against ARP (machine-wide),
         so this helper queries each whitelisted machine-scoped app individually and reports any
         pending upgrade so the main loop can apply it from SYSTEM context (no UAC).
     .PARAMETER Whitelist
         Parsed whitelist entries with AppID, FriendlyName, and optional Enabled.
     .PARAMETER ExistingIds
-        Hashtable of AppIDs already discovered by the main `winget upgrade` listing — these are
+        Hashtable of AppIDs already discovered by the main `winget upgrade` listing - these are
         skipped to avoid duplicate processing.
     .PARAMETER WingetExePath
         Full path to winget.exe (resolved for SYSTEM context).
@@ -6653,7 +6654,7 @@ function Get-MissingMachineUpgrades {
     foreach ($entry in $Whitelist) {
         if (-not $entry.AppID) { continue }
         if ($entry.PSObject.Properties['Disabled'] -and $entry.Disabled -eq $true) { continue }
-        # Skip wildcard patterns — `winget list --id` needs a concrete ID.
+        # Skip wildcard patterns - `winget list --id` needs a concrete ID.
         # Wildcarded entries are typically handled fine by the main `winget upgrade` listing because
         # they cover variants (Beta/ESR/etc.) that are independently tracked.
         if ($entry.AppID -match '[\*\?]') { continue }
@@ -6902,7 +6903,7 @@ if ($UserRemediationOnly) {
             TestRunningAsSystem = (Test-RunningAsSystem)
         }
         
-        # Privilege check + minimal context setup. Discovery is done by detect.ps1 — we read
+        # Privilege check + minimal context setup. Discovery is done by detect.ps1 - we read
         # its task file below instead of calling `winget upgrade` here.
         Update-Status -Status "Loading work list" -Progress "Reading task file written by detect.ps1"
 
@@ -6927,7 +6928,7 @@ if ($UserRemediationOnly) {
             exit 1
         }
 
-        # Discovery output is intentionally empty — the task file is the work source.
+        # Discovery output is intentionally empty - the task file is the work source.
         $OUTPUT = @()
         $OUTPUT_USER_SCOPE = @()
 
@@ -6944,7 +6945,7 @@ if ($UserRemediationOnly) {
 
         Write-Log -Message "Using winget path: $WingetPath"
         $wingetExe = Join-Path $WingetPath "winget.exe"
-        # Discovery output is intentionally empty — the task file is the work source.
+        # Discovery output is intentionally empty - the task file is the work source.
         $OUTPUT = @()
         $OUTPUT_USER_SCOPE = @()
 } else {
@@ -7232,7 +7233,7 @@ if ($LIST -and $LIST.Count -gt 0) {
                                         Start-Sleep -Seconds 3
                                         
                                         # Verify processes are really stopped
-                                        # Exclude AutoCloseProcesses from check — services like warp-svc auto-restart via SCM
+                                        # Exclude AutoCloseProcesses from check - services like warp-svc auto-restart via SCM
                                         $autoCloseList2 = @()
                                         if (-not [string]::IsNullOrEmpty($okapp.AutoCloseProcesses)) {
                                             $autoCloseList2 = ($okapp.AutoCloseProcesses -split ',') | ForEach-Object { $_.Trim() }
@@ -7523,7 +7524,7 @@ if ($LIST -and $LIST.Count -gt 0) {
                                     $installExitCode = $installProc.ExitCode
                                     Write-Log -Message "Direct installer exited with code: $installExitCode"
 
-                                    # Treat null/0 as success — Chromium installers often return null (parent forks)
+                                    # Treat null/0 as success - Chromium installers often return null (parent forks)
                                     if ($null -eq $installExitCode -or $installExitCode -eq 0) {
                                         $upgradeOutput = "Successfully installed (direct download fallback)"
                                         Write-Log -Message "Direct install succeeded for $($appInfo.AppID)"
@@ -7562,7 +7563,7 @@ if ($LIST -and $LIST.Count -gt 0) {
                         # Post-upgrade verification: confirm via winget list --exact that the update actually took effect.
                         # Originally added (v8.8) for Adobe Reader's exit-code-0-but-no-version-change behavior. The
                         # extra winget list pass costs ~1.5s per app, so it is now opt-in via the whitelist
-                        # `RequiresPostVerify` flag — set true only on apps known to lie about success.
+                        # `RequiresPostVerify` flag - set true only on apps known to lie about success.
                         $needsPostVerify = $false
                         if ($okapp -and $okapp.PSObject.Properties['RequiresPostVerify'] -and $okapp.RequiresPostVerify -eq $true) {
                             $needsPostVerify = $true
@@ -7592,15 +7593,15 @@ if ($LIST -and $LIST.Count -gt 0) {
                                 }
 
                                 if ([string]::IsNullOrWhiteSpace($verifyAvailableVersion)) {
-                                    # No Available version parsed (column empty or absent) — upgrade took effect
+                                    # No Available version parsed (column empty or absent) - upgrade took effect
                                     # or no pending upgrade remains. Trust the original success signal.
                                     Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) confirmed up to date (Current=$verifyCurrentVersion, no Available)"
                                 } elseif ($verifyAvailableVersion -eq $appInfo.AvailableVersion) {
-                                    # winget list still shows the EXACT version we tried to install as pending — true failure
+                                    # winget list still shows the EXACT version we tried to install as pending - true failure
                                     Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) still shows pending update for our target version $($appInfo.AvailableVersion) - treating as failure"
                                     $isSuccess = $false
                                 } else {
-                                    # A different (typically newer) version appeared in the source after our upgrade — trust original success
+                                    # A different (typically newer) version appeared in the source after our upgrade - trust original success
                                     Write-Log -Message "Post-upgrade verification: $($appInfo.AppID) Available=$verifyAvailableVersion differs from target $($appInfo.AvailableVersion) - newer release appeared, trusting original success"
                                 }
                             } catch {
@@ -7793,7 +7794,7 @@ if ($LIST -and $LIST.Count -gt 0) {
     }
 
     # When a UserRemediationOnly run has nothing to do (typically because SYSTEM already drained
-    # the task file), still write the result file so SYSTEM stops waiting on heartbeats — the
+    # the task file), still write the result file so SYSTEM stops waiting on heartbeats - the
     # outer Schedule-UserContextRemediation polls for this file and otherwise sits in its
     # 600-second idle timeout before declaring failure.
     if ($UserRemediationOnly -and $RemediationResultFile) {
