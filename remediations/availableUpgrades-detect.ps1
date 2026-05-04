@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.41
-    Tag: 71
+    Version: 5.42
+    Tag: 72
     
     Version History:
     1.0 - Initial version
@@ -88,6 +88,7 @@
     5.39 - FIX: Detection script's last stdout line is now always the [ScriptTag] summary so Intune reads the right detection result. Previously Write-UpgradeTaskFile and Remove-UpgradeTaskFile (both non-debug) ran AFTER the summary, so on some runs the final visible line was "Wrote upgrade task file with N tasks" or "Removed upgrade task file" instead of the upgrade-list/no-upgrade summary, which Intune surfaces as the detection state. Reordered all four main exit paths (SYSTEM merged-apps, SYSTEM no-apps, direct-user apps-found, direct-user no-apps, plus the no-winget-output path) to do task-file IO first and emit the [ScriptTag] line last.
     5.40 - FIX: Get-AppInstalledScope was returning "unknown" for apps like Google.Chrome whose registry layout doesn't fit the simple "DisplayName contains FriendlyName, hive determines scope" model. Two improvements: (a) search by multiple terms — FriendlyName plus AppID parts (e.g. "Google Chrome", "Chrome", "Google") — so apps where the whitelist FriendlyName doesn't substring-match the registry DisplayName are still found; (b) use InstallLocation as the authoritative scope signal. A binary in C:\Users\...\AppData\... is per-user even when the uninstall key sits in HKLM, and a Program Files install is machine-wide even when the uninstall key sits in HKCU. Hive membership is now only the fallback when InstallLocation is empty. When both scopes show installs, prefer "machine" so SYSTEM remediation runs (covers the Program Files binary; the per-user copy comes along via the same upgrade).
     5.41 - PERF: Orphan marker cleanup at startup no longer calls Get-InteractiveUser to find the user temp dir — replaced with a disk enumeration of C:\Users\* (skipping well-known non-user profile dirs). The CIM-based user detection costs ~7s on Azure AD machines and was the first thing every Intune cycle paid for; disk enumeration is sub-millisecond and additionally catches orphans from any user profile rather than just the active one.
+    5.42 - FIX: Get-AppInstalledScope returned "unknown" for Notepad++ (and likely other apps) on ARM64 because the `Get-ItemProperty <basepath>\*` wildcard form silently returned $null when -ErrorAction SilentlyContinue swallowed a single bad subkey. Replaced with explicit per-subkey enumeration: Get-ChildItem to list subkeys, then Get-ItemProperty per subkey wrapped in try/catch so individual unreadable entries don't abort the whole walk. Also extended the match function to check PSChildName (the literal subkey name, e.g. "Notepad++") in addition to DisplayName, providing a second signal when DisplayName is missing or formatted unexpectedly. Confirmed via diagnostic log line "machine hits=0, user hits=0" for Notepad++.Notepad++ that the previous walk found nothing.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -850,42 +851,64 @@ function Get-AppInstalledScope {
 
         $matchEntry = {
             param($e)
-            if (-not $e.DisplayName) { return $false }
             foreach ($t in $searchTerms) {
-                if ($e.DisplayName -like "*$t*") { return $true }
+                if ($e.DisplayName -and $e.DisplayName -like "*$t*") { return $true }
+                # Also match the subkey name itself — for many apps (e.g. "Notepad++") the
+                # uninstall key is literally named after the product. This is a second signal
+                # independent of DisplayName, useful when DisplayName is missing or differs.
+                if ($e.PSChildName -and $e.PSChildName -like "*$t*") { return $true }
             }
             return $false
         }
 
-        # Machine-wide uninstall registry. Using `Get-ItemProperty <path>\*` instead of
-        # `Get-ChildItem | Get-ItemProperty` because the latter has been observed to silently
-        # produce empty results in SYSTEM context for some hosts (suspected: a subkey with a
-        # malformed default value short-circuits the pipeline).
-        $machinePaths = @(
-            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        # Walk uninstall registry per-subkey rather than `Get-ItemProperty <basepath>\*` —
+        # the wildcard form is fragile: a single subkey with a malformed default value or
+        # restricted ACL anywhere under the hive can cause the whole batch read to silently
+        # return $null with -ErrorAction SilentlyContinue (observed for Notepad++ on ARM64).
+        # Per-subkey iteration with try/catch isolates the failures.
+        $walkUninstallHive = {
+            param([string]$BasePath)
+            $hits = New-Object System.Collections.Generic.List[object]
+            if (-not (Test-Path $BasePath)) { return $hits }
+            $subKeys = $null
+            try { $subKeys = Get-ChildItem -Path $BasePath -ErrorAction Stop } catch {
+                Write-Log "Scope detection: cannot enumerate $BasePath - $($_.Exception.Message)" | Out-Null
+                return $hits
+            }
+            foreach ($sub in $subKeys) {
+                try {
+                    $entry = Get-ItemProperty -Path $sub.PSPath -ErrorAction Stop
+                    # PSChildName is normally present, but make sure the match block can rely on it
+                    if (-not ($entry.PSObject.Properties['PSChildName'])) {
+                        $entry | Add-Member -NotePropertyName PSChildName -NotePropertyValue $sub.PSChildName -Force
+                    }
+                    if (& $matchEntry $entry) { [void]$hits.Add($entry) }
+                } catch {
+                    # Skip individual unreadable subkeys
+                }
+            }
+            return $hits
+        }
+
+        $machineBases = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
         )
         $machineHits = New-Object System.Collections.Generic.List[object]
-        foreach ($p in $machinePaths) {
-            $all = Get-ItemProperty -Path $p -ErrorAction SilentlyContinue
-            foreach ($e in $all) {
-                if (& $matchEntry $e) { [void]$machineHits.Add($e) }
-            }
+        foreach ($base in $machineBases) {
+            foreach ($h in (& $walkUninstallHive $base)) { [void]$machineHits.Add($h) }
         }
 
         # User-scope uninstall registry — different access path per context.
         $userHits = New-Object System.Collections.Generic.List[object]
         $userBase = if (Test-RunningAsSystem) {
             $userInfo = Get-InteractiveUser
-            if ($userInfo -and $userInfo.SID) { "Registry::HKU\$($userInfo.SID)\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" } else { $null }
+            if ($userInfo -and $userInfo.SID) { "Registry::HKU\$($userInfo.SID)\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" } else { $null }
         } else {
-            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
         }
         if ($userBase) {
-            $all = Get-ItemProperty -Path $userBase -ErrorAction SilentlyContinue
-            foreach ($e in $all) {
-                if (& $matchEntry $e) { [void]$userHits.Add($e) }
-            }
+            foreach ($h in (& $walkUninstallHive $userBase)) { [void]$userHits.Add($h) }
         }
 
         # Authoritative signal: InstallLocation. A binary in C:\Users\...\AppData\... is
@@ -1487,7 +1510,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "71" # Update this tag for each script version
+$ScriptTag = "72" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
