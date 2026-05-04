@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.29
- Tag: 29
+ Version: 9.30
+ Tag: 30
     
     Version History:
     1.0 - Initial version
@@ -94,6 +94,7 @@
     9.27 - PERF: Three further cost reductions. (a) Get-InteractiveUser now uses Get-Process explorer -IncludeUserName as the PRIMARY detection method (~50ms) and falls back to CIM (~5s) only when Explorer isn't running. Explorer is the desktop shell so its owner is by definition the interactive user - same answer as Win32_ComputerSystem.Username in 99%+ of sessions, dramatically faster. The CIM/WMI paths are kept as fallbacks for early-boot or RDP-edge scenarios where Explorer isn't yet running. Also collapsed the verbose per-method logging: the function now emits a single line "User detection method: Explorer (52ms) -> DSGR\\adminhsk, SID=..." instead of 8+ progress lines. (b) Whitelist fetch now uses an on-disk cache (C:\ProgramData\Temp\availableUpgrades-whitelist.cache.*) with a 60-min TTL plus ETag/If-Modified-Since revalidation. Within the TTL window we skip the network entirely; after TTL we send If-None-Match and reuse the cached body on a 304. Reduces external dependency from once-per-cycle to at most once-per-hour. Stale cache is also used as a fallback when the network is unavailable. (c) Removed three redundant log lines around the Get-InteractiveUser call inside Schedule-UserContextRemediation that were just announcing function entry/exit ("Calling Get-InteractiveUser function...", "Get-InteractiveUser completed in X seconds"). The function logs its own success line.
     9.28 - TUNE: Whitelist cache TTL bumped from 60 min to 36 hours (2160 min). At a once-a-day client cadence the 60-min default never reached the fast-path (cache always >60 min old at next run, always revalidated). 36 h is comfortably longer than a daily cycle including check-in jitter, so the fast-path normally hits and we skip the network entirely. Whitelist edits propagate within ~1.5 days worst case.
     9.29 - FIX: Stripped em-dashes/en-dashes (U+2014, U+2013) from the script and saved with a UTF-8 BOM. Without a BOM, PowerShell 5.1 reads the file as Windows-1252 and the multi-byte UTF-8 sequence for an em-dash decodes to bytes 0xE2 0x80 0x94 - byte 0x94 is a right-quote in Windows-1252 which terminated string literals early and broke the parser when run via the iex bootstrapper (which writes the script to a .ps1 in temp without preserving UTF-8 metadata). All Unicode dashes replaced with ASCII hyphen-minus.
+    9.30 - FIX: Get-CachedWhitelistJSON returned its log line concatenated with the cached body, so $whitelistJSON was "Using cached whitelist (age 0.6 min...) {actual JSON}" and ConvertFrom-Json failed with "Invalid JSON primitive". Root cause: Write-Log emits to the success stream under some conditions (Out-File internally); every other value-returning function in the script already pipes Write-Log to Out-Null for this reason - I missed it on the new function. All Write-Log calls inside Get-CachedWhitelistJSON now end with `| Out-Null`. Also added a defensive validator: cached and fetched bodies are checked to start with `{` or `[` before being used; corrupt cache files are auto-deleted so the next run re-fetches.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6032,7 +6033,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "29" # Update this tag for each script version
+$ScriptTag = "30" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6250,19 +6251,36 @@ function Get-CachedWhitelistJSON {
     $cachedEtag = $null
     $cacheAge = $null
 
+    # Helper: a JSON body must start with `{` or `[`. Anything else means the cache file
+    # was contaminated (e.g. by previous Write-Log stream pollution before v9.30) and we
+    # should treat it as missing so the caller re-fetches from the network.
+    $isValidJson = {
+        param([string]$Body)
+        if ([string]::IsNullOrWhiteSpace($Body)) { return $false }
+        $first = $Body.TrimStart()[0]
+        return ($first -eq '{' -or $first -eq '[')
+    }
+
     if ((Test-Path $CachePath) -and (Test-Path $metaPath)) {
         try {
             $meta = Get-Content -Path $metaPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
             if ($meta.Url -eq $Url -and $meta.Timestamp) {
-                $cachedJson = Get-Content -Path $CachePath -Raw -Encoding UTF8
-                $cachedEtag = $meta.ETag
-                $cacheAge = (Get-Date) - [datetime]$meta.Timestamp
+                $tentative = Get-Content -Path $CachePath -Raw -Encoding UTF8
+                if (& $isValidJson $tentative) {
+                    $cachedJson = $tentative
+                    $cachedEtag = $meta.ETag
+                    $cacheAge = (Get-Date) - [datetime]$meta.Timestamp
+                } else {
+                    Write-Log -Message "Whitelist cache file is not valid JSON - discarding and re-fetching" | Out-Null
+                    Remove-Item -Path $CachePath -Force -ErrorAction SilentlyContinue
+                    Remove-Item -Path $metaPath -Force -ErrorAction SilentlyContinue
+                }
             }
         } catch { }
     }
 
     if ($cachedJson -and $cacheAge -and $cacheAge.TotalMinutes -lt $TtlMinutes) {
-        Write-Log -Message "Using cached whitelist (age $([Math]::Round($cacheAge.TotalMinutes, 1)) min, TTL $TtlMinutes min)"
+        Write-Log -Message "Using cached whitelist (age $([Math]::Round($cacheAge.TotalMinutes, 1)) min, TTL $TtlMinutes min)" | Out-Null
         return $cachedJson
     }
 
@@ -6275,7 +6293,11 @@ function Get-CachedWhitelistJSON {
         $newJson = $resp.Content
         $newEtag = $resp.Headers['ETag']
         if ($newEtag -is [array]) { $newEtag = $newEtag[0] }
-        Write-Log -Message "Fetched whitelist from $Url ($($newJson.Length) bytes)"
+        if (-not (& $isValidJson $newJson)) {
+            Write-Log -Message "Fetched whitelist body is not valid JSON - aborting cache write" | Out-Null
+            return $newJson
+        }
+        Write-Log -Message "Fetched whitelist from $Url ($($newJson.Length) bytes)" | Out-Null
 
         try {
             $cacheDir = Split-Path -Parent $CachePath
@@ -6284,23 +6306,23 @@ function Get-CachedWhitelistJSON {
             @{ Url = $Url; ETag = $newEtag; Timestamp = (Get-Date).ToString('o') } |
                 ConvertTo-Json | Out-File -FilePath $metaPath -Encoding UTF8 -Force
         } catch {
-            Write-Log -Message "Whitelist cache write failed (non-fatal): $($_.Exception.Message)"
+            Write-Log -Message "Whitelist cache write failed (non-fatal): $($_.Exception.Message)" | Out-Null
         }
         return $newJson
     } catch {
         $statusCode = $null
         if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
         if ($statusCode -eq 304 -and $cachedJson) {
-            Write-Log -Message "Whitelist unchanged on server (304) - reusing cache"
+            Write-Log -Message "Whitelist unchanged on server (304) - reusing cache" | Out-Null
             try {
                 @{ Url = $Url; ETag = $cachedEtag; Timestamp = (Get-Date).ToString('o') } |
                     ConvertTo-Json | Out-File -FilePath $metaPath -Encoding UTF8 -Force
             } catch { }
             return $cachedJson
         }
-        Write-Log -Message "Whitelist fetch failed: $($_.Exception.Message)"
+        Write-Log -Message "Whitelist fetch failed: $($_.Exception.Message)" | Out-Null
         if ($cachedJson) {
-            Write-Log -Message "Falling back to stale whitelist cache"
+            Write-Log -Message "Falling back to stale whitelist cache" | Out-Null
             return $cachedJson
         }
         return $null
