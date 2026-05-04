@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.44
-    Tag: 74
+    Version: 5.45
+    Tag: 75
     
     Version History:
     1.0 - Initial version
@@ -91,6 +91,7 @@
     5.42 - FIX: Get-AppInstalledScope returned "unknown" for Notepad++ (and likely other apps) on ARM64 because the `Get-ItemProperty <basepath>\*` wildcard form silently returned $null when -ErrorAction SilentlyContinue swallowed a single bad subkey. Replaced with explicit per-subkey enumeration: Get-ChildItem to list subkeys, then Get-ItemProperty per subkey wrapped in try/catch so individual unreadable entries don't abort the whole walk. Also extended the match function to check PSChildName (the literal subkey name, e.g. "Notepad++") in addition to DisplayName, providing a second signal when DisplayName is missing or formatted unexpectedly. Confirmed via diagnostic log line "machine hits=0, user hits=0" for Notepad++.Notepad++ that the previous walk found nothing.
     5.43 - FIX: Notepad++ still returned "unknown" after v5.42 because the underlying problem was WoW64 redirection, not enumeration. When this script runs in a 32-bit PowerShell host (Intune Remediation policies default to 32-bit unless "Run script in 64-bit PowerShell host" is enabled), accesses to HKLM:\SOFTWARE\... are silently redirected to WOW6432Node, hiding native 64-bit and ARM64 uninstall entries entirely. Listing WOW6432Node explicitly didn't help — that's still the same redirected view a 32-bit process gets when reading SOFTWARE\. Switched the registry walk to [Microsoft.Win32.RegistryKey]::OpenBaseKey() with explicit Registry64 and Registry32 views for HKLM, and Default view for HKU/HKCU (user hives have no 32/64 split). This bypasses the WoW64 redirector and guarantees both views are read regardless of host process architecture. Diagnostic log line now also includes [32-bit host] / [64-bit host] for visibility.
     5.44 - PERF: Two cost reductions. (a) Get-InteractiveUser now uses Get-Process explorer -IncludeUserName as the PRIMARY detection method (~50ms) and falls back to Win32_ComputerSystem (~5s) only when Explorer isn't running. Explorer is the desktop shell so its owner is by definition the interactive user — same answer as the WMI Username property in 99%+ of sessions, much faster. (b) Whitelist fetch now uses an on-disk cache (C:\ProgramData\Temp\availableUpgrades-whitelist.cache.*) with a 60-min TTL plus ETag/If-Modified-Since revalidation. Within the TTL window we skip the network entirely; after TTL we send If-None-Match and reuse the cached body on a 304. Reduces external dependency from once-per-cycle to at most once-per-hour. Stale cache is also used as a fallback when the network is unavailable.
+    5.45 - TUNE: Whitelist cache TTL bumped from 60 min to 36 hours (2160 min). At a once-a-day client cadence the 60-min default never reached the fast-path (cache always >60 min old at next run, always revalidated). 36 h is comfortably longer than a daily cycle including check-in jitter, so the fast-path normally hits and we skip the network entirely. Whitelist edits propagate within ~1.5 days worst case.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -1544,7 +1545,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "74" # Update this tag for each script version
+$ScriptTag = "75" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -1647,7 +1648,7 @@ function Get-CachedWhitelistJSON {
     #>
     param(
         [Parameter(Mandatory)][string]$Url,
-        [int]$TtlMinutes = 60,
+        [int]$TtlMinutes = 2160,   # 36 hours — longer than a daily cycle so the fast-path normally hits
         [string]$CachePath = "C:\ProgramData\Temp\availableUpgrades-whitelist.cache.json"
     )
 

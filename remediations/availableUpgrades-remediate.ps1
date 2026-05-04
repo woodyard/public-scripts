@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.27
- Tag: 27
+ Version: 9.28
+ Tag: 28
     
     Version History:
     1.0 - Initial version
@@ -92,6 +92,7 @@
     9.25 - FIX: SYSTEM-context handoff to user-context remediation no longer runs when the task file contains zero user-scoped entries. The post-processing handoff (only reached when SYSTEM had work itself) was unconditional — every SYSTEM run that processed any machine-scoped app would also schedule a no-op user-context task, wasting ~3 minutes per cycle on heartbeat polling for nothing. Now gated on $Script:TasksForOtherContext > 0, matching the gate already on the empty-list else branch added in v9.23.
     9.26 - PERF: Two startup/per-app cost reductions. (a) Orphan marker cleanup no longer calls Get-InteractiveUser to find the user temp dir — replaced with a disk enumeration of C:\Users\* (skipping well-known non-user profile dirs). The CIM call costs ~7s on Azure AD machines and was the first thing every Intune cycle paid for; disk enumeration is sub-millisecond and additionally catches orphans from any user profile rather than just the active one. (b) Post-upgrade verification (the `winget list --exact` re-query that costs ~1.5s per upgraded app) is now opt-in via a new whitelist `RequiresPostVerify: true` flag. Originally added in v8.8 for Adobe Reader's silent-failure pattern; Adobe Reader is now disabled in the whitelist, so the cost was being paid on every enabled app to protect against a problem none of them have. Apps that need the safety net can opt back in by setting the flag.
     9.27 - PERF: Three further cost reductions. (a) Get-InteractiveUser now uses Get-Process explorer -IncludeUserName as the PRIMARY detection method (~50ms) and falls back to CIM (~5s) only when Explorer isn't running. Explorer is the desktop shell so its owner is by definition the interactive user — same answer as Win32_ComputerSystem.Username in 99%+ of sessions, dramatically faster. The CIM/WMI paths are kept as fallbacks for early-boot or RDP-edge scenarios where Explorer isn't yet running. Also collapsed the verbose per-method logging: the function now emits a single line "User detection method: Explorer (52ms) -> DSGR\\adminhsk, SID=..." instead of 8+ progress lines. (b) Whitelist fetch now uses an on-disk cache (C:\ProgramData\Temp\availableUpgrades-whitelist.cache.*) with a 60-min TTL plus ETag/If-Modified-Since revalidation. Within the TTL window we skip the network entirely; after TTL we send If-None-Match and reuse the cached body on a 304. Reduces external dependency from once-per-cycle to at most once-per-hour. Stale cache is also used as a fallback when the network is unavailable. (c) Removed three redundant log lines around the Get-InteractiveUser call inside Schedule-UserContextRemediation that were just announcing function entry/exit ("Calling Get-InteractiveUser function...", "Get-InteractiveUser completed in X seconds"). The function logs its own success line.
+    9.28 - TUNE: Whitelist cache TTL bumped from 60 min to 36 hours (2160 min). At a once-a-day client cadence the 60-min default never reached the fast-path (cache always >60 min old at next run, always revalidated). 36 h is comfortably longer than a daily cycle including check-in jitter, so the fast-path normally hits and we skip the network entirely. Whitelist edits propagate within ~1.5 days worst case.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -6030,7 +6031,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "27" # Update this tag for each script version
+$ScriptTag = "28" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -6239,7 +6240,7 @@ function Get-CachedWhitelistJSON {
     #>
     param(
         [Parameter(Mandatory)][string]$Url,
-        [int]$TtlMinutes = 60,
+        [int]$TtlMinutes = 2160,   # 36 hours — longer than a daily cycle so the fast-path normally hits
         [string]$CachePath = "C:\ProgramData\Temp\availableUpgrades-whitelist.cache.json"
     )
 
