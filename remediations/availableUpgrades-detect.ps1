@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.39
-    Tag: 69
+    Version: 5.40
+    Tag: 70
     
     Version History:
     1.0 - Initial version
@@ -86,6 +86,7 @@
     5.37 - FIX: Get-AppInstalledScope was silently returning "unknown" for Firefox when called from SYSTEM-context Write-UpgradeTaskFile (task file showed InstalledScope="unknown" despite Firefox being in HKLM uninstall). Replaced the `Get-ChildItem | Get-ItemProperty | Where-Object` pipeline with the more robust `Get-ItemProperty <path>\*` wildcard form — empirically the pipeline can short-circuit silently in some SYSTEM-context environments, the wildcard form does not. Also added match-count diagnostic logging (machine matches=N, user matches=N -> scope) so future drift is visible in the log without needing to instrument.
     5.38 - FIX: SYSTEM-context detection no longer skips user-context detection when system apps are found. The v5.19 "performance optimization" caused the task file to omit user-scoped upgrades on any machine that also had a system-scoped upgrade pending, leaving them indefinitely undone (remediate.ps1 now relies solely on the task file). New flow: always run user-context detection when an interactive session exists, then merge system + user records by AppID into a single task file. SYSTEM record wins on AppID conflict so the more accurate InstalledScope (HKLM + HKU\SID) is preserved.
     5.39 - FIX: Detection script's last stdout line is now always the [ScriptTag] summary so Intune reads the right detection result. Previously Write-UpgradeTaskFile and Remove-UpgradeTaskFile (both non-debug) ran AFTER the summary, so on some runs the final visible line was "Wrote upgrade task file with N tasks" or "Removed upgrade task file" instead of the upgrade-list/no-upgrade summary, which Intune surfaces as the detection state. Reordered all four main exit paths (SYSTEM merged-apps, SYSTEM no-apps, direct-user apps-found, direct-user no-apps, plus the no-winget-output path) to do task-file IO first and emit the [ScriptTag] line last.
+    5.40 - FIX: Get-AppInstalledScope was returning "unknown" for apps like Google.Chrome whose registry layout doesn't fit the simple "DisplayName contains FriendlyName, hive determines scope" model. Two improvements: (a) search by multiple terms — FriendlyName plus AppID parts (e.g. "Google Chrome", "Chrome", "Google") — so apps where the whitelist FriendlyName doesn't substring-match the registry DisplayName are still found; (b) use InstallLocation as the authoritative scope signal. A binary in C:\Users\...\AppData\... is per-user even when the uninstall key sits in HKLM, and a Program Files install is machine-wide even when the uninstall key sits in HKCU. Hive membership is now only the fallback when InstallLocation is empty. When both scopes show installs, prefer "machine" so SYSTEM remediation runs (covers the Program Files binary; the per-user copy comes along via the same upgrade).
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -807,12 +808,16 @@ function Get-AppInstalledScope {
         uninstall registry. Returns "user", "machine", or "unknown".
     .DESCRIPTION
         Scans HKLM (machine-wide) and the current user's HKU/HKCU (user-scope) uninstall
-        keys for an entry whose DisplayName matches the provided FriendlyName (or, when
-        FriendlyName is empty, the last segment of the AppID).
+        keys for entries whose DisplayName matches one of several search terms derived
+        from the FriendlyName and the AppID (e.g. "Google.Chrome" -> "Google Chrome",
+        "Chrome", "Google"). For each match found the function then inspects
+        InstallLocation as the authoritative scope signal — a binary living in the user
+        profile is per-user even if the uninstall key happens to be in HKLM, and a
+        Program Files install is machine-wide even if the uninstall key is in HKCU
+        (Chrome and similar apps that mix per-user winget metadata with machine binaries).
+        Hive membership is used only as a fallback when InstallLocation is empty.
         - From SYSTEM context the user hive is reached via HKU\<interactive-user-SID>.
         - From user context HKCU is the current user's own hive.
-        Used by detect.ps1 to embed an InstalledScope in each task entry so remediate.ps1
-        can route the upgrade to the right context without rerunning the registry walk.
     #>
     param(
         [string]$AppID,
@@ -820,57 +825,102 @@ function Get-AppInstalledScope {
     )
 
     try {
-        $foundMachine = $false
-        $foundUser = $false
+        # Build a list of candidate DisplayName fragments. Order matters only for the log
+        # line; the search is OR-across-terms.
+        $searchTerms = New-Object System.Collections.Generic.List[string]
+        if ($FriendlyName) { [void]$searchTerms.Add($FriendlyName) }
+        if ($AppID) {
+            $idParts = $AppID -split '\.'
+            if ($idParts.Count -gt 1) {
+                [void]$searchTerms.Add(($idParts -join ' '))   # "Google Chrome"
+                [void]$searchTerms.Add($idParts[-1])           # "Chrome"
+                [void]$searchTerms.Add($idParts[0])            # "Google" (catches publisher-prefixed DisplayNames)
+            } else {
+                [void]$searchTerms.Add($AppID)
+            }
+        }
+        $searchTerms = @($searchTerms | Where-Object { $_ } | Select-Object -Unique)
 
-        $searchName = if ($FriendlyName) { $FriendlyName } else { ($AppID -split '\.')[-1] }
+        $matchEntry = {
+            param($e)
+            if (-not $e.DisplayName) { return $false }
+            foreach ($t in $searchTerms) {
+                if ($e.DisplayName -like "*$t*") { return $true }
+            }
+            return $false
+        }
 
         # Machine-wide uninstall registry. Using `Get-ItemProperty <path>\*` instead of
         # `Get-ChildItem | Get-ItemProperty` because the latter has been observed to silently
         # produce empty results in SYSTEM context for some hosts (suspected: a subkey with a
-        # malformed default value short-circuits the pipeline). The wildcard form is more
-        # robust because errors on individual subkeys do not break the rest of the read.
+        # malformed default value short-circuits the pipeline).
         $machinePaths = @(
             "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
             "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
         )
-        $machineMatches = 0
+        $machineHits = New-Object System.Collections.Generic.List[object]
         foreach ($p in $machinePaths) {
-            $entries = Get-ItemProperty -Path $p -ErrorAction SilentlyContinue |
-                Where-Object { $_.DisplayName -and $_.DisplayName -like "*$searchName*" }
-            if ($entries) {
-                $machineMatches += @($entries).Count
-                $foundMachine = $true
+            $all = Get-ItemProperty -Path $p -ErrorAction SilentlyContinue
+            foreach ($e in $all) {
+                if (& $matchEntry $e) { [void]$machineHits.Add($e) }
             }
         }
 
-        # User-scope uninstall registry — different access path per context
-        $userMatches = 0
-        if (Test-RunningAsSystem) {
+        # User-scope uninstall registry — different access path per context.
+        $userHits = New-Object System.Collections.Generic.List[object]
+        $userBase = if (Test-RunningAsSystem) {
             $userInfo = Get-InteractiveUser
-            if ($userInfo -and $userInfo.SID) {
-                $userPath = "Registry::HKU\$($userInfo.SID)\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
-                $userEntries = Get-ItemProperty -Path $userPath -ErrorAction SilentlyContinue |
-                    Where-Object { $_.DisplayName -and $_.DisplayName -like "*$searchName*" }
-                if ($userEntries) {
-                    $userMatches = @($userEntries).Count
-                    $foundUser = $true
-                }
-            }
+            if ($userInfo -and $userInfo.SID) { "Registry::HKU\$($userInfo.SID)\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" } else { $null }
         } else {
-            $userPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
-            $userEntries = Get-ItemProperty -Path $userPath -ErrorAction SilentlyContinue |
-                Where-Object { $_.DisplayName -and $_.DisplayName -like "*$searchName*" }
-            if ($userEntries) {
-                $userMatches = @($userEntries).Count
-                $foundUser = $true
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        }
+        if ($userBase) {
+            $all = Get-ItemProperty -Path $userBase -ErrorAction SilentlyContinue
+            foreach ($e in $all) {
+                if (& $matchEntry $e) { [void]$userHits.Add($e) }
             }
         }
 
-        $resolvedScope = if ($foundUser -and -not $foundMachine) { "user" }
-                         elseif ($foundMachine) { "machine" }
-                         else { "unknown" }
-        Write-Log "Scope detection $AppID (search='$searchName'): machine matches=$machineMatches, user matches=$userMatches -> $resolvedScope" | Out-Null
+        # Authoritative signal: InstallLocation. A binary in C:\Users\...\AppData\... is
+        # per-user; one in C:\Program Files... is machine-wide. Look at every matched
+        # entry's path regardless of which hive it came from.
+        $installLocHints = @{ machine = 0; user = 0 }
+        $sampleLoc = ""
+        foreach ($e in ($machineHits + $userHits)) {
+            $loc = if ($e.PSObject.Properties['InstallLocation']) { [string]$e.InstallLocation } else { "" }
+            if ([string]::IsNullOrWhiteSpace($loc)) { continue }
+            if (-not $sampleLoc) { $sampleLoc = $loc }
+            if ($loc -match '(?i)\\Users\\[^\\]+\\(AppData|Local|Roaming)\\' -or
+                $loc -match '(?i)^[A-Z]:\\Users\\[^\\]+\\') {
+                $installLocHints.user++
+            } elseif ($loc -match '(?i)^[A-Z]:\\Program Files( \(x86\))?\\') {
+                $installLocHints.machine++
+            } elseif ($loc -match '(?i)\\ProgramData\\') {
+                $installLocHints.machine++
+            }
+        }
+
+        # Decision: InstallLocation wins when present; otherwise fall back to hive membership.
+        $resolvedScope = "unknown"
+        $decisionBy = "none"
+        if ($installLocHints.machine -gt 0 -and $installLocHints.user -eq 0) {
+            $resolvedScope = "machine"; $decisionBy = "InstallLocation"
+        } elseif ($installLocHints.user -gt 0 -and $installLocHints.machine -eq 0) {
+            $resolvedScope = "user"; $decisionBy = "InstallLocation"
+        } elseif ($installLocHints.machine -gt 0 -and $installLocHints.user -gt 0) {
+            # Both scopes installed — let SYSTEM handle it (machine wins) so the user
+            # binary is also covered if Program Files is the active install.
+            $resolvedScope = "machine"; $decisionBy = "InstallLocation(both)"
+        } elseif ($machineHits.Count -gt 0 -and $userHits.Count -eq 0) {
+            $resolvedScope = "machine"; $decisionBy = "hive"
+        } elseif ($userHits.Count -gt 0 -and $machineHits.Count -eq 0) {
+            $resolvedScope = "user"; $decisionBy = "hive"
+        } elseif ($machineHits.Count -gt 0) {
+            $resolvedScope = "machine"; $decisionBy = "hive(both)"
+        }
+
+        $sampleSuffix = if ($sampleLoc) { " sample='$sampleLoc'" } else { "" }
+        Write-Log "Scope detection $AppID (terms='$($searchTerms -join '|')'): machine hits=$($machineHits.Count), user hits=$($userHits.Count), pathHints=m:$($installLocHints.machine)/u:$($installLocHints.user) -> $resolvedScope (by $decisionBy)$sampleSuffix" | Out-Null
         return $resolvedScope
     } catch {
         Write-Log "Scope detection error for $AppID : $($_.Exception.Message)" | Out-Null
@@ -1430,7 +1480,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "69" # Update this tag for each script version
+$ScriptTag = "70" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
