@@ -18,8 +18,8 @@
 
 .NOTES
     Author: Henrik Skovgaard
-    Version: 5.42
-    Tag: 72
+    Version: 5.43
+    Tag: 73
     
     Version History:
     1.0 - Initial version
@@ -89,6 +89,7 @@
     5.40 - FIX: Get-AppInstalledScope was returning "unknown" for apps like Google.Chrome whose registry layout doesn't fit the simple "DisplayName contains FriendlyName, hive determines scope" model. Two improvements: (a) search by multiple terms — FriendlyName plus AppID parts (e.g. "Google Chrome", "Chrome", "Google") — so apps where the whitelist FriendlyName doesn't substring-match the registry DisplayName are still found; (b) use InstallLocation as the authoritative scope signal. A binary in C:\Users\...\AppData\... is per-user even when the uninstall key sits in HKLM, and a Program Files install is machine-wide even when the uninstall key sits in HKCU. Hive membership is now only the fallback when InstallLocation is empty. When both scopes show installs, prefer "machine" so SYSTEM remediation runs (covers the Program Files binary; the per-user copy comes along via the same upgrade).
     5.41 - PERF: Orphan marker cleanup at startup no longer calls Get-InteractiveUser to find the user temp dir — replaced with a disk enumeration of C:\Users\* (skipping well-known non-user profile dirs). The CIM-based user detection costs ~7s on Azure AD machines and was the first thing every Intune cycle paid for; disk enumeration is sub-millisecond and additionally catches orphans from any user profile rather than just the active one.
     5.42 - FIX: Get-AppInstalledScope returned "unknown" for Notepad++ (and likely other apps) on ARM64 because the `Get-ItemProperty <basepath>\*` wildcard form silently returned $null when -ErrorAction SilentlyContinue swallowed a single bad subkey. Replaced with explicit per-subkey enumeration: Get-ChildItem to list subkeys, then Get-ItemProperty per subkey wrapped in try/catch so individual unreadable entries don't abort the whole walk. Also extended the match function to check PSChildName (the literal subkey name, e.g. "Notepad++") in addition to DisplayName, providing a second signal when DisplayName is missing or formatted unexpectedly. Confirmed via diagnostic log line "machine hits=0, user hits=0" for Notepad++.Notepad++ that the previous walk found nothing.
+    5.43 - FIX: Notepad++ still returned "unknown" after v5.42 because the underlying problem was WoW64 redirection, not enumeration. When this script runs in a 32-bit PowerShell host (Intune Remediation policies default to 32-bit unless "Run script in 64-bit PowerShell host" is enabled), accesses to HKLM:\SOFTWARE\... are silently redirected to WOW6432Node, hiding native 64-bit and ARM64 uninstall entries entirely. Listing WOW6432Node explicitly didn't help — that's still the same redirected view a 32-bit process gets when reading SOFTWARE\. Switched the registry walk to [Microsoft.Win32.RegistryKey]::OpenBaseKey() with explicit Registry64 and Registry32 views for HKLM, and Default view for HKU/HKCU (user hives have no 32/64 split). This bypasses the WoW64 redirector and guarantees both views are read regardless of host process architecture. Diagnostic log line now also includes [32-bit host] / [64-bit host] for visibility.
 
     Exit Codes:
     0 - No upgrades available, script completed successfully, or OOBE not complete
@@ -861,54 +862,82 @@ function Get-AppInstalledScope {
             return $false
         }
 
-        # Walk uninstall registry per-subkey rather than `Get-ItemProperty <basepath>\*` —
-        # the wildcard form is fragile: a single subkey with a malformed default value or
-        # restricted ACL anywhere under the hive can cause the whole batch read to silently
-        # return $null with -ErrorAction SilentlyContinue (observed for Notepad++ on ARM64).
-        # Per-subkey iteration with try/catch isolates the failures.
+        # Walk uninstall registry via the .NET RegistryKey API with explicit registry views,
+        # bypassing the WoW64 redirector. Critical on ARM64 / 64-bit Windows when this script
+        # runs in a 32-bit PowerShell host (e.g. Intune Remediation with "Run as 64-bit"
+        # toggled off): in that case `HKLM:\SOFTWARE\...` access is silently redirected to
+        # WOW6432Node, hiding native 64-bit (and ARM64) uninstall entries entirely. Reading
+        # both Registry64 and Registry32 views guarantees we see entries regardless of host
+        # process architecture. Per-subkey iteration with try/catch isolates malformed
+        # entries that would otherwise abort a batch read.
         $walkUninstallHive = {
-            param([string]$BasePath)
+            param([Microsoft.Win32.RegistryKey]$Root)
             $hits = New-Object System.Collections.Generic.List[object]
-            if (-not (Test-Path $BasePath)) { return $hits }
-            $subKeys = $null
-            try { $subKeys = Get-ChildItem -Path $BasePath -ErrorAction Stop } catch {
-                Write-Log "Scope detection: cannot enumerate $BasePath - $($_.Exception.Message)" | Out-Null
-                return $hits
-            }
-            foreach ($sub in $subKeys) {
-                try {
-                    $entry = Get-ItemProperty -Path $sub.PSPath -ErrorAction Stop
-                    # PSChildName is normally present, but make sure the match block can rely on it
-                    if (-not ($entry.PSObject.Properties['PSChildName'])) {
-                        $entry | Add-Member -NotePropertyName PSChildName -NotePropertyValue $sub.PSChildName -Force
+            if (-not $Root) { return $hits }
+            try {
+                foreach ($subName in $Root.GetSubKeyNames()) {
+                    try {
+                        $subKey = $Root.OpenSubKey($subName)
+                        if (-not $subKey) { continue }
+                        try {
+                            $entry = [pscustomobject]@{
+                                PSChildName     = $subName
+                                DisplayName     = $subKey.GetValue('DisplayName')
+                                InstallLocation = $subKey.GetValue('InstallLocation')
+                                Publisher       = $subKey.GetValue('Publisher')
+                            }
+                            if (& $matchEntry $entry) { [void]$hits.Add($entry) }
+                        } finally { $subKey.Close() }
+                    } catch {
+                        # Skip individual unreadable subkeys
                     }
-                    if (& $matchEntry $entry) { [void]$hits.Add($entry) }
-                } catch {
-                    # Skip individual unreadable subkeys
                 }
-            }
+            } finally { $Root.Close() }
             return $hits
         }
 
-        $machineBases = @(
-            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-        )
+        $hostBits = if ([Environment]::Is64BitProcess) { "64-bit" } else { "32-bit" }
         $machineHits = New-Object System.Collections.Generic.List[object]
-        foreach ($base in $machineBases) {
-            foreach ($h in (& $walkUninstallHive $base)) { [void]$machineHits.Add($h) }
+        # Read both 64-bit and 32-bit views of HKLM\SOFTWARE\...\Uninstall — Registry64 is the
+        # native ARM64/x64 view, Registry32 is the WOW6432Node 32-bit view.
+        foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
+            try {
+                $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $view)
+                $root = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+                if ($root) {
+                    foreach ($h in (& $walkUninstallHive $root)) { [void]$machineHits.Add($h) }
+                }
+                $base.Close()
+            } catch {
+                Write-Log "Scope detection: error opening LocalMachine ($view): $($_.Exception.Message)" | Out-Null
+            }
         }
 
-        # User-scope uninstall registry — different access path per context.
+        # User-scope uninstall registry — open via the same explicit-view API so a 32-bit
+        # host doesn't get redirected. From SYSTEM context we open the interactive user's
+        # hive under HKEY_USERS\<SID>; from user context we open HKCU directly.
         $userHits = New-Object System.Collections.Generic.List[object]
-        $userBase = if (Test-RunningAsSystem) {
-            $userInfo = Get-InteractiveUser
-            if ($userInfo -and $userInfo.SID) { "Registry::HKU\$($userInfo.SID)\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" } else { $null }
-        } else {
-            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-        }
-        if ($userBase) {
-            foreach ($h in (& $walkUninstallHive $userBase)) { [void]$userHits.Add($h) }
+        try {
+            if (Test-RunningAsSystem) {
+                $userInfo = Get-InteractiveUser
+                if ($userInfo -and $userInfo.SID) {
+                    $usersBase = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users, [Microsoft.Win32.RegistryView]::Default)
+                    $root = $usersBase.OpenSubKey("$($userInfo.SID)\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")
+                    if ($root) {
+                        foreach ($h in (& $walkUninstallHive $root)) { [void]$userHits.Add($h) }
+                    }
+                    $usersBase.Close()
+                }
+            } else {
+                $hkcuBase = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Default)
+                $root = $hkcuBase.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+                if ($root) {
+                    foreach ($h in (& $walkUninstallHive $root)) { [void]$userHits.Add($h) }
+                }
+                $hkcuBase.Close()
+            }
+        } catch {
+            Write-Log "Scope detection: error reading user hive: $($_.Exception.Message)" | Out-Null
         }
 
         # Authoritative signal: InstallLocation. A binary in C:\Users\...\AppData\... is
@@ -950,7 +979,7 @@ function Get-AppInstalledScope {
         }
 
         $sampleSuffix = if ($sampleLoc) { " sample='$sampleLoc'" } else { "" }
-        Write-Log "Scope detection $AppID (terms='$($searchTerms -join '|')'): machine hits=$($machineHits.Count), user hits=$($userHits.Count), pathHints=m:$($installLocHints.machine)/u:$($installLocHints.user) -> $resolvedScope (by $decisionBy)$sampleSuffix" | Out-Null
+        Write-Log "Scope detection $AppID [$hostBits host] (terms='$($searchTerms -join '|')'): machine hits=$($machineHits.Count), user hits=$($userHits.Count), pathHints=m:$($installLocHints.machine)/u:$($installLocHints.user) -> $resolvedScope (by $decisionBy)$sampleSuffix" | Out-Null
         return $resolvedScope
     } catch {
         Write-Log "Scope detection error for $AppID : $($_.Exception.Message)" | Out-Null
@@ -1510,7 +1539,7 @@ function Invoke-UserContextDetection {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate finding an app update and trigger remediation
-$ScriptTag = "72" # Update this tag for each script version
+$ScriptTag = "73" # Update this tag for each script version
 $LogName = 'DetectAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
