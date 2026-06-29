@@ -19,8 +19,8 @@
 
 .NOTES
  Author: Henrik Skovgaard
- Version: 9.30
- Tag: 30
+ Version: 9.31
+ Tag: 31
     
     Version History:
     1.0 - Initial version
@@ -95,6 +95,7 @@
     9.28 - TUNE: Whitelist cache TTL bumped from 60 min to 36 hours (2160 min). At a once-a-day client cadence the 60-min default never reached the fast-path (cache always >60 min old at next run, always revalidated). 36 h is comfortably longer than a daily cycle including check-in jitter, so the fast-path normally hits and we skip the network entirely. Whitelist edits propagate within ~1.5 days worst case.
     9.29 - FIX: Stripped em-dashes/en-dashes (U+2014, U+2013) from the script and saved with a UTF-8 BOM. Without a BOM, PowerShell 5.1 reads the file as Windows-1252 and the multi-byte UTF-8 sequence for an em-dash decodes to bytes 0xE2 0x80 0x94 - byte 0x94 is a right-quote in Windows-1252 which terminated string literals early and broke the parser when run via the iex bootstrapper (which writes the script to a .ps1 in temp without preserving UTF-8 metadata). All Unicode dashes replaced with ASCII hyphen-minus.
     9.30 - FIX: Get-CachedWhitelistJSON returned its log line concatenated with the cached body, so $whitelistJSON was "Using cached whitelist (age 0.6 min...) {actual JSON}" and ConvertFrom-Json failed with "Invalid JSON primitive". Root cause: Write-Log emits to the success stream under some conditions (Out-File internally); every other value-returning function in the script already pipes Write-Log to Out-Null for this reason - I missed it on the new function. All Write-Log calls inside Get-CachedWhitelistJSON now end with `| Out-Null`. Also added a defensive validator: cached and fetched bodies are checked to start with `{` or `[` before being used; corrupt cache files are auto-deleted so the next run re-fetches.
+    9.31 - UX: Unified the upgrade experience when apps span both SYSTEM and user contexts. Previously each context ran as a separate process and each per-app progress popup ended with "Update complete!" before closing, so the SYSTEM phase visibly finished ("done") and then the user-context phase started a fresh batch - the dialogs read as two disjoint runs. Now, whenever the current run still has work queued for the other context (SYSTEM with $Script:TasksForOtherContext > 0), its per-app completion signals carry a new Quiet=true flag and the three progress dialogs (informational, mandatory, deferral) honor it by closing immediately without showing a completion cue. The genuinely last popup of the session (the user-context phase, which never sets Quiet) remains the single completion cue, so the flow reads as one continuous upgrade pass instead of "finished, then restarted." Single-context runs (machine-only, or a lone interactive user) are unchanged - no Quiet, completion cue shown as before.
 
     Exit Codes:
     0 - Script completed successfully or OOBE not complete
@@ -1939,6 +1940,12 @@ try {
             Write-ProgLog "Signal received"
             try {
                 $signalData = Get-Content $SignalFilePath -Raw | ConvertFrom-Json
+                if ($signalData.Quiet -eq $true) {
+                    # Continuous mode: more updates follow in another context - close quietly, no completion cue
+                    Write-ProgLog "Quiet completion - closing without completion text"
+                    $window.Close()
+                    return
+                }
                 $pBar = $window.FindName("ProgressBar")
                 $sText = $window.FindName("StatusText")
                 $pBar.IsIndeterminate = $false
@@ -3132,6 +3139,11 @@ try {
             $script:progressPollTimer.Stop()
             try {
                 $signalData = Get-Content $ProgressSignalFilePath -Raw | ConvertFrom-Json
+                if ($signalData.Quiet -eq $true) {
+                    # Continuous mode: more updates follow in another context - close quietly, no completion cue
+                    $window.Close()
+                    return
+                }
                 $pBar = $window.FindName("ProgressBar")
                 $sText = $window.FindName("StatusText")
                 $pBar.IsIndeterminate = $false
@@ -4020,6 +4032,11 @@ $switchToProgress = {
             $pollTimer.Stop()
             try {
                 $signalData = Get-Content $signalFile -Raw | ConvertFrom-Json
+                if ($signalData.Quiet -eq $true) {
+                    # Continuous mode: more updates follow in another context - close quietly, no completion cue
+                    $window.Close()
+                    return
+                }
                 $pBar = $window.FindName("ProgressBar")
                 $pText = $window.FindName("ProgressText")
                 $pBar.IsIndeterminate = $false
@@ -6033,7 +6050,7 @@ function Invoke-MarkerFileCleanup {
 
 <# Script variables #>
 $Script:TestMode = $false  # Set to $true to simulate app update with dialogs and notifications
-$ScriptTag = "30" # Update this tag for each script version
+$ScriptTag = "31" # Update this tag for each script version
 $LogName = 'RemediateAvailableUpgrades'
 $LogDate = Get-Date -Format dd-MM-yy_HH-mm # go with the EU format day / month / year
 $LogFullName = "$LogName-$LogDate.log"
@@ -7041,6 +7058,7 @@ function Resolve-FriendlyName {
 $LIST = @()
 $Script:TasksForOtherContext = 0   # set by the routing block below; checked in the else branch so SYSTEM can still hand off user-scoped work even when its own list is empty
 $Script:OtherContextAppIds = @()   # AppIDs routed to the other context, logged when handing off
+$Script:QuietCompletions = $false  # when true, per-app completion signals close their progress dialog without a "complete" cue (more updates follow in the other context - keeps the cross-context flow continuous; see v9.31)
 $rawTaskList = @(Read-UpgradeTaskFile)
 if ($rawTaskList -and $rawTaskList.Count -gt 0) {
     # Filter the task list down to entries that belong in the current context:
@@ -7062,6 +7080,13 @@ if ($rawTaskList -and $rawTaskList.Count -gt 0) {
     $LIST = $filtered
     $Script:TasksForOtherContext = $skippedIds.Count
     $Script:OtherContextAppIds = @($skippedIds)
+    # If this (SYSTEM) run still has work queued for the user context, suppress the per-app
+    # "Update complete!" cue so SYSTEM's phase doesn't read as a finished run before the
+    # user-context phase begins - the last user-context popup stays the single completion cue.
+    $Script:QuietCompletions = ($isSystem -and ($skippedIds.Count -gt 0))
+    if ($Script:QuietCompletions) {
+        Write-Log -Message "Continuous mode: user-context work is queued, so SYSTEM per-app completion cues will be suppressed (v9.31)"
+    }
     $contextLabel = if ($isSystem) { "SYSTEM" } else { "user" }
     $listCount = $LIST.Count
     Write-Log -Message "Task file: $($rawTaskList.Count) entries, $listCount routed to $contextLabel context, $($skippedIds.Count) left for the other context"
@@ -7639,12 +7664,12 @@ if ($LIST -and $LIST.Count -gt 0) {
 
                             if ($dialogResult -and $dialogResult.ProgressSignalFile) {
                                 # Signal the deferral dialog's progress mode
-                                @{ Success = $true; Message = "Update complete" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
-                                Write-Log -Message "Wrote completion signal to progress dialog"
+                                @{ Success = $true; Message = "Update complete"; Quiet = $Script:QuietCompletions } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                                Write-Log -Message "Wrote completion signal to progress dialog (Quiet=$($Script:QuietCompletions))"
                             } elseif ($infoSignalFile) {
                                 # Signal the informational progress dialog
-                                @{ Success = $true; Message = "Update complete" } | ConvertTo-Json | Out-File -FilePath $infoSignalFile -Encoding UTF8
-                                Write-Log -Message "Signaled informational progress dialog"
+                                @{ Success = $true; Message = "Update complete"; Quiet = $Script:QuietCompletions } | ConvertTo-Json | Out-File -FilePath $infoSignalFile -Encoding UTF8
+                                Write-Log -Message "Signaled informational progress dialog (Quiet=$($Script:QuietCompletions))"
                             } elseif (($dialogResult -and ($dialogResult.CloseProcess -or $dialogResult.UserChoice)) -or ($Script:TestMode -and $appInfo.AppID -eq "Test.DemoApp")) {
                                 # Fallback: show separate completion notification
                                 Show-CompletionNotification -AppName $okapp.AppID -FriendlyName $okapp.FriendlyName
@@ -7666,20 +7691,20 @@ if ($LIST -and $LIST.Count -gt 0) {
                                 Remove-UpgradeTaskEntry -AppID $appInfo.AppID
                             }
                             if ($dialogResult -and $dialogResult.ProgressSignalFile) {
-                                @{ Success = $false; Message = "Update failed" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
-                                Write-Log -Message "Wrote failure signal to progress dialog"
+                                @{ Success = $false; Message = "Update failed"; Quiet = $Script:QuietCompletions } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                                Write-Log -Message "Wrote failure signal to progress dialog (Quiet=$($Script:QuietCompletions))"
                             } elseif ($infoSignalFile) {
-                                @{ Success = $false; Message = "Update failed" } | ConvertTo-Json | Out-File -FilePath $infoSignalFile -Encoding UTF8
-                                Write-Log -Message "Signaled informational progress dialog (failure)"
+                                @{ Success = $false; Message = "Update failed"; Quiet = $Script:QuietCompletions } | ConvertTo-Json | Out-File -FilePath $infoSignalFile -Encoding UTF8
+                                Write-Log -Message "Signaled informational progress dialog (failure, Quiet=$($Script:QuietCompletions))"
                             }
                         }
                     } catch {
                         Write-Log -Message "Error upgrading $($appInfo.AppID) : $($_.Exception.Message)"
                         $message += "$($appInfo.AppID) (ERROR)|"
                         if ($dialogResult -and $dialogResult.ProgressSignalFile) {
-                            @{ Success = $false; Message = "Update error" } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
+                            @{ Success = $false; Message = "Update error"; Quiet = $Script:QuietCompletions } | ConvertTo-Json | Out-File -FilePath $dialogResult.ProgressSignalFile -Encoding UTF8
                         } elseif ($infoSignalFile) {
-                            @{ Success = $false; Message = "Update error" } | ConvertTo-Json | Out-File -FilePath $infoSignalFile -Encoding UTF8
+                            @{ Success = $false; Message = "Update error"; Quiet = $Script:QuietCompletions } | ConvertTo-Json | Out-File -FilePath $infoSignalFile -Encoding UTF8
                         }
                     }
                 }
